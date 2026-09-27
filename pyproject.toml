@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ddosim"
+version = "0.1.0"
+description = "Simple UDP Stress Tester"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+
+dependencies = [
+    "pydantic>=2.6",
+    # ddosim.config and ddosim.defenses both import yaml at module level.
+    "pyyaml>=6.0",
+    # ddosim.monitor imports psutil to sample the local target process.
+    "psutil>=5.9",
+]
+
+[project.optional-dependencies]
+raw = ["scapy>=2.6"]
+# The lab target (ddosim.target) is a server, not part of the CLI. Kept optional
+# so an operator who only generates load does not pull in a web framework.
+lab = ["fastapi>=0.110", "uvicorn>=0.27"]
+build = ["pyinstaller>=6.0"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "pytest-cov>=5.0"]
+
+[project.scripts]
+ddosim = "ddosim.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["ddosim*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-q --strict-markers"
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.coverage.run]
+source = ["ddosim"]
+branch = true
