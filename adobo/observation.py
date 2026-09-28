@@ -44,9 +44,48 @@ from typing import Any, Awaitable, Callable, Protocol
 
 from .models import TargetStats
 
-__all__ = ["TargetObservation", "TargetObserver", "STATS_PATH"]
+__all__ = [
+    "TargetObservation",
+    "TargetObserver",
+    "STATS_PATH",
+    "NO_HTTP_SURFACE_MARKERS",
+    "refused_connection",
+]
 
 STATS_PATH = "/stats"
+
+
+# Text that means "nothing is listening on that port" rather than "the target was
+# reachable and then failed". Matched case-insensitively against the recorded
+# error, which carries the exception type name.
+NO_HTTP_SURFACE_MARKERS = ("connection refused", "connecterror")
+"""Deliberately narrow. See :func:`refused_connection`."""
+
+
+def refused_connection(error: str | None) -> bool:
+    """True when an error records a *refused* connection.
+
+    Two very different situations produce an identical 0% availability, and
+    reporting them the same way is how a report ends up claiming an outage that
+    never happened:
+
+    * the target exposes no HTTP endpoint, so the prober asked a question it was
+      never going to get an answer to, and
+    * the target answered and then failed, which is a real measurement.
+
+    Only a refused connection distinguishes them. A timeout is deliberately not
+    treated as evidence of either: a filtered port, a silent host and a service
+    that never responds are indistinguishable from the client, so claiming to
+    know which it was would be a guess dressed as a finding.
+
+    Lives here rather than in either caller because both the engine's report and
+    the nuclear aggregator need the same distinction, and a second copy of this
+    rule is a second thing to keep in step with the first.
+    """
+    if not error:
+        return False
+    lowered = error.lower()
+    return any(marker in lowered for marker in NO_HTTP_SURFACE_MARKERS)
 
 
 class TargetObservation(Protocol):
@@ -101,6 +140,10 @@ class TargetObserver:
         self._url = f"http://{host}:{port}{path}"
         self._timeout = timeout
         self._last_error: str | None = None
+        # Why the most recent alive() sample failed, or None if it succeeded or
+        # has not run. Separate from _last_error, which belongs to read() and is
+        # about the /stats payload rather than about reachability.
+        self.last_probe_error: str | None = None
         if fetch is not None:
             self._fetch = fetch  # type: ignore[assignment]
         else:
@@ -142,11 +185,20 @@ class TargetObserver:
         whether the target is still responding rather than what it has counted.
         Never raises: an unreachable target is a failed sample, which is the
         measurement, not an error in the measuring.
+
+        The reason for the most recent failure is left on
+        :attr:`last_probe_error`. A boolean cannot distinguish "the target
+        collapsed" from "there was never an HTTP service here", and a report
+        that has to choose between those two readings is guessing unless it kept
+        the reason. Success clears it, so the attribute always describes the
+        latest sample rather than the latest failure.
         """
         try:
             await self._fetch(timeout)
-        except Exception:  # noqa: BLE001 - unavailability is the datum
+        except Exception as exc:  # noqa: BLE001 - unavailability is the datum
+            self.last_probe_error = f"{type(exc).__name__}: {exc}"
             return False
+        self.last_probe_error = None
         return True
 
     def window_sync(

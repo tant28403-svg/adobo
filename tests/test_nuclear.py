@@ -619,3 +619,146 @@ class TestParentProbeAccounting:
             aggregator._print_final_results()
         assert "target availability" not in buffer.getvalue().lower()
 
+
+class TestAvailabilityReportingIsNotAnOutageClaim:
+    """A 0% figure must not be reported as a target that fell over.
+
+    The regression this covers is a real run: a strike against a phone, which
+    serves no HTTP, produced 0 of 84 probes answered and the report then
+    asserted "The target stopped answering at least once while under load."
+    An independent observer on a second machine was pinging the same phone
+    throughout at 3-5ms with almost no loss, so the tool had declared an
+    outage that demonstrably had not happened.
+
+    A percentage cannot carry that distinction on its own - the same 0% means
+    opposite things depending on why the probes failed - so the report has to
+    say which it was, and say nothing it cannot support when it cannot tell.
+    """
+
+    @staticmethod
+    def _render(aggregator) -> str:
+        import io
+        from contextlib import redirect_stdout
+
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            aggregator._print_final_results()
+        return buffer.getvalue()
+
+    def test_refused_probes_are_not_reported_as_degradation(self) -> None:
+        aggregator = make_aggregator([make_profile()])
+        aggregator._probe_total = 84
+        aggregator._probe_ok = 0
+        aggregator._probe_failures = {"ConnectError": 84}
+        output = self._render(aggregator)
+        assert "0%" in output
+        assert "stopped answering" not in output.lower()
+        assert "NOT evidence that the target failed" in output
+
+    def test_refused_probes_say_availability_was_unmeasurable(self) -> None:
+        aggregator = make_aggregator([make_profile()])
+        aggregator._probe_total = 84
+        aggregator._probe_ok = 0
+        aggregator._probe_failures = {"ConnectError": 84}
+        output = self._render(aggregator)
+        assert "cannot be measured" in output
+
+    def test_answered_then_failed_is_reported_as_degradation(self) -> None:
+        """Some answers followed by failures is a result, and should read as one."""
+        aggregator = make_aggregator([make_profile()])
+        aggregator._probe_total = 20
+        aggregator._probe_ok = 4
+        aggregator._probe_failures = {"ReadTimeout": 16}
+        output = self._render(aggregator)
+        assert "consistent with real degradation" in output
+
+    def test_timeouts_alone_are_not_attributed_to_anything(self) -> None:
+        """A timeout cannot separate a filtered port from a dead service."""
+        aggregator = make_aggregator([make_profile()])
+        aggregator._probe_total = 20
+        aggregator._probe_ok = 0
+        aggregator._probe_failures = {"ReadTimeout": 20}
+        output = self._render(aggregator)
+        assert "unknown rather than inferred" in output
+        assert "stopped answering" not in output.lower()
+
+    def test_failure_reasons_are_itemised(self) -> None:
+        aggregator = make_aggregator([make_profile()])
+        aggregator._probe_total = 30
+        aggregator._probe_ok = 0
+        aggregator._probe_failures = {"ConnectTimeout": 20, "ReadTimeout": 10}
+        output = self._render(aggregator)
+        assert "20x ConnectTimeout" in output
+        assert "10x ReadTimeout" in output
+
+    def test_full_availability_claims_nothing_about_failure(self) -> None:
+        aggregator = make_aggregator([make_profile()])
+        aggregator._probe_total = 10
+        aggregator._probe_ok = 10
+        output = self._render(aggregator)
+        assert "100%" in output
+        assert "Probe failure reasons" not in output
+
+    def test_refused_detection_requires_every_failure_to_be_refused(self) -> None:
+        """One timeout among refusals is not evidence of an absent surface."""
+        aggregator = make_aggregator([make_profile()])
+        aggregator._probe_total = 10
+        aggregator._probe_ok = 0
+        aggregator._probe_failures = {"ConnectError": 9, "ReadTimeout": 1}
+        assert aggregator._probes_all_refused() is False
+
+    def test_refused_detection_is_false_when_any_probe_answered(self) -> None:
+        aggregator = make_aggregator([make_profile()])
+        aggregator._probe_total = 10
+        aggregator._probe_ok = 1
+        aggregator._probe_failures = {"ConnectError": 9}
+        assert aggregator._probes_all_refused() is False
+
+    def test_probe_failure_reason_is_recorded_per_attempt(self) -> None:
+        """alive() leaves the reason behind, and it is tallied by type."""
+        aggregator = make_aggregator([make_profile()])
+
+        class Refusing:
+            last_probe_error = "ConnectError: [Errno 111] Connection refused"
+
+            async def alive(self, timeout=None):
+                return False
+
+        aggregator._observer = Refusing()
+        aggregator._probe_total = 2
+        aggregator._record_probe_failure()
+        aggregator._record_probe_failure()
+        assert aggregator._probe_failures == {"ConnectError": 2}
+
+
+class TestRefusedConnection:
+    """The rule both the engine and the nuclear aggregator now share."""
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            "ConnectError: [Errno 111] Connection refused",
+            "httpx.ConnectError",
+            "connecterror: all connection attempts failed",
+        ],
+    )
+    def test_refusals_are_recognised(self, error: str) -> None:
+        from adobo.observation import refused_connection
+
+        assert refused_connection(error) is True
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            "ReadTimeout: timed out",
+            "ConnectTimeout: ",
+            "HTTP 503 Service Unavailable",
+            "",
+            None,
+        ],
+    )
+    def test_everything_else_is_not_a_refusal(self, error: str | None) -> None:
+        from adobo.observation import refused_connection
+
+        assert refused_connection(error) is False
+

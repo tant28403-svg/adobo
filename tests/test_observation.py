@@ -201,3 +201,34 @@ class TestAlive:
         """A target that is down is the measurement, not a fault in the prober."""
         observer = TargetObserver("127.0.0.1", closed_port, timeout=0.3)
         assert await observer.alive(0.3) is False
+
+    async def test_a_failure_records_why(self, closed_port: int) -> None:
+        """The reason is kept, because a boolean cannot report one.
+
+        Callers have to distinguish a target that collapsed from a port that
+        never served anything, and both arrive here as plain False.
+        """
+        observer = TargetObserver("127.0.0.1", closed_port, timeout=0.3)
+        assert observer.last_probe_error is None, "no sample taken yet"
+        assert await observer.alive(0.3) is False
+        assert observer.last_probe_error
+        assert observer.last_probe_error.split(":")[0].strip()
+
+    async def test_success_clears_the_previous_failure(self, stats_server) -> None:
+        """The attribute must describe the latest sample, not the latest failure."""
+        server, _ = stats_server
+        observer = TargetObserver("127.0.0.1", server.server_address[1])
+        await observer.alive()
+        assert observer.last_probe_error is None
+
+    async def test_a_failure_does_not_disturb_the_stats_error(self, closed_port: int) -> None:
+        """read() and alive() track different things and must not share state.
+
+        _last_error describes the /stats payload; last_probe_error describes
+        reachability. Conflating them would let a probe overwrite the reason the
+        delivery report gives for having no target-side evidence.
+        """
+        observer = TargetObserver("127.0.0.1", closed_port, timeout=0.3)
+        assert await observer.alive(0.3) is False
+        assert observer.last_probe_error
+        assert observer._last_error is None

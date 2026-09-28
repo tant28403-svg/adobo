@@ -16,7 +16,7 @@ from typing import Any
 from .models import ProfileName, RunConfig, Target, TransportKind, AttackProfile
 from .cancellation import CancelReason
 from .engine import EngineHooks, RunEngine
-from .observation import TargetObserver
+from .observation import TargetObserver, refused_connection
 from .transports import raw_capability
 @dataclass(frozen=True, slots=True)
 class NuclearProfile:
@@ -518,6 +518,11 @@ class NuclearAggregator:
         self._stats_after: tuple[int, int] | None = None
         self._probe_total = 0
         self._probe_ok = 0
+        # Why the probes failed, and how often. A bare ok/total pair cannot tell
+        # "the target collapsed" from "there was never an HTTP service to
+        # collapse", and those demand opposite conclusions, so the reason for
+        # each failure is recorded rather than discarded.
+        self._probe_failures: dict[str, int] = {}
         self._last_probe = 0.0
 
     @staticmethod
@@ -615,6 +620,125 @@ class NuclearAggregator:
                 self._probe_ok += 1
         except Exception:  # noqa: BLE001 - defensive; alive() already swallows
             pass
+        # alive() never raises, so reaching here with a failure means it
+        # returned False and left the reason behind. Counted by reason so the
+        # report can separate a refused connection from a timeout instead of
+        # reporting both as the same indistinguishable 0%.
+        if self._probe_total > self._probe_ok:
+            self._record_probe_failure()
+
+    def _record_probe_failure(self) -> None:
+        """Attribute the most recent failed probe to a reason.
+
+        The exception text is reduced to its type name so the same failure
+        collapses to one key. A raw message would differ per attempt - errno
+        text, ports, timeouts - and the tally would fill with near-duplicates
+        that no reader could sum.
+        """
+        error = getattr(self._observer, "last_probe_error", None)
+        if not error:
+            key = "unknown"
+        else:
+            key = error.split(":", 1)[0].strip() or "unknown"
+        self._probe_failures[key] = self._probe_failures.get(key, 0) + 1
+
+    def _probe_failures_had_timeouts(self) -> bool:
+        """True when any probe failure was a timeout rather than a refusal.
+
+        Only used to pick the wording of the ambiguous case. A timeout is the
+        reason worth naming explicitly, because it is the one a reader is most
+        likely to misread as a dead target; the distinction is about honesty of
+        phrasing, not about deciding anything.
+        """
+        return any(
+            "timeout" in key.lower() for key in self._probe_failures
+        )
+
+    def _probes_all_refused(self) -> bool:
+        """True when every failed probe was a refused connection.
+
+        A refusal says something about the target's *surface* - nothing is
+        listening there - rather than about its health. It is the only failure
+        that licenses that conclusion; a timeout cannot separate a filtered port
+        from a dead service, so those are left uncategorised.
+        """
+        if not self._probe_total or self._probe_ok:
+            return False
+        reasons = self._probe_failures or {}
+        refused = sum(
+            count for key, count in reasons.items() if refused_connection(key)
+        )
+        return refused == self._probe_total - self._probe_ok
+
+    def _print_availability(self) -> None:
+        """Report probe availability without claiming more than it measured.
+
+        A 0% figure is ambiguous on its own. The two situations behind it point
+        in opposite directions: a target that answered and then stopped is a
+        result, while a target that never served the probed endpoint is a
+        measurement that asked the wrong question. Printing the percentage
+        alone forces the reader to assume the first, which is how a run against
+        a device with no web server ends up reading as a successful outage that
+        never happened.
+
+        So the percentage is stated, and then what it does and does not
+        establish. Nothing here claims a target fell over unless the probes
+        actually support it.
+        """
+        if not self._probe_total:
+            return
+        pct = 100.0 * self._probe_ok / self._probe_total
+        print()
+        print("Target availability (probed by the parent during the strike):")
+        print(
+            f"  {pct:.0f}%  ({self._probe_ok} of {self._probe_total} "
+            f"probes answered)"
+        )
+
+        if pct == 100.0:
+            return
+
+        if self._probes_all_refused():
+            print(
+                f"  Every probe was refused, so the target served no HTTP endpoint "
+                f"on this port for the whole run. The 0% above records that the "
+                f"prober had nothing to talk to - it is NOT evidence that the "
+                f"target failed under load, and nothing here should be read as a "
+                f"measured outage."
+            )
+            print(
+                "  Against a target with no HTTP surface, availability cannot be "
+                "measured at all."
+            )
+            return
+
+        if self._probe_ok:
+            print(
+                f"  The target answered {self._probe_ok} of {self._probe_total} "
+                f"probes and then stopped answering some, which is consistent "
+                f"with real degradation under load."
+            )
+        elif self._probe_failures_had_timeouts():
+            print(
+                "  No probe was answered, and at least one failure was a "
+                "timeout. A timeout cannot separate a filtered port from a dead "
+                "service, so whether the target collapsed, was firewalled, or "
+                "was never reachable is unknown rather than inferred."
+            )
+        else:
+            print(
+                "  No probe was answered. The recorded failure reasons are not "
+                "one this tool knows how to interpret, so no conclusion is drawn "
+                "about whether the target collapsed."
+            )
+
+        if self._probe_failures:
+            breakdown = ", ".join(
+                f"{count}x {key}" for key, count in sorted(
+                    self._probe_failures.items(), key=lambda kv: -kv[1]
+                )
+            )
+            print(f"  Probe failure reasons: {breakdown}")
 
     def _print_progress(self, elapsed: float, remaining: float) -> None:
         """Print live progress table."""
@@ -748,13 +872,7 @@ class NuclearAggregator:
         self._print_profile_warnings(silent, empty)
         self._print_failure_reasons()
 
-        if self._probe_total:
-            pct = 100.0 * self._probe_ok / self._probe_total
-            print()
-            print("Target availability (probed by the parent during the strike):")
-            print(f"  {pct:.0f}%  ({self._probe_ok} of {self._probe_total} probes answered)")
-            if pct < 100.0:
-                print("  The target stopped answering at least once while under load.")
+        self._print_availability()
 
     def _addresses_observed_endpoint(self, profile: NuclearProfile) -> bool:
         """True if this profile sends HTTP requests to the port whose /stats was read.
