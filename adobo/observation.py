@@ -58,8 +58,18 @@ STATS_PATH = "/stats"
 # Text that means "nothing is listening on that port" rather than "the target was
 # reachable and then failed". Matched case-insensitively against the recorded
 # error, which carries the exception type name.
-NO_HTTP_SURFACE_MARKERS = ("connection refused", "connecterror")
-"""Deliberately narrow. See :func:`refused_connection`."""
+NO_HTTP_SURFACE_MARKERS = ("refused", "connecterror")
+"""Deliberately narrow. See :func:`refused_connection`.
+
+"refused" covers the spellings that actually reach here - the errno text
+"[Errno 111] Connection refused", and the bare exception name
+ConnectionRefusedError, which contains no space and so would be missed by a
+marker written as "connection refused". "connecterror" is separate because
+httpx wraps a refused connect in ConnectError, which never says "refused".
+
+Neither word appears in a timeout or a 5xx, so nothing here can be reached by
+the failure modes that must *not* be treated as evidence of an absent service.
+"""
 
 
 def refused_connection(error: str | None) -> bool:

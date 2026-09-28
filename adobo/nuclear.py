@@ -654,36 +654,78 @@ class NuclearAggregator:
             "timeout" in key.lower() for key in self._probe_failures
         )
 
-    def _probes_all_refused(self) -> bool:
-        """True when every failed probe was a refused connection.
+    def _refused_count(self) -> int:
+        """How many failed probes were refused connections."""
+        return sum(
+            count
+            for key, count in (self._probe_failures or {}).items()
+            if refused_connection(key)
+        )
 
-        A refusal says something about the target's *surface* - nothing is
-        listening there - rather than about its health. It is the only failure
-        that licenses that conclusion; a timeout cannot separate a filtered port
-        from a dead service, so those are left uncategorised.
+    def _no_http_surface(self) -> bool:
+        """True when the probes indicate no HTTP service was ever there.
+
+        Requires every failure to be a refusal. A single refused connection is
+        weak on its own - it could be a connection-limit artefact, or the target
+        briefly dropping a backlog - and a handful of refusals among many
+        timeouts says very little, because a service under load can refuse some
+        connections while timing out others.
+
+        A run where *every* probe was refused has established something the
+        reader needs: nothing was listening on that port for the whole run.
+
+        This is deliberately a different question from whether the target
+        collapsed, and the two are reported separately. Conflating them was the
+        original defect. The 100% threshold is nonetheless relaxed in one
+        direction by :meth:`_refusals_dominate`, so that an overwhelming
+        majority of refusals still informs the surface question instead of
+        being discarded by a single outlier - but the relaxed reading is always
+        labelled as an inference rather than a fact.
         """
         if not self._probe_total or self._probe_ok:
             return False
-        reasons = self._probe_failures or {}
-        refused = sum(
-            count for key, count in reasons.items() if refused_connection(key)
-        )
-        return refused == self._probe_total - self._probe_ok
+        return self._refused_count() == self._probe_total - self._probe_ok
+
+    def _refusals_dominate(self) -> bool:
+        """True when refusals are the overwhelming majority of all probes.
+
+        Set for the real phone run: 82 refusals against 1 timeout out of 83
+        probes, where no probe ever succeeded. The old strict test reported the
+        fully-ambiguous branch there, so the 82 refusals - which settle the
+        surface question - never reached the reader, and the report implied the
+        tool knew nothing when it knew almost everything.
+
+        The threshold is high on purpose. This is a reporting convenience, not
+        a new inference: a run that answered some probes and then refused the
+        rest has not established the absence of a service, it has established
+        that a service stopped answering, which is a different and stronger
+        finding. Hence the requirement that nothing succeeded.
+        """
+        if not self._probe_total or self._probe_ok:
+            return False
+        if self._no_http_surface():
+            return True
+        failed = self._probe_total - self._probe_ok
+        if not failed:
+            return False
+        return self._refused_count() / failed >= 0.95
 
     def _print_availability(self) -> None:
         """Report probe availability without claiming more than it measured.
 
-        A 0% figure is ambiguous on its own. The two situations behind it point
-        in opposite directions: a target that answered and then stopped is a
-        result, while a target that never served the probed endpoint is a
-        measurement that asked the wrong question. Printing the percentage
-        alone forces the reader to assume the first, which is how a run against
-        a device with no web server ends up reading as a successful outage that
-        never happened.
+        A 0% figure is ambiguous on its own, and behind it sit two independent
+        questions that often have *different* answers:
 
-        So the percentage is stated, and then what it does and does not
-        establish. Nothing here claims a target fell over unless the probes
-        actually support it.
+        1. Did the target serve the probed endpoint at all? A refusal answers
+           this - nothing was listening.
+        2. Did the target stop answering under load? Only a target that answered
+           and then did not answers this.
+
+        A run against a device with no web server scores 0% for a reason that
+        has nothing to do with load, and reporting that as an outage claims a
+        result the measurement cannot support. So each question is answered only
+        as far as the evidence reaches, and where the evidence runs out the
+        report says so rather than filling the gap with a plausible story.
         """
         if not self._probe_total:
             return
@@ -698,43 +740,109 @@ class NuclearAggregator:
         if pct == 100.0:
             return
 
-        if self._probes_all_refused():
-            print(
-                f"  Every probe was refused, so the target served no HTTP endpoint "
-                f"on this port for the whole run. The 0% above records that the "
-                f"prober had nothing to talk to - it is NOT evidence that the "
-                f"target failed under load, and nothing here should be read as a "
-                f"measured outage."
-            )
-            print(
-                "  Against a target with no HTTP surface, availability cannot be "
-                "measured at all."
-            )
-            return
+        # Every claim below is derived from the tallies rather than from which
+        # branch is taken. An earlier version asserted "no probe was refused"
+        # in its fallback branch without checking, and that sentence is simply
+        # untrue in a run like 1 answered / 99 refused.
+        failed = self._probe_total - self._probe_ok
+        refused = self._refused_count()
 
-        if self._probe_ok:
+        if not self._probe_ok and self._refusals_dominate():
+            # Question 1: nothing was ever listening. Either every failure was a
+            # refusal, or refusals were so overwhelming that the few outliers
+            # cannot outweigh them - reported as an inference in that case,
+            # because one timeout in 83 is still a timeout.
+            if failed == refused:
+                print(
+                    "  Every probe was refused, so the target served no HTTP "
+                    "endpoint on this port at any point in the run. Availability "
+                    "cannot be measured against a service that was never there."
+                )
+            else:
+                print(
+                    f"  {refused} of the {failed} failed probes were refused, so "
+                    f"the target most likely served no HTTP endpoint on this port. "
+                    f"Availability cannot be measured against it."
+                )
+                print(
+                    f"  The remaining {failed - refused} failure(s) were not "
+                    f"refusals, so this is an inference from the majority rather "
+                    f"than a fact about every sample."
+                )
             print(
-                f"  The target answered {self._probe_ok} of {self._probe_total} "
-                f"probes and then stopped answering some, which is consistent "
-                f"with real degradation under load."
-            )
-        elif self._probe_failures_had_timeouts():
-            print(
-                "  No probe was answered, and at least one failure was a "
-                "timeout. A timeout cannot separate a filtered port from a dead "
-                "service, so whether the target collapsed, was firewalled, or "
-                "was never reachable is unknown rather than inferred."
+                "  The 0% above is NOT evidence that the target failed under load, "
+                "and nothing here should be read as a measured outage."
             )
         else:
+            # Something was reachable at some point in the run.
+            if self._probe_ok:
+                print(
+                    f"  {self._probe_ok} of {self._probe_total} probes were "
+                    f"answered, so an HTTP service did exist on this port."
+                )
+            elif not refused:
+                # The important negative case. No probe was answered and nothing
+                # came back as a refusal, so every failure was silence. Silence
+                # is genuinely uninformative: a filtered port, a service that
+                # was already down, and an unreachable host all look identical
+                # from here. An earlier draft of this branch claimed "the port
+                # was accepting connections", which a timeout cannot establish -
+                # that is precisely the kind of claim this report exists to
+                # avoid making.
+                if self._probe_failures_had_timeouts():
+                    print(
+                        "  No probe was answered and none was refused, so every "
+                        "failure was silence. Silence cannot distinguish a "
+                        "filtered port from a target that was already down or "
+                        "unreachable, and this run does not claim to tell those "
+                        "apart."
+                    )
+                else:
+                    print(
+                        "  No probe was answered and none was refused. The "
+                        "recorded failure reasons are not ones this tool knows "
+                        "how to interpret, so no conclusion is drawn about "
+                        "whether the target was reachable at all."
+                    )
+            else:
+                # A refusal is a real packet back from the target, so it does
+                # establish that the host was alive and the path worked at those
+                # moments - which rules out "the target was down the whole time".
+                print(
+                    f"  No probe was answered, but {refused} of the {failed} "
+                    f"failures were refused connections, which means the target "
+                    f"host was alive and its network path worked at those moments. "
+                    f"It was not down for the whole run."
+                )
+                if self._probe_failures_had_timeouts():
+                    print(
+                        f"  The remaining {failed - refused} failure(s) were "
+                        f"timeouts. A target that answers some probes with a "
+                        f"refusal and others with silence is consistent with a "
+                        f"service that stopped accepting connections partway "
+                        f"through the run, but a timeout cannot confirm that "
+                        f"rather than a connection that was dropped while "
+                        f"overloaded."
+                    )
+                else:
+                    print(
+                        f"  The remaining {failed - refused} failure(s) were "
+                        f"neither refusals nor timeouts, so nothing further is "
+                        f"concluded about them."
+                    )
+
+        # Question 2: did it stop answering? Only answerable if it answered.
+        if self._probe_ok:
             print(
-                "  No probe was answered. The recorded failure reasons are not "
-                "one this tool knows how to interpret, so no conclusion is drawn "
-                "about whether the target collapsed."
+                f"  Separately, the target answered {self._probe_ok} of "
+                f"{self._probe_total} probes and stopped answering some, which "
+                f"is consistent with real degradation under load."
             )
 
         if self._probe_failures:
             breakdown = ", ".join(
-                f"{count}x {key}" for key, count in sorted(
+                f"{count}x {key}"
+                for key, count in sorted(
                     self._probe_failures.items(), key=lambda kv: -kv[1]
                 )
             )

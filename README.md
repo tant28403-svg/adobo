@@ -97,6 +97,36 @@ Report:  %ADOBO_HOME%\reports\<run_id>.html    (Windows)
 Run `ADOBO --help` to see your resolved config/output directories.
 ```
 
+### 4. (Optional) Start the lab target
+
+An attack on its own only proves packets were sent. The **lab target** is the
+other half: a deliberately fragile HTTP service that keeps its own count, so a
+run can be checked against an independent number instead of the sender's own
+claim.
+
+```bash
+# unhardened baseline - saturates, degrades, then stops answering
+python -m adobo.target --port 8000
+
+# hardened - sheds load deliberately and stays reachable
+python -m adobo.target --port 8000 --defenses all
+python -m adobo.target --port 8000 --defenses rate_limit,waf
+```
+
+`ADOBO --serve-target ...` is the same runner with the same flags.
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /healthz` | cheap liveness check; exempt from every mitigation so the prober measures the target rather than the WAF |
+| `GET /api/data` | the expensive one — simulated database work, tunable with `--work-ms` |
+| `GET /stats` | the target's own request and error counts, for correlating with the attack side |
+
+```bash
+# attack it, and the summary prints a delivery figure backed by /stats
+python -m adobo --host 127.0.0.1 --port 8000 \
+                --profile http_flood --pps 2000 --duration 10
+```
+
 ## Profiles & Transports
 
 | Profile | Transports | Description |

@@ -195,6 +195,206 @@ class TestNuclearAvailabilityWording:
         assert "no HTTP endpoint" in output
         assert "NOT evidence that the target failed" in output
 
+    def test_a_lone_timeout_does_not_discard_overwhelming_refusals(self) -> None:
+        """The real run: 82 refusals and 1 timeout out of 83 probes.
+
+        A 100% threshold reported the fully-ambiguous branch here, so the 82
+        refusals - which settle the surface question - never reached the reader.
+        The surface question and the health question have different answers, and
+        the report has to give both rather than collapsing them into one test.
+        """
+        agg = _aggregator()
+        agg._probe_total = 83
+        agg._probe_ok = 0
+        agg._probe_failures = {"ConnectError": 82, "ConnectTimeout": 1}
+        output = _render(agg)
+        assert "82 of the 83 failed probes were refused" in output
+        assert "Availability cannot be measured" in output
+        assert "NOT evidence that the target failed" in output
+        assert "inference from the majority rather than a fact" in output
+
+    def test_uneven_refusals_are_flagged_as_an_inference(self) -> None:
+        """A minority of non-refusals must not be presented as settled fact."""
+        agg = _aggregator()
+        agg._probe_total = 83
+        agg._probe_ok = 0
+        agg._probe_failures = {"ConnectError": 82, "ConnectTimeout": 1}
+        output = _render(agg)
+        assert "most likely served no HTTP endpoint" in output
+        assert "1 failure(s) were not refusals" in output
+
+    def test_uniform_refusals_are_stated_as_certain(self) -> None:
+        agg = _aggregator()
+        agg._probe_total = 84
+        agg._probe_ok = 0
+        agg._probe_failures = {"ConnectError": 84}
+        output = _render(agg)
+        assert "Every probe was refused" in output
+        assert "inference from the majority" not in output
+
+    def test_surface_and_health_are_answered_separately(self) -> None:
+        """A target that answered then went silent gets both readings.
+
+        Four probes answered, so an HTTP service demonstrably existed - the
+        later refusals cannot be read as "there was never a service here". The
+        degradation is a separate finding and is reported as one.
+        """
+        agg = _aggregator()
+        agg._probe_total = 20
+        agg._probe_ok = 4
+        agg._probe_failures = {"ConnectError": 10, "ReadTimeout": 6}
+        output = _render(agg)
+        assert "an HTTP service did exist" in output
+        assert "Separately, the target answered 4 of 20 probes" in output
+        assert "consistent with real degradation" in output
+        assert "no HTTP endpoint on this port" not in output
+
+    def test_a_service_that_existed_is_never_called_absent(self) -> None:
+        """Any answered probe rules out the "never served anything" reading."""
+        agg = _aggregator()
+        agg._probe_total = 100
+        agg._probe_ok = 1
+        agg._probe_failures = {"ConnectError": 99}
+        output = _render(agg)
+        assert "no HTTP endpoint" not in output
+        assert "an HTTP service did exist" in output
+
+    def test_timeouts_alone_never_claim_the_port_was_accepting(self) -> None:
+        """A timeout establishes silence, and silence establishes nothing.
+
+        An earlier draft of this branch reported "no probe was refused, so the
+        port was accepting connections". That inference is not available: a
+        filtered port, a service that was already down, and an unreachable host
+        all produce exactly the same silence. The report must say the run cannot
+        tell them apart instead of picking the friendliest one.
+        """
+        agg = _aggregator()
+        agg._probe_total = 20
+        agg._probe_ok = 0
+        agg._probe_failures = {"ReadTimeout": 20}
+        output = _render(agg)
+        assert "every failure was silence" in output
+        assert "does not claim to tell those apart" in output
+        assert "the port was accepting" not in output
+        assert "the port was reachable" not in output
+
+    def test_a_refusal_proves_the_host_was_alive_at_that_moment(self) -> None:
+        """A RST is a real packet back, so it rules out "down the whole run"."""
+        agg = _aggregator()
+        agg._probe_total = 20
+        agg._probe_ok = 0
+        agg._probe_failures = {"ConnectError": 10, "ReadTimeout": 10}
+        output = _render(agg)
+        assert "the target host was alive and its network path worked" in output
+        assert "It was not down for the whole run" in output
+        assert "consistent with a service that stopped accepting" in output
+
+    def test_unrecognised_failures_claim_nothing_about_reachability(self) -> None:
+        agg = _aggregator()
+        agg._probe_total = 20
+        agg._probe_ok = 0
+        agg._probe_failures = {"SomeVendorError": 20}
+        output = _render(agg)
+        assert "no conclusion is drawn" in output
+        assert "accepting connections" not in output
+
+    def test_no_branch_ever_claims_a_probe_reached_a_healthy_service(self) -> None:
+        """Guard: silence is never upgraded into a reachability claim.
+
+        Walks every probe outcome the tool can record and checks that the only
+        assertions about a live service come from probes that were actually
+        answered. The original defect in this file was exactly this kind of
+        upgrade, and a per-branch assertion does not catch it appearing in a
+        branch nobody thought to test.
+        """
+        for total, ok, failures in (
+            (84, 0, {"ConnectError": 84}),
+            (83, 0, {"ConnectError": 82, "ConnectTimeout": 1}),
+            (20, 0, {"ConnectError": 10, "ReadTimeout": 10}),
+            (20, 0, {"ReadTimeout": 20}),
+            (20, 0, {"SomeVendorError": 20}),
+            (20, 4, {"ReadTimeout": 10, "ConnectError": 6}),
+            (100, 1, {"ConnectError": 99}),
+        ):
+            agg = _aggregator()
+            agg._probe_total = total
+            agg._probe_ok = ok
+            agg._probe_failures = failures
+            output = _render(agg)
+            # Scoped to the assertive form. "stopped accepting connections
+            # partway through" is a hedged hypothesis about a service that
+            # existed, which is a different and legitimate claim.
+            assert "the port was accepting" not in output, (total, ok, failures)
+            assert "the port was reachable" not in output, (total, ok, failures)
+            if not ok:
+                assert "an HTTP service did exist" not in output
+            # The blanket "NOT evidence of failure" disclaimer is reserved for
+            # the no-surface branch, where nothing ever existed to degrade. In
+            # the mixed case a real change of state is a live hypothesis and the
+            # disclaimer would suppress a genuine finding.
+            dominates = (
+                not ok
+                and failures
+                and sum(c for k, c in failures.items() if "refus" in k or "connecterror" in k.lower())
+                / sum(failures.values())
+                >= 0.95
+            )
+            if dominates:
+                assert "NOT evidence that the target failed" in output, failures
+            else:
+                assert "NOT evidence that the target failed" not in output, failures
+
+    def test_refused_count_is_summed_across_reason_types(self) -> None:
+        """Two different exception names can both record a refusal.
+
+        httpx raises ConnectError for a refused TCP connection, and a socket
+        error surfacing through a different client arrives as
+        ConnectionRefusedError. Both mean the same thing to this rule, so
+        counting only one of them would understate the evidence.
+        """
+        agg = _aggregator()
+        agg._probe_failures = {
+            "ConnectError": 70,
+            "ConnectionRefusedError": 12,
+            "ReadTimeout": 5,
+        }
+        assert agg._refused_count() == 82
+
+    @pytest.mark.parametrize(
+        "ok,total,failures,expected",
+        [
+            # Strict: every failure refused.
+            (0, 10, {"ConnectError": 10}, True),
+            # The real run: one timeout in 83 still counts as a majority.
+            (0, 83, {"ConnectError": 82, "ConnectTimeout": 1}, True),
+            (0, 20, {"ConnectError": 19, "ReadTimeout": 1}, True),
+            # Below the threshold: genuinely mixed, so not a surface finding.
+            (0, 20, {"ConnectError": 10, "ReadTimeout": 10}, False),
+            (0, 20, {"ConnectError": 18, "ReadTimeout": 2}, False),
+            # Something answered, so a service existed regardless of refusals.
+            (1, 20, {"ConnectError": 19}, False),
+            (0, 0, {}, False),
+        ],
+    )
+    def test_refusal_majority_threshold(
+        self, ok: int, total: int, failures: dict, expected: bool
+    ) -> None:
+        """The relaxed threshold must not swallow genuinely mixed evidence."""
+        agg = _aggregator()
+        agg._probe_total = total
+        agg._probe_ok = ok
+        agg._probe_failures = failures
+        assert agg._refusals_dominate() is expected
+
+    def test_strict_and_relapsed_agree_on_a_uniform_run(self) -> None:
+        agg = _aggregator()
+        agg._probe_total = 84
+        agg._probe_ok = 0
+        agg._probe_failures = {"ConnectError": 84}
+        assert agg._no_http_surface() is True
+        assert agg._no_http_surface() is True
+        assert agg._refusals_dominate() is True
+
     def test_refused_probes_call_availability_unmeasurable(self) -> None:
         agg = _aggregator()
         agg._probe_total = 84
@@ -211,12 +411,14 @@ class TestNuclearAvailabilityWording:
         assert "consistent with real degradation" in _render(agg)
 
     def test_timeouts_are_attributed_to_nothing(self) -> None:
+        """All-timeout, nothing answered: the run states its own blindness."""
         agg = _aggregator()
         agg._probe_total = 20
         agg._probe_ok = 0
         agg._probe_failures = {"ReadTimeout": 20}
         output = _render(agg)
-        assert "unknown rather than inferred" in output
+        assert "cannot distinguish a filtered port" in output
+        assert "does not claim to tell those apart" in output
         assert "stopped answering" not in output.lower()
 
     def test_a_timeout_wording_does_not_leak_into_other_reasons(self) -> None:
@@ -287,7 +489,7 @@ class TestNuclearAvailabilityWording:
         agg._probe_total = total
         agg._probe_ok = ok
         agg._probe_failures = failures
-        assert agg._probes_all_refused() is expected
+        assert agg._no_http_surface() is expected
 
     def test_failure_reason_is_tallied_by_type(self) -> None:
         """Raw exception text differs per attempt and would not sum."""

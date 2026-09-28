@@ -679,7 +679,8 @@ class TestAvailabilityReportingIsNotAnOutageClaim:
         aggregator._probe_ok = 0
         aggregator._probe_failures = {"ReadTimeout": 20}
         output = self._render(aggregator)
-        assert "unknown rather than inferred" in output
+        assert "cannot distinguish a filtered port" in output
+        assert "does not claim to tell those apart" in output
         assert "stopped answering" not in output.lower()
 
     def test_failure_reasons_are_itemised(self) -> None:
@@ -705,14 +706,14 @@ class TestAvailabilityReportingIsNotAnOutageClaim:
         aggregator._probe_total = 10
         aggregator._probe_ok = 0
         aggregator._probe_failures = {"ConnectError": 9, "ReadTimeout": 1}
-        assert aggregator._probes_all_refused() is False
+        assert aggregator._no_http_surface() is False
 
     def test_refused_detection_is_false_when_any_probe_answered(self) -> None:
         aggregator = make_aggregator([make_profile()])
         aggregator._probe_total = 10
         aggregator._probe_ok = 1
         aggregator._probe_failures = {"ConnectError": 9}
-        assert aggregator._probes_all_refused() is False
+        assert aggregator._no_http_surface() is False
 
     def test_probe_failure_reason_is_recorded_per_attempt(self) -> None:
         """alive() leaves the reason behind, and it is tallied by type."""

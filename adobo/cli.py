@@ -162,7 +162,16 @@ def build_parser() -> argparse.ArgumentParser:
         description="ADOBO - Network Stress Tester",
     )
     parser.add_argument("--host", help="target IP")
-    parser.add_argument("--port", type=int, default=80, help="target port (default: 80)")
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help=(
+            "target port (default: 80, or 8000 under --serve-target). Left as "
+            "None rather than 80 so --serve-target can tell 'not given' from "
+            "'given as 80' and apply its own default"
+        ),
+    )
     parser.add_argument("--profile", choices=ALL_PROFILES, default="udp_flood", help="attack profile (default: udp_flood)")
     parser.add_argument("--pps", type=int, default=5000, help="packets per second (default: 5000)")
     parser.add_argument("--duration", type=float, default=10.0, help="duration in seconds (default: 10)")
@@ -176,6 +185,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="run the interactive nuclear wizard instead of a single profile",
     )
     parser.add_argument("--quiet", action="store_true", help="suppress progress output")
+    parser.add_argument(
+        "--serve-target",
+        action="store_true",
+        help=(
+            "serve the lab target instead of attacking anything: a deliberately "
+            "fragile HTTP service with /healthz, /stats and /api/data, so a run "
+            "has something to measure a result against"
+        ),
+    )
+    parser.add_argument(
+        "--defenses",
+        default="none",
+        help=(
+            "mitigations for --serve-target, comma-separated or 'all'/'none' "
+            "(default: none, i.e. the unhardened baseline)"
+        ),
+    )
+    parser.add_argument(
+        "--work-ms",
+        type=int,
+        default=None,
+        help="simulated database work per /api/data request, in ms (--serve-target)",
+    )
     return parser
 
 
@@ -198,7 +230,7 @@ def config_from_args(args: argparse.Namespace) -> RunConfig:
         spoof_sources = True
 
     return RunConfig(
-        target=Target(host=args.host, port=args.port),
+        target=Target(host=args.host, port=args.port if args.port is not None else 80),
         attack=AttackProfile(
             profile=profile,
             pps=args.pps,
@@ -234,6 +266,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     _print_banner()
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    # Serving the target is the other half of the tool, and it is a different job
+    # from attacking: nothing here is a flood, so the wizard and the run engine
+    # must not be reached. Delegating rather than reimplementing keeps
+    # `adobo --serve-target` and `python -m adobo.target` on one code path.
+    if args.serve_target:
+        from .target.__main__ import main as target_main
+
+        return target_main(
+            [
+                "--host", args.host or "127.0.0.1",
+                # Only forwarded when given, so the target's own default of 8000
+                # survives instead of being overridden by the attack path's 80.
+                *(["--port", str(args.port)] if args.port is not None else []),
+                "--defenses", args.defenses,
+                *(["--work-ms", str(args.work_ms)] if args.work_ms is not None else []),
+            ]
+        )
 
     # Nuclear mode with no --host, or when asked for explicitly. The wizard is
     # interactive, so it reads stdin; a Ctrl-C inside it is a normal way to back
