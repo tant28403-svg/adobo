@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import socket
 import socketserver
+import ssl
 import struct
 import sys
 import threading
@@ -1278,3 +1279,219 @@ class TestFrozenImportSafety:
             assert isinstance(raw_capability(), RawCapability)
         finally:
             os.chdir(previous)
+
+
+# ---------------------------------------------------------------------------
+# Keep-alive and TLS tests
+# ---------------------------------------------------------------------------
+
+
+class TestSocketTransportKeepAlive:
+    """Tests for HTTP keep-alive mode.
+
+    Keep-alive reuses the TCP connection across requests, which dramatically
+    increases throughput but loses the per-request delivery guarantee: a local
+    ``sendall`` can succeed after the peer has closed the connection, so the
+    sender's counter may overcount. These tests verify the behaviour and that
+    the trade-off is correctly implemented.
+    """
+
+    def test_keep_alive_disables_per_request_close(self) -> None:
+        """In keep-alive mode, _close_per_request must be False."""
+        target = Target(host="127.0.0.1", port=8000)
+        transport = SocketTransport(
+            target, ProfileName.HTTP_FLOOD, keep_alive=True
+        )
+        assert transport.keep_alive is True
+        assert transport._close_per_request is False
+
+    def test_keep_alive_defaults_to_per_request_close(self) -> None:
+        """Without keep-alive, per-request close is the default for honesty."""
+        target = Target(host="127.0.0.1", port=8000)
+        transport = SocketTransport(
+            target, ProfileName.HTTP_FLOOD, keep_alive=False
+        )
+        assert transport.keep_alive is False
+        assert transport._close_per_request is True
+
+    def test_describe_includes_keep_alive(self) -> None:
+        """The describe() output must include keep_alive for reporting."""
+        target = Target(host="127.0.0.1", port=8000)
+        transport = SocketTransport(
+            target, ProfileName.HTTP_FLOOD, keep_alive=True
+        )
+        desc = transport.describe()
+        assert desc.get("keep_alive") is True
+
+        transport2 = SocketTransport(target, ProfileName.HTTP_FLOOD, keep_alive=False)
+        desc2 = transport2.describe()
+        assert desc2.get("keep_alive") is False
+
+    def test_keep_alive_and_tls_can_be_combined(self) -> None:
+        """Keep-alive and TLS are orthogonal and can be used together."""
+        target = Target(host="127.0.0.1", port=443)
+        transport = SocketTransport(
+            target,
+            ProfileName.HTTP_FLOOD,
+            keep_alive=True,
+            use_tls=True,
+            tls_verify=False,
+        )
+        assert transport.keep_alive is True
+        assert transport.use_tls is True
+        assert transport._close_per_request is False
+        desc = transport.describe()
+        assert desc.get("keep_alive") is True
+        assert desc.get("use_tls") is True
+
+
+class TestSocketTransportTLS:
+    """Tests for TLS/HTTPS support in the socket transport."""
+
+    def test_use_tls_creates_ssl_context(self) -> None:
+        """use_tls=True must create an SSL context."""
+        target = Target(host="127.0.0.1", port=443)
+        transport = SocketTransport(
+            target, ProfileName.HTTP_FLOOD, use_tls=True
+        )
+        assert transport.use_tls is True
+        assert transport._tls_context is None  # Built on open()
+        assert transport.tls_verify is True
+
+    def test_tls_no_verify_disables_verification(self) -> None:
+        """tls_verify=False must disable hostname and cert verification."""
+        target = Target(host="127.0.0.1", port=443)
+        transport = SocketTransport(
+            target, ProfileName.HTTP_FLOOD, use_tls=True, tls_verify=False
+        )
+        assert transport.tls_verify is False
+        ctx = transport._build_tls_context()
+        assert ctx.check_hostname is False
+        assert ctx.verify_mode == ssl.CERT_NONE
+
+    def test_tls_default_verifies(self) -> None:
+        """Default TLS behaviour must verify hostname and cert."""
+        target = Target(host="127.0.0.1", port=443)
+        transport = SocketTransport(
+            target, ProfileName.HTTP_FLOOD, use_tls=True
+        )
+        ctx = transport._build_tls_context()
+        assert ctx.check_hostname is True
+        assert ctx.verify_mode == ssl.CERT_REQUIRED
+
+    def test_describe_includes_use_tls(self) -> None:
+        """The describe() output must include use_tls for reporting."""
+        target = Target(host="127.0.0.1", port=443)
+        transport = SocketTransport(target, ProfileName.HTTP_FLOOD, use_tls=True)
+        desc = transport.describe()
+        assert desc.get("use_tls") is True
+
+
+class TestCLIConfigFromArgs:
+    """Tests for CLI argument parsing and config construction."""
+
+    def test_keep_alive_flag_reaches_attack_profile(self) -> None:
+        """--keep-alive must set attack.keep_alive."""
+        from adobo.cli import config_from_args
+
+        class Args:
+            profile = "http_flood"
+            pps = 100
+            duration = 1
+            payload = 512
+            workers = 4
+            spoof_sources = False
+            keep_alive = True
+            tls = False
+            tls_no_verify = False
+            host = "127.0.0.1"
+            port = 8000
+            transport = "auto"
+
+        config = config_from_args(Args())
+        assert config.attack.keep_alive is True
+
+    def test_tls_flag_reaches_attack_profile(self) -> None:
+        """--tls must set attack.use_tls."""
+        from adobo.cli import config_from_args
+
+        class Args:
+            profile = "http_flood"
+            pps = 100
+            duration = 1
+            payload = 512
+            workers = 4
+            spoof_sources = False
+            keep_alive = False
+            tls = True
+            tls_no_verify = False
+            host = "127.0.0.1"
+            port = 443
+            transport = "auto"
+
+        config = config_from_args(Args())
+        assert config.attack.use_tls is True
+        assert config.attack.tls_verify is True
+
+    def test_tls_no_verify_implies_tls(self) -> None:
+        """--tls-no-verify must imply --tls and disable verification."""
+        from adobo.cli import config_from_args
+
+        class Args:
+            profile = "http_flood"
+            pps = 100
+            duration = 1
+            payload = 512
+            workers = 4
+            spoof_sources = False
+            keep_alive = False
+            tls = False
+            tls_no_verify = True
+            host = "127.0.0.1"
+            port = 8000
+            transport = "auto"
+
+        config = config_from_args(Args())
+        assert config.attack.use_tls is True
+        assert config.attack.tls_verify is False
+
+    def test_auto_tls_on_port_443(self) -> None:
+        """Port 443 must auto-enable TLS even without --tls flag."""
+        from adobo.cli import config_from_args
+
+        class Args:
+            profile = "http_flood"
+            pps = 100
+            duration = 1
+            payload = 512
+            workers = 4
+            spoof_sources = False
+            keep_alive = False
+            tls = False
+            tls_no_verify = False
+            host = "127.0.0.1"
+            port = 443
+            transport = "auto"
+
+        config = config_from_args(Args())
+        assert config.attack.use_tls is True
+
+    def test_get_transport_passes_keep_alive_and_tls(self) -> None:
+        """get_transport must pass keep_alive and use_tls to SocketTransport."""
+        config = RunConfig(
+            target=Target(host="127.0.0.1", port=8000),
+            attack=AttackProfile(
+                profile=ProfileName.HTTP_FLOOD,
+                pps=100,
+                duration_seconds=1,
+                keep_alive=True,
+                use_tls=True,
+                tls_verify=False,
+            ),
+            transport=TransportKind.SOCKET,
+        )
+        transport = get_transport(config)
+        assert isinstance(transport, SocketTransport)
+        assert transport.keep_alive is True
+        assert transport.use_tls is True
+        assert transport.tls_verify is False

@@ -151,7 +151,15 @@ def get_transport(config: RunConfig) -> Transport:
     if config.transport is TransportKind.SOCKET:
         if profile is ProfileName.SLOWLORIS:
             return SlowlorisTransport(config.target, profile)
-        return SocketTransport(config.target, profile)
+        attack = config.attack
+        return SocketTransport(
+            config.target,
+            profile,
+            keep_alive=attack.keep_alive,
+            use_tls=attack.use_tls,
+            tls_verify=attack.tls_verify,
+            sndbuf=65536,
+        )
 
     if config.transport is TransportKind.LINUX_RAW:
         # Import locally to avoid circular imports

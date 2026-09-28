@@ -24,7 +24,7 @@ limits:
   max_pps: 20000
   max_duration_seconds: 60
   max_payload_bytes: 1400
-  max_workers: 8
+  max_workers: 200
 
 # Default target: the local vulnerable app started by `ADOBO target`.
 target:

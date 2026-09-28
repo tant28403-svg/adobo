@@ -18,7 +18,6 @@ reach them.
 from __future__ import annotations
 
 import socket
-import ssl
 from typing import ClassVar
 
 from ..models import ProfileName, Target, TransportKind
@@ -60,9 +59,6 @@ class SocketTransport(Transport):
         connect_timeout: float = DEFAULT_CONNECT_TIMEOUT,
         sndbuf: int = DEFAULT_SNDBUF,
         tcp_path: str = "/api/data",
-        keep_alive: bool = False,
-        use_tls: bool = False,
-        tls_verify: bool = True,
     ) -> None:
         super().__init__(target, profile)
         if not supports_profile(TransportKind.SOCKET, profile):
@@ -76,26 +72,14 @@ class SocketTransport(Transport):
         self.connect_timeout = connect_timeout
         self.sndbuf = sndbuf
         self.tcp_path = tcp_path
-        self.keep_alive = keep_alive
-        self.use_tls = use_tls
-        self.tls_verify = tls_verify
         self._sock: socket.socket | None = None
         self._family = socket.AF_INET
         self._using_tcp = profile is ProfileName.HTTP_FLOOD
-        # In keep-alive mode we reuse the connection and send
-        # "Connection: keep-alive". Otherwise we close per request for
-        # delivery certainty (see _send_tcp docstring).
-        self._close_per_request = self._using_tcp and not keep_alive
-        self._tls_context: ssl.SSLContext | None = None
-        self._tls_wrapped: bool = False
-
-    def _build_tls_context(self) -> ssl.SSLContext:
-        """Build SSL context for HTTPS connections."""
-        ctx = ssl.create_default_context()
-        if not self.tls_verify:
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-        return ctx
+        # Every HTTP payload this transport builds declares ``Connection:
+        # close``, so the target will hang up after each response and the socket
+        # cannot be reused. Connecting per request is what makes a successful
+        # send mean anything.
+        self._close_per_request = self._using_tcp
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -131,14 +115,6 @@ class SocketTransport(Transport):
                 pass
             if self._using_tcp:
                 self._connect(sockaddr)
-                # Wrap with TLS after successful TCP connect
-                if self.use_tls:
-                    self._tls_context = self._build_tls_context()
-                    self._sock = self._tls_context.wrap_socket(
-                        self._sock,
-                        server_hostname=self.target.host
-                    )
-                    self._tls_wrapped = True
         except OSError as exc:
             self._teardown()
             raise TransportError(
@@ -182,7 +158,6 @@ class SocketTransport(Transport):
             finally:
                 self._sock = None
         self._open = False
-        self._tls_wrapped = False
 
     def _close_socket(self) -> None:
         """Release just the socket, leaving the transport logically open.
@@ -260,12 +235,6 @@ class SocketTransport(Transport):
 
         A target that ignores ``Connection: close`` would still benefit from the
         per-request connect, so this does not depend on the peer behaving.
-
-        In keep-alive mode (``self.keep_alive=True``), the connection is reused
-        and ``Connection: keep-alive`` is sent. On send error, we reconnect once
-        and retry, same as per-request mode. The trade-off is that a local
-        ``sendall`` can succeed after the peer has closed, so delivery figures
-        may overcount.
         """
         assert self._sock is not None
         if self._close_per_request:
@@ -287,7 +256,6 @@ class SocketTransport(Transport):
                 raise TransportError(f"TCP send failed after reconnect: {exc}") from exc
         if self._close_per_request:
             self._finish_request()
-        # In keep-alive mode, we leave the socket open for the next request.
 
     def _finish_request(self) -> None:
         """Close out a per-request connection without discarding the request.
@@ -329,12 +297,11 @@ class SocketTransport(Transport):
             self._counters.record_response(total)
         self._close_socket()
 
+
     # -- observation -------------------------------------------------------
 
     def describe(self) -> dict[str, object]:
         info = super().describe()
         info["protocol"] = "tcp" if self._using_tcp else "udp"
         info["send_timeout_s"] = self.send_timeout
-        info["keep_alive"] = self.keep_alive
-        info["use_tls"] = self.use_tls
         return info

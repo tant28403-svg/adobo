@@ -117,6 +117,9 @@ class AttackProfile(BaseModel):
     payload_size: int = Field(default=512, ge=0, le=65507)
     workers: int = Field(default=4, ge=1)
     spoof_sources: bool = False
+    keep_alive: bool = False
+    use_tls: bool = False
+    tls_verify: bool = True
 
     def clamped(self, **overrides: Any) -> "AttackProfile":
         """Return a copy with fields replaced. Used by the safety layer."""

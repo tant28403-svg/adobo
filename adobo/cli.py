@@ -180,6 +180,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workers", type=int, default=4, help="worker threads (default: 4)")
     parser.add_argument("--spoof-sources", action="store_true", help="spoof source IP (requires --transport scapy + Admin)")
     parser.add_argument(
+        "--keep-alive",
+        action="store_true",
+        help="Reuse HTTP connections for http_flood (higher throughput; delivery may overcount if target closes connections)",
+    )
+    parser.add_argument(
+        "--tls",
+        action="store_true",
+        help="Use TLS/HTTPS for http_flood (auto-enabled on port 443)",
+    )
+    parser.add_argument(
+        "--tls-no-verify",
+        action="store_true",
+        help="Disable TLS certificate verification (lab only; implies --tls)",
+    )
+    parser.add_argument(
         "--nuclear",
         action="store_true",
         help="run the interactive nuclear wizard instead of a single profile",
@@ -229,6 +244,13 @@ def config_from_args(args: argparse.Namespace) -> RunConfig:
     if not spoof_sources and args.profile in AMPLIFICATION_PROFILES:
         spoof_sources = True
 
+    # Auto-enable TLS on port 443
+    use_tls = args.tls
+    if not use_tls and args.port == 443:
+        use_tls = True
+    if args.tls_no_verify:
+        use_tls = True
+
     return RunConfig(
         target=Target(host=args.host, port=args.port if args.port is not None else 80),
         attack=AttackProfile(
@@ -238,6 +260,9 @@ def config_from_args(args: argparse.Namespace) -> RunConfig:
             payload_size=args.payload,
             workers=args.workers,
             spoof_sources=spoof_sources,
+            keep_alive=args.keep_alive,
+            use_tls=use_tls,
+            tls_verify=not args.tls_no_verify,
         ),
         transport=TransportKind(transport),
         defenses=[],

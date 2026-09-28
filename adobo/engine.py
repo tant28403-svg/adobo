@@ -901,6 +901,12 @@ class RunEngine:
             )
         if self.config.dry_run:
             notes.append("Dry run: no packets were sent.")
+        if self.config.attack.keep_alive:
+            notes.append(
+                "Keep-alive enabled: delivery figures may overcount if the target "
+                "closes connections between requests, because a local sendall() "
+                "can succeed after the peer has closed."
+            )
         if not self._probes_enabled() and not self.config.dry_run:
             notes.append("Probes disabled for this run.")
         elif self._probes_enabled() and not self._probes:
