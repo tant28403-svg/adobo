@@ -1292,7 +1292,7 @@ def _ask_yes_no(prompt: str, default: bool) -> bool:
         print("  Please answer 'y' or 'n'")
 
 
-def nuclear_wizard() -> int:
+def nuclear_wizard(skip_reflector_prompts: bool = False) -> int:
     """Interactive wizard for nuclear mode."""
     print("\n=== Nuclear Strike ===")
     host = _ask("Target IP")
@@ -1305,16 +1305,17 @@ def nuclear_wizard() -> int:
         "cldap": 389,
         "ssdp": 1900,
     }
-    print("\n--- Amplification Reflector Ports (auto-filled) ---")
-    print(f"  DNS reflector port: {reflector_ports['dns']}")
-    print(f"  NTP reflector port: {reflector_ports['ntp']}")
-    print(f"  CLDAP reflector port: {reflector_ports['cldap']}")
-    print(f"  SSDP reflector port: {reflector_ports['ssdp']}")
-    print("  (Press Enter to use defaults, or enter custom values)")
-    reflector_ports["dns"] = _ask_int("DNS reflector port", reflector_ports["dns"])
-    reflector_ports["ntp"] = _ask_int("NTP reflector port", reflector_ports["ntp"])
-    reflector_ports["cldap"] = _ask_int("CLDAP reflector port", reflector_ports["cldap"])
-    reflector_ports["ssdp"] = _ask_int("SSDP reflector port", reflector_ports["ssdp"])
+    if not skip_reflector_prompts:
+        print("\n--- Amplification Reflector Ports (auto-filled) ---")
+        print(f"  DNS reflector port: {reflector_ports['dns']}")
+        print(f"  NTP reflector port: {reflector_ports['ntp']}")
+        print(f"  CLDAP reflector port: {reflector_ports['cldap']}")
+        print(f"  SSDP reflector port: {reflector_ports['ssdp']}")
+        print("  (Press Enter to use defaults, or enter custom values)")
+        reflector_ports["dns"] = _ask_int("DNS reflector port", reflector_ports["dns"])
+        reflector_ports["ntp"] = _ask_int("NTP reflector port", reflector_ports["ntp"])
+        reflector_ports["cldap"] = _ask_int("CLDAP reflector port", reflector_ports["cldap"])
+        reflector_ports["ssdp"] = _ask_int("SSDP reflector port", reflector_ports["ssdp"])
     
     pps = _ask_int("PPS per profile", 500)
     duration = _ask_float("Duration (s)", 60)
