@@ -16,6 +16,8 @@ dependencies = [
     "pyyaml>=6.0",
     # adobo.monitor imports psutil to sample the local target process.
     "psutil>=5.9",
+    # adobo.engine imports httpx for target health probing.
+    "httpx>=0.28",
     # Banner rendering
     "pyfiglet>=1.0",
 ]

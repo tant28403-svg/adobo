@@ -17,14 +17,29 @@ Authorised DDoS resilience lab. A tool for measuring how your services behave un
 Download `ADOBO.exe` from the releases page. No dependencies, no install.
 
 ### From source (Python 3.11+)
+**No install required — run directly from the clone:**
+```bash
+git clone https://github.com/tant28403-svg/adobo.git
+cd adobo
+python -m adobo --nuclear
+```
+
+If dependencies are missing (Kali blocks system pip), install them with the override flag:
+```bash
+pip install --break-system-packages pydantic pyyaml psutil pyfiglet httpx
+# or create a venv:
+python -m venv .venv && source .venv/bin/activate && pip install -e .
+```
+
+Editable install (gives you the `ADOBO` command):
 ```bash
 # From PyPI
 pip install adobo
 # or with raw-socket support (needs Npcap + Admin on Windows):
 pip install adobo[raw]
 
-# From a local clone (Linux / macOS / Windows)
-git clone https://github.com/<your-org>/adobo.git
+# From a local clone
+git clone https://github.com/tant28403-svg/adobo.git
 cd adobo
 pip install -e .              # editable install
 # or with raw transport (scapy):
@@ -44,6 +59,12 @@ Edit `config/authorization.yaml` — set `expires_on` to a future date
 Edit `config/lab.yaml` — add your lab CIDR to `allowed_cidrs`
 
 ### 2. Run the wizard
+**No install:**
+```bash
+python -m adobo
+```
+
+**With editable install (gives `ADOBO` command):**
 ```bash
 ADOBO
 ```
