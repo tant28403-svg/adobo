@@ -847,6 +847,38 @@ class RunEngine:
             ProfileName.SSDP_AMPLIFICATION: 30.0,
         }.get(profile)
 
+    # Probe failure text that means "nothing is listening on that port" rather
+    # than "the target was reachable and failed". Matched case-insensitively
+    # against the recorded error, which carries the exception type name.
+    _NO_HTTP_SURFACE_MARKERS = ("connection refused", "connecterror")
+    """Deliberately narrow. See :meth:`_target_lacks_http_surface`."""
+
+    def _target_lacks_http_surface(self) -> bool:
+        """True when every probe failed by refusing the connection.
+
+        Two very different situations produce an identical 0% availability, and
+        reporting them the same way is how a report ends up claiming an outage
+        that never happened:
+
+        * the target exposes no HTTP endpoint, so the prober asked a question it
+          was never going to get an answer to, and
+        * the target answered and then failed, which is a real measurement.
+
+        Only a refused connection distinguishes them. A timeout is deliberately
+        not treated as evidence of either: a filtered port, a silent host and a
+        service that never responds are indistinguishable from the client, so
+        claiming to know which it was would be a guess dressed as a finding.
+        """
+        if not self._probes:
+            return False
+        for probe in self._probes:
+            if probe.ok:
+                return False
+            error = (probe.error or "").lower()
+            if not any(marker in error for marker in self._NO_HTTP_SURFACE_MARKERS):
+                return False
+        return True
+
     def _notes(self, reason: CancelReason, cancelled: bool) -> list[str]:
         notes: list[str] = []
         if reason is CancelReason.DEADLINE:
@@ -895,6 +927,17 @@ class RunEngine:
                 "Availability was not measured: the run ended before the first "
                 "probe completed. Availability figures are absent rather than "
                 "assumed good."
+            )
+        if self._probes_enabled() and self._target_lacks_http_surface():
+            notes.append(
+                f"Every probe to {self.config.target.host}:{self.config.target.port}"
+                f"{self.probe_path} was refused. The target served no HTTP "
+                f"endpoint there, so the 0% availability above records that the "
+                f"prober had nothing to talk to - it does not show a target that "
+                f"failed under load. Against a target with no HTTP surface, "
+                f"availability is unmeasurable and the packet counters are "
+                f"sender-side only: they are what this process handed to the "
+                f"kernel, not proof of arrival."
             )
         if self.monitor.unavailable_reason:
             # Said explicitly rather than left as absent columns, so a reader can
