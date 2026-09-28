@@ -299,7 +299,7 @@ class Transport(ABC):
 # Payload construction
 # --------------------------------------------------------------------------
 
-_FILLER = b"ddosim-lab-payload"
+_FILLER = b"adobo-lab-payload"
 """Recognisable filler so lab traffic is attributable in a packet capture."""
 
 
@@ -374,7 +374,7 @@ def _http_request(host: str, path: str, size: int, seed: int) -> bytes:
     request = (
         f"GET {path} HTTP/1.1\r\n"
         f"Host: {host}\r\n"
-        f"User-Agent: ddosim-lab/0.1 (authorized testing)\r\n"
+        f"User-Agent: adobo-lab/0.1 (authorized testing)\r\n"
         f"Accept: */*\r\n"
         f"Connection: close\r\n"
         f"X-Ddosim-Seq: {seed}\r\n"
@@ -441,7 +441,7 @@ def _ssdp_query(size: int, seed: int) -> bytes:
         "MAN: \"ssdp:discover\"\r\n"
         "MX: 3\r\n"
         "ST: ssdp:all\r\n"
-        "USER-AGENT: ddosim-lab/0.1\r\n"
+        "USER-AGENT: adobo-lab/0.1\r\n"
         "\r\n"
     ).encode("ascii")
     return _pad(query, size, seed)

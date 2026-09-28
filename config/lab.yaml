@@ -4,7 +4,7 @@
 # do. Every value under `limits` is a hard ceiling: the engine clamps each run
 # down to it, and no command-line flag can raise it.
 
-lab_id: "default"
+lab_id: "adobo"
 
 # ---------------------------------------------------------------------------
 # Allowlist - the only networks this tool may ever send traffic to.
@@ -26,7 +26,7 @@ limits:
   max_payload_bytes: 1400
   max_workers: 8
 
-# Default target: the local vulnerable app started by `ddosim target`.
+# Default target: the local vulnerable app started by `ADOBO target`.
 target:
   host: "127.0.0.1"
   port: 8000

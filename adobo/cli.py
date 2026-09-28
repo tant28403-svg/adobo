@@ -8,6 +8,8 @@ import time
 from pathlib import Path
 from typing import Sequence
 
+from pyfiglet import Figlet
+
 from .engine import EngineHooks, RunEngine, RunOutcome
 from .models import AttackProfile, ProfileName, RunConfig, Target, TransportKind
 from .nuclear import nuclear_wizard
@@ -18,6 +20,12 @@ __all__ = ["main"]
 EXIT_OK = 0
 EXIT_INTERRUPTED = 130
 EXIT_ERROR = 1
+
+
+def _print_banner() -> None:
+    if sys.platform == "linux":
+        f = Figlet(font="standard")
+        print(f.renderText("ADOBO"), flush=True)
 
 
 def _say(message: str = "") -> None:
@@ -150,8 +158,8 @@ ALL_PROFILES = sorted({
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="ddosim",
-        description="DDOS Ripper - Network Stress Tester",
+        prog="ADOBO",
+        description="ADOBO - Network Stress Tester",
     )
     parser.add_argument("--host", help="target IP")
     parser.add_argument("--port", type=int, default=80, help="target port (default: 80)")
@@ -223,6 +231,7 @@ def run_once(config: RunConfig, quiet: bool = False) -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    _print_banner()
     parser = build_parser()
     args = parser.parse_args(argv)
 

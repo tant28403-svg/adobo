@@ -2,7 +2,7 @@
 
 The gap this closes
 -------------------
-``ddosim.monitor`` samples CPU and RSS through psutil, which only works on a
+``adobo.monitor`` samples CPU and RSS through psutil, which only works on a
 local process. Against a remote host it can only report that the figures are
 unavailable - correctly, since inventing them would corrupt the score. The
 consequence was that a remote run had *no* target-side evidence at all, leaving
@@ -161,7 +161,7 @@ class TargetObserver:
 
         Returns a :class:`TargetStats` carrying only the request fields; the
         psutil resource fields stay at their defaults because this path is
-        remote-capable and those are not (see ``ddosim.monitor``).
+        remote-capable and those are not (see ``adobo.monitor``).
         """
         if before is None or after is None:
             return TargetStats(

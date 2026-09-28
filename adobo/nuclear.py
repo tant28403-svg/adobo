@@ -188,7 +188,7 @@ def check_privileges() -> tuple[bool, bool]:
 
 def _child_capability_worker(q: mp.Queue) -> None:
     """Worker for check_child_raw_capability; must be top-level for pickling."""
-    from ddosim.transports import raw_capability
+    from adobo.transports import raw_capability
     cap = raw_capability()
     q.put((cap.can_send, cap.reason))
 
@@ -365,7 +365,7 @@ def run_profile_process(
     # Crash log file in temp dir - survives process death for debugging
     import atexit
     import tempfile
-    crash_log = os.path.join(tempfile.gettempdir(), f"ddosim_crash_{label}.log")
+    crash_log = os.path.join(tempfile.gettempdir(), f"adobo_crash_{label}.log")
 
     def _write_crash(msg: str) -> None:
         try:
@@ -1127,7 +1127,7 @@ def nuclear_wizard() -> int:
         "ssdp": [p for p in profiles if p.profile == ProfileName.SSDP_AMPLIFICATION],
     }
     
-    from ddosim.nuclear import probe_udp_port
+    from adobo.nuclear import probe_udp_port
     for protocol, profiles_list in amp_profiles_by_protocol.items():
         if not profiles_list:
             continue

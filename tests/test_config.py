@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from ddosim.config import (
+from adobo.config import (
     AuthorizationConfig,
     LabConfig,
     LimitsConfig,
@@ -21,7 +21,7 @@ from ddosim.config import (
     load_lab_config,
     project_path,
 )
-from ddosim.models import Target
+from adobo.models import Target
 
 
 # ---------------------------------------------------------------------------
@@ -32,7 +32,7 @@ from ddosim.models import Target
 class TestShippedConfig:
     def test_lab_yaml_loads(self) -> None:
         config = load_lab_config()
-        assert config.lab_id == "default"
+        assert config.lab_id == "adobo"
         assert config.limits.max_pps == 20_000
 
     def test_lab_yaml_is_loopback_only_by_default(self) -> None:
@@ -86,7 +86,7 @@ class TestLabConfig:
 
     def test_missing_file_falls_back_to_defaults(self, tmp_path: Path) -> None:
         config = load_lab_config(tmp_path / "absent.yaml")
-        assert config.lab_id == "default"
+        assert config.lab_id == "adobo"
         assert config.limits.max_pps == 20_000
 
     def test_non_mapping_yaml_is_rejected(self, tmp_path: Path) -> None:
@@ -98,7 +98,7 @@ class TestLabConfig:
     def test_empty_yaml_falls_back_to_defaults(self, tmp_path: Path) -> None:
         empty = tmp_path / "lab.yaml"
         empty.write_text("", encoding="utf-8")
-        assert load_lab_config(empty).lab_id == "default"
+        assert load_lab_config(empty).lab_id == "adobo"
 
     def test_unknown_key_is_rejected(self) -> None:
         with pytest.raises(ValueError):

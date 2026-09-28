@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from ddosim.monitor import ResourceMonitor, process_for_pid, psutil_available
+from adobo.monitor import ResourceMonitor, process_for_pid, psutil_available
 
 
 class StubProcess:

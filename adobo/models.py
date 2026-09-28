@@ -248,7 +248,7 @@ class TargetStats(BaseModel):
     """What the TARGET observed, as opposed to what the sender tried.
 
     The psutil fields are local-process measurements, so against a remote host
-    they are necessarily empty - see ``ddosim.monitor`` on why guessing them
+    they are necessarily empty - see ``adobo.monitor`` on why guessing them
     would be worse than omitting them. The request fields below are the remote
     case: they are read from the target's own ``/stats`` endpoint over HTTP, so
     they work regardless of where the target runs.

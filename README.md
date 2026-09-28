@@ -1,4 +1,4 @@
-# ddosim
+# ADOBO
 
 ---
 
@@ -14,18 +14,18 @@ Authorised DDoS resilience lab. A tool for measuring how your services behave un
 ## Installation
 
 ### Pre-built executable (Windows)
-Download `ddosim.exe` from the releases page. No dependencies, no install.
+Download `ADOBO.exe` from the releases page. No dependencies, no install.
 
 ### From source (Python 3.11+)
 ```bash
 # From PyPI
-pip install ddosim
+pip install adobo
 # or with raw-socket support (needs Npcap + Admin on Windows):
-pip install ddosim[raw]
+pip install adobo[raw]
 
 # From a local clone (Linux / macOS / Windows)
-git clone https://github.com/<your-org>/ddosim.git
-cd ddosim
+git clone https://github.com/<your-org>/adobo.git
+cd adobo
 pip install -e .              # editable install
 # or with raw transport (scapy):
 pip install -e .[raw]
@@ -34,7 +34,7 @@ pip install -e .[raw]
 > **Linux raw sockets (no root):** The `linux_raw` transport uses native `AF_INET SOCK_RAW` and only needs `CAP_NET_RAW`:
 > ```bash
 > sudo setcap cap_net_raw+ep $(which python3)
-> ddosim --host 10.0.0.7 --profile syn_flood --transport linux_raw --pps 5000 --duration 10
+> ADOBO --host 10.0.0.7 --profile syn_flood --transport linux_raw --pps 5000 --duration 10
 > ```
 
 ## Quick start
@@ -45,7 +45,7 @@ Edit `config/lab.yaml` — add your lab CIDR to `allowed_cidrs`
 
 ### 2. Run the wizard
 ```bash
-ddosim
+ADOBO
 ```
 
 It prompts exactly this:
@@ -67,13 +67,13 @@ Enable IP spoofing for raw profiles? (requires root/CAP_NET_RAW) [y/N]: n
 
 ### 3. Read results
 ```
-Results: %DDOSIM_HOME%\results\<run_id>.json    (Windows)
-         ~/.local/share/ddosim/results/...       (Linux/macOS)
+Results: %ADOBO_HOME%\results\<run_id>.json    (Windows)
+         ~/.local/share/adobo/results/...       (Linux/macOS)
 
-Report:  %DDOSIM_HOME%\reports\<run_id>.html    (Windows)
-         ~/.local/share/ddosim/reports/...       (Linux/macOS)
+Report:  %ADOBO_HOME%\reports\<run_id>.html    (Windows)
+         ~/.local/share/adobo/reports/...       (Linux/macOS)
 
-Run `ddosim --help` to see your resolved config/output directories.
+Run `ADOBO --help` to see your resolved config/output directories.
 ```
 
 ## Profiles & Transports
@@ -101,7 +101,7 @@ Run `ddosim --help` to see your resolved config/output directories.
 
 Enable mitigations on the target to measure their effect:
 ```bash
-ddosim --host 10.0.0.7 --defenses waf,rate-limit,circuit-breaker ...
+ADOBO --host 10.0.0.7 --defenses waf,rate-limit,circuit-breaker ...
 ```
 
 | Defense | What it simulates |
@@ -114,13 +114,13 @@ ddosim --host 10.0.0.7 --defenses waf,rate-limit,circuit-breaker ...
 
 ## Configuration
 
-Config files live in `%DDOSIM_HOME%\config\` (or `~/.config/ddosim/` on Linux/macOS):
+Config files live in `%ADOBO_HOME%\config\` (or `~/.config/adobo/` on Linux/macOS):
 
 - `lab.yaml` — policy ceilings, default target, lab ID, allowlist
 - `authorization.yaml` — dated authorisation records (must not be expired)
 - `waf_rules.yaml` — WAF rule definitions
 
-Run `ddosim --help` to see the resolved config directory.
+Run `ADOBO --help` to see the resolved config directory.
 
 ## Output
 
@@ -139,7 +139,7 @@ JSON result includes: `attack` (packets sent, throughput, amplification), `probe
 # .github/workflows/resilience.yml
 - name: Resilience test
   run: |
-    ddosim --host 127.0.0.1 --profile udp_flood --pps 5000 --duration 30 \
+    ADOBO --host 127.0.0.1 --profile udp_flood --pps 5000 --duration 30 \
       --transport virtual --defenses rate-limit --yes
     python -c "
 import json, sys

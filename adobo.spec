@@ -1,5 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller spec: build a single self-contained ddosim.exe."""
+"""PyInstaller spec: build a single self-contained ADOBO.exe."""
 
 from pathlib import Path
 from PyInstaller.utils.hooks import collect_submodules
@@ -7,7 +7,7 @@ from PyInstaller.utils.hooks import collect_submodules
 PROJECT = Path(SPECPATH).resolve()
 
 hiddenimports = (
-    collect_submodules("ddosim")
+    collect_submodules("adobo")
     + [
         "pydantic",
         "pydantic.deprecated.decorator",
@@ -32,8 +32,8 @@ excludes = [
     "pytest",
     "sphinx",
     # yaml and psutil are declared runtime dependencies (pyproject.toml) and are
-    # imported at module level by ddosim.config / ddosim.defenses and
-    # ddosim.monitor. Excluding them produced a bundle that could not read its
+    # imported at module level by adobo.config / adobo.defenses and
+    # adobo.monitor. Excluding them produced a bundle that could not read its
     # own config or sample the target.
     "fastapi",
     "uvicorn",
@@ -41,7 +41,7 @@ excludes = [
 ]
 
 a = Analysis(
-    [str(PROJECT / "ddosim" / "__main__.py")],
+    [str(PROJECT / "adobo" / "__main__.py")],
     pathex=[str(PROJECT)],
     binaries=[],
     datas=[],
@@ -62,7 +62,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name="ddosim",
+    name="ADOBO",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -81,7 +81,7 @@ exe = EXE(
     # before it can print anything - a silent failure with no error to act on.
     #
     # Raw-socket profiles genuinely do need an elevated terminal, but that is
-    # checked at runtime by ddosim.transports.raw_capability(), which refuses
+    # checked at runtime by adobo.transports.raw_capability(), which refuses
     # with an actionable message instead of dying without one. Failing there is
     # strictly better than failing before the process starts.
     #
@@ -89,7 +89,7 @@ exe = EXE(
     # by double-click or from a non-elevated shell can become Administrator.
     # Without it, raw-capable profiles silently send nothing and the tool
     # reports zero with no explanation. The egress probe in
-    # ddosim.transports.scapy_transport now catches that and refuses with a
+    # adobo.transports.scapy_transport now catches that and refuses with a
     # clear message, but that still means "runs and sends nothing" instead of
     # "runs and actually sends". Enabling the manifest elevation restores the
     # user's expectation: double-click → UAC prompt → raw profiles work.

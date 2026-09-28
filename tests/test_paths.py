@@ -10,8 +10,8 @@ from pathlib import Path
 
 import pytest
 
-from ddosim import paths
-from ddosim.config import project_path
+from adobo import paths
+from adobo.config import project_path
 
 
 # ---------------------------------------------------------------------------
@@ -39,15 +39,15 @@ class TestDetection:
         monkeypatch.setattr(paths.sys, "frozen", True, raising=False)
         monkeypatch.setattr(paths.sys, "_MEIPASS", str(tmp_path / "MEI12345"), raising=False)
         monkeypatch.setattr(
-            paths.sys, "executable", str(tmp_path / "ddosim.exe"), raising=False
+            paths.sys, "executable", str(tmp_path / "adobo.exe"), raising=False
         )
 
-        assert paths.executable_path() == tmp_path / "ddosim.exe"
+        assert paths.executable_path() == tmp_path / "adobo.exe"
         assert paths.resolve_home() == tmp_path
 
     def test_source_root_is_absolute(self) -> None:
         assert paths.source_root().is_absolute()
-        assert (paths.source_root() / "ddosim").is_dir()
+        assert (paths.source_root() / "adobo").is_dir()
 
     def test_fallback_root_is_absolute(self) -> None:
         assert paths.fallback_root().is_absolute()

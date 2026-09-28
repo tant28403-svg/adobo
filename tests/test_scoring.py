@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import pytest
 
-from ddosim.models import ProbeResult, ProbeSummary, ResourceSample, TargetStats
-from ddosim.scoring import (
+from adobo.models import ProbeResult, ProbeSummary, ResourceSample, TargetStats
+from adobo.scoring import (
     LATENCY_BUDGET_MS,
     LATENCY_CEILING_MS,
     WEIGHTS,

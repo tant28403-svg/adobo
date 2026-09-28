@@ -18,7 +18,7 @@ import socket
 
 import pytest
 
-from ddosim.models import (
+from adobo.models import (
     AttackProfile,
     AttackStats,
     ProfileName,
@@ -27,7 +27,7 @@ from ddosim.models import (
     Target,
     TransportKind,
 )
-from ddosim.nuclear import (
+from adobo.nuclear import (
     NuclearAggregator,
     NuclearProfile,
     build_profiles,

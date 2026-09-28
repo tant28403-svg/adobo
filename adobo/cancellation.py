@@ -367,7 +367,7 @@ def run_watchdog(
                 escalated.set()
                 _hard_exit()
 
-    thread = threading.Thread(target=loop, name="ddosim-watchdog", daemon=True)
+    thread = threading.Thread(target=loop, name="adobo-watchdog", daemon=True)
     thread.start()
     return Watchdog(thread=thread, stop_event=finished)
 
@@ -380,7 +380,7 @@ def _hard_exit(code: int = 130) -> None:
     this layer exists to escape. The audit trail is already on disk.
     """
     sys.stderr.write(
-        "\n[ddosim] Workers did not stop in time. Terminating the process now.\n"
+        "\n[adobo] Workers did not stop in time. Terminating the process now.\n"
         "          The audit trail in logs/audit.jsonl is complete up to run_start.\n"
     )
     sys.stderr.flush()

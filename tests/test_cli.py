@@ -16,9 +16,9 @@ from __future__ import annotations
 import io
 from contextlib import redirect_stdout
 
-from ddosim.cli import summarise
-from ddosim.engine import RunEngine
-from ddosim.models import (
+from adobo.cli import summarise
+from adobo.engine import RunEngine
+from adobo.models import (
     AttackProfile,
     ProfileName,
     RunConfig,

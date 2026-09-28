@@ -23,8 +23,8 @@ import os
 import sys
 from pathlib import Path
 
-APP_NAME = "ddosim"
-HOME_ENV_VAR = "DDOSIM_HOME"
+APP_NAME = "adobo"
+HOME_ENV_VAR = "ADOBO_HOME"
 
 __all__ = [
     "APP_NAME",

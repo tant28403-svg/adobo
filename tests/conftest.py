@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from ddosim.models import (
+from adobo.models import (
     AttackProfile,
     ProfileName,
     RunConfig,

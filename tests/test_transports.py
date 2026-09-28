@@ -6,7 +6,7 @@ Two rules govern this file:
   loopback tests.** A capability test must never assert that a real raw packet
   was transmitted, because the result would depend on whether the machine
   running the suite happens to have Npcap and Administrator.
-* **The ``raw_capability`` contract is asserted structurally.** ``ddosim.safety``
+* **The ``raw_capability`` contract is asserted structurally.** ``adobo.safety``
   reads ``can_send`` and ``reason`` by name, so a rename there would break
   refusals at runtime rather than at import. These tests fail on that.
 """
@@ -22,14 +22,14 @@ from pathlib import Path
 
 import pytest
 
-from ddosim.models import (
+from adobo.models import (
     AttackProfile,
     ProfileName,
     RunConfig,
     Target,
     TransportKind,
 )
-from ddosim.transports import (
+from adobo.transports import (
     PeerUnavailable,
     RawCapability,
     ScapyTransport,
@@ -46,7 +46,7 @@ from ddosim.transports import (
     scapy_available,
     supports_profile,
 )
-from ddosim.transports.scapy_transport import _resolve_iface
+from adobo.transports.scapy_transport import _resolve_iface
 
 TARGET = Target(host="127.0.0.1", port=9)
 
@@ -82,7 +82,7 @@ class TestPayloads:
         assert a != b
 
     def test_payloads_carry_identifiable_filler(self) -> None:
-        assert b"ddosim" in build_payload(ProfileName.UDP_FLOOD, 256)
+        assert b"adobo" in build_payload(ProfileName.UDP_FLOOD, 256)
 
     def test_dns_query_is_well_formed(self) -> None:
         payload = build_payload(ProfileName.DNS_AMPLIFICATION, 512, seed=1)
@@ -115,7 +115,7 @@ class TestPayloads:
         )
         assert payload.startswith(b"GET /api/data HTTP/1.1\r\n")
         assert b"Host: lab.internal\r\n" in payload
-        assert payload.endswith(b"\r\n\r\n") or b"ddosim" in payload
+        assert payload.endswith(b"\r\n\r\n") or b"adobo" in payload
 
     def test_http_request_is_complete_at_the_default_size(self) -> None:
         """The default payload size is 128, and this is where it used to break.
@@ -638,7 +638,7 @@ class TestPeerUnavailableIsDistinctFromALocalFault:
 
 
 class TestRawCapabilityContract:
-    """``ddosim.safety`` depends on these two attribute names."""
+    """``adobo.safety`` depends on these two attribute names."""
 
     def test_returned_object_exposes_can_send_and_reason(self) -> None:
         capability = raw_capability()
@@ -670,7 +670,7 @@ class TestRawCapabilityContract:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(
-            "ddosim.transports.scapy_transport.scapy_available", lambda: False
+            "adobo.transports.scapy_transport.scapy_available", lambda: False
         )
         capability = raw_capability()
         assert capability.can_send is False
@@ -681,7 +681,7 @@ class TestRawCapabilityContract:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(
-            "ddosim.transports.scapy_transport._npcap_present", lambda: (False, "")
+            "adobo.transports.scapy_transport._npcap_present", lambda: (False, "")
         )
         capability = raw_capability()
         assert capability.can_send is False
@@ -693,11 +693,11 @@ class TestRawCapabilityContract:
     ) -> None:
         monkeypatch.setattr("sys.platform", "win32")
         monkeypatch.setattr(
-            "ddosim.transports.scapy_transport._npcap_present",
+            "adobo.transports.scapy_transport._npcap_present",
             lambda: (True, r"C:\Windows\System32\Npcap\wpcap.dll"),
         )
         monkeypatch.setattr(
-            "ddosim.transports.scapy_transport._is_windows_admin", lambda: False
+            "adobo.transports.scapy_transport._is_windows_admin", lambda: False
         )
         capability = raw_capability()
         assert capability.can_send is False
@@ -708,11 +708,11 @@ class TestRawCapabilityContract:
     ) -> None:
         monkeypatch.setattr("sys.platform", "win32")
         monkeypatch.setattr(
-            "ddosim.transports.scapy_transport._npcap_present",
+            "adobo.transports.scapy_transport._npcap_present",
             lambda: (True, r"C:\Windows\System32\Npcap\wpcap.dll"),
         )
         monkeypatch.setattr(
-            "ddosim.transports.scapy_transport._is_windows_admin", lambda: True
+            "adobo.transports.scapy_transport._is_windows_admin", lambda: True
         )
         capability = raw_capability()
         assert capability.can_send is True

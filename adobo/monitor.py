@@ -8,7 +8,7 @@ on the floor". These samples are what make the resilience score meaningful.
 Scope and honesty about limits
 ------------------------------
 psutil can only inspect processes on the local machine, so this samples the
-*local* target - the one ``ddosim`` can start itself. Against a remote host there
+*local* target - the one ``adobo`` can start itself. Against a remote host there
 is no honest way to read its CPU or RSS, and inventing plausible numbers would
 corrupt the score. In that case sampling is skipped and the result carries a
 note saying so, rather than a row of zeroes that look like an idle target.

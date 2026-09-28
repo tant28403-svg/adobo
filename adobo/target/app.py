@@ -194,7 +194,7 @@ def create_app(settings: TargetSettings | None = None) -> FastAPI:
     """Build the target application."""
     config = settings or TargetSettings()
     app = FastAPI(
-        title="ddosim lab target",
+        title="adobo lab target",
         version="0.1.0",
         docs_url=None,
         redoc_url=None,
@@ -292,7 +292,7 @@ def create_app(settings: TargetSettings | None = None) -> FastAPI:
     @app.get("/")
     async def index() -> dict[str, Any]:
         return {
-            "service": "ddosim lab target",
+            "service": "adobo lab target",
             "defenses": config.active(),
             "endpoints": ["/healthz", "/api/data"],
         }

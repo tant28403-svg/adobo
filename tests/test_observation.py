@@ -19,7 +19,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from ddosim.observation import TargetObserver
+from adobo.observation import TargetObserver
 
 
 def _free_port() -> int:

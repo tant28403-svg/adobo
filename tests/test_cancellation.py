@@ -3,7 +3,7 @@
 The stop guarantee is the most safety-critical behaviour in the tool, so these
 tests assert it at every layer rather than only the happy path. The escalation
 layer calls ``os._exit``, which would kill the test runner, so
-``ddosim.cancellation._hard_exit`` is always monkeypatched before it can fire.
+``adobo.cancellation._hard_exit`` is always monkeypatched before it can fire.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import time
 
 import pytest
 
-from ddosim.cancellation import (
+from adobo.cancellation import (
     CancelReason,
     CancellationToken,
     GracePeriod,
@@ -298,7 +298,7 @@ class TestWatchdog:
     def test_stays_quiet_while_the_run_is_healthy(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr("ddosim.cancellation._hard_exit", lambda *a: None)
+        monkeypatch.setattr("adobo.cancellation._hard_exit", lambda *a: None)
         calls: list[str] = []
         controller = RunController(0.2)
         controller.start()
@@ -316,7 +316,7 @@ class TestWatchdog:
     ) -> None:
         exits: list[int] = []
         monkeypatch.setattr(
-            "ddosim.cancellation._hard_exit", lambda code=130: exits.append(code)
+            "adobo.cancellation._hard_exit", lambda code=130: exits.append(code)
         )
         controller = RunController(
             60.0, grace=GracePeriod(join_grace_s=0.02, escalate_after_s=0.08)

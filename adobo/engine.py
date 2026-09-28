@@ -151,7 +151,7 @@ class RunEngine:
     """Executes one :class:`RunConfig` and returns a :class:`RunOutcome`.
 
     The config must already have been through
-    :meth:`ddosim.safety.SafetyGuard.preflight`. The allowlist is not re-checked
+    :meth:`adobo.safety.SafetyGuard.preflight`. The allowlist is not re-checked
     here; the engine is only reachable with a transport the guarded factory
     produced.
     """
@@ -349,7 +349,7 @@ class RunEngine:
             thread = threading.Thread(
                 target=self._worker_loop,
                 args=(index,),
-                name=f"ddosim-worker-{index}",
+                name=f"adobo-worker-{index}",
                 daemon=True,
             )
             thread.start()
@@ -548,14 +548,14 @@ class RunEngine:
         # does not depend on the target answering at all.
         done = asyncio.Event()
         observer = asyncio.create_task(
-            self._observe_target(done), name="ddosim-target-stats"
+            self._observe_target(done), name="adobo-target-stats"
         )
         tasks: list[asyncio.Task[None]] = [
-            asyncio.create_task(self._sample_counters(), name="ddosim-sampler")
+            asyncio.create_task(self._sample_counters(), name="adobo-sampler")
         ]
         if self._probes_enabled():
             tasks.append(
-                asyncio.create_task(self._probe_availability(), name="ddosim-prober")
+                asyncio.create_task(self._probe_availability(), name="adobo-prober")
             )
         try:
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -826,7 +826,7 @@ class RunEngine:
         forged source address, so the reflector replies to the victim and the
         response is never visible from the sending host. The declared protocol
         ratio is reported separately as
-        :attr:`~ddosim.models.AttackStats.amplification_declared`, labelled as
+        :attr:`~adobo.models.AttackStats.amplification_declared`, labelled as
         a nominal figure, so a reader can never mistake it for a result.
         """
         return counters.measured_amplification

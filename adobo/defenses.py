@@ -1,7 +1,7 @@
 """Mitigations the lab target can switch on.
 
 Each mitigation is a small, standalone, testable object. None of them know about
-HTTP; :mod:`ddosim.target.app` adapts them to requests. That split is what makes
+HTTP; :mod:`adobo.target.app` adapts them to requests. That split is what makes
 them verifiable: a rate limiter can be tested against a fake clock instead of by
 sending thousands of packets at a real socket.
 

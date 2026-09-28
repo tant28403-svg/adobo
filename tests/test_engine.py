@@ -17,16 +17,16 @@ import time
 
 import pytest
 
-from ddosim.cancellation import CancelReason, GracePeriod, RunController
-from ddosim.engine import EngineHooks, RunEngine, RunOutcome
-from ddosim.models import (
+from adobo.cancellation import CancelReason, GracePeriod, RunController
+from adobo.engine import EngineHooks, RunEngine, RunOutcome
+from adobo.models import (
     AttackProfile,
     ProfileName,
     RunConfig,
     Target,
     TransportKind,
 )
-from ddosim.scoring import score_run
+from adobo.scoring import score_run
 
 TARGET = Target(host="127.0.0.1", port=8000)
 
@@ -253,7 +253,7 @@ class TestCancellation:
             started.set()
             time.sleep(30.0)
 
-        thread = threading.Thread(target=stuck, daemon=True, name="ddosim-worker-stuck")
+        thread = threading.Thread(target=stuck, daemon=True, name="adobo-worker-stuck")
         engine._start_workers = lambda: [thread]  # type: ignore[method-assign]
         thread.start()
         assert started.wait(2.0)
@@ -418,7 +418,7 @@ class TestSleepUntilStopReturnsPromptlyOnCancel:
     """
 
     def test_sleep_returns_true_immediately_after_cancel(self) -> None:
-        from ddosim.cancellation import RunController
+        from adobo.cancellation import RunController
 
         controller = RunController(1.0)
         controller.start()
@@ -706,8 +706,8 @@ class TestHooks:
         assert all(hasattr(t, "counters") for t in ticks)
 
     def test_snapshot_availability_is_100_when_nothing_was_probed(self) -> None:
-        from ddosim.engine import RunSnapshot
-        from ddosim.transports import TransportCounters
+        from adobo.engine import RunSnapshot
+        from adobo.transports import TransportCounters
 
         snapshot = RunSnapshot(
             elapsed=1.0,
@@ -719,8 +719,8 @@ class TestHooks:
         assert snapshot.achieved_pps() == 0.0
 
     def test_snapshot_availability_reflects_failures(self) -> None:
-        from ddosim.engine import RunSnapshot
-        from ddosim.transports import TransportCounters
+        from adobo.engine import RunSnapshot
+        from adobo.transports import TransportCounters
 
         snapshot = RunSnapshot(
             elapsed=1.0,

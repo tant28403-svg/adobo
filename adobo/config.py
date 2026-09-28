@@ -5,7 +5,7 @@ path:
 
     config/lab.yaml            policy: allowlist, ceilings, measurement cadence
     config/authorization.yaml  written authorisation record (fails closed)
-    config/waf_rules.yaml      mitigation rule set (parsed by ddosim.defenses)
+    config/waf_rules.yaml      mitigation rule set (parsed by adobo.defenses)
 
 Nothing here opens a socket. Loading a config is a pure, testable operation.
 """
@@ -27,7 +27,7 @@ from .models import Target
 # Locations
 # --------------------------------------------------------------------------
 #
-# Resolution lives in ddosim.paths, which knows whether we are running from a
+# Resolution lives in adobo.paths, which knows whether we are running from a
 # source tree or a PyInstaller bundle. Do not reintroduce Path(__file__).parent
 # here: under a onefile build that points at the temp extraction directory, and
 # config would silently fail to load.
@@ -38,7 +38,7 @@ WAF_CONFIG_NAME = "waf_rules.yaml"
 
 
 def project_path(relative: str | Path) -> Path:
-    """Resolve a config-relative path against the ddosim home directory."""
+    """Resolve a config-relative path against the adobo home directory."""
     candidate = Path(relative)
     if candidate.is_absolute():
         return candidate
@@ -117,7 +117,7 @@ class LabConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    lab_id: str = "default"
+    lab_id: str = "adobo"
     allowed_cidrs: list[str] = Field(default_factory=lambda: ["127.0.0.0/8"])
     limits: LimitsConfig = Field(default_factory=LimitsConfig)
     target: Target = Field(default_factory=lambda: Target(host="127.0.0.1", port=8000))
@@ -216,7 +216,7 @@ def load_authorization(path: str | Path | None = None) -> AuthorizationConfig | 
 # --------------------------------------------------------------------------
 # waf_rules.yaml
 # --------------------------------------------------------------------------
-# Parsed by ddosim.defenses, which owns the rule model. Only the location lives
+# Parsed by adobo.defenses, which owns the rule model. Only the location lives
 # here so every config file has exactly one resolver.
 
 

@@ -2,7 +2,7 @@
 
 One entry point, :func:`get_transport`, so nothing else in the codebase needs to
 know which implementations exist. The factory re-checks the same conditions
-``ddosim.safety`` already enforces: it is a second, independent gate rather than
+``adobo.safety`` already enforces: it is a second, independent gate rather than
 a place where policy can be bypassed by importing a transport class directly.
 A caller that skipped preflight still cannot obtain a transport that would send
 raw packets or spoof a source address on an unauthorised target.
@@ -192,7 +192,7 @@ def get_transport(config: RunConfig) -> Transport:
 def available_transports() -> dict[str, str]:
     """Transport name to a human-readable availability note.
 
-    Used by ``ddosim doctor`` so the operator can see what this machine can do
+    Used by ``adobo doctor`` so the operator can see what this machine can do
     before being asked to pick.
     """
     capability = raw_capability()

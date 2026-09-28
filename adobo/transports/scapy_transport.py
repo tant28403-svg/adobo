@@ -3,9 +3,9 @@
 The only module permitted to honour ``spoof_sources``: crafting a source address
 is the whole point of a raw socket, and no other transport can do it.
 
-**The capability contract is load-bearing.** ``ddosim.safety`` calls
+**The capability contract is load-bearing.** ``adobo.safety`` calls
 :func:`raw_capability` before this module is ever imported for sending, and turns
-``can_send``/``reason`` into a :class:`~ddosim.safety.PolicyViolation`. Keep the
+``can_send``/``reason`` into a :class:`~adobo.safety.PolicyViolation`. Keep the
 returned object's two attributes named exactly that; several safety tests
 assert on them.
 
@@ -343,7 +343,7 @@ class ScapyTransport(Transport):
         try:
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", category=SyntaxWarning, module="scapy")
-                scapy.send(self.build_packet(b"ddosim egress probe"), iface=iface, verbose=False)
+                scapy.send(self.build_packet(b"adobo egress probe"), iface=iface, verbose=False)
         except Exception as exc:
             self._count_error()
             raise TransportError(
