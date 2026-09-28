@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import socket
 import socketserver
+import struct
 import sys
 import threading
 import time
@@ -720,6 +721,237 @@ class TestRawCapabilityContract:
 
     def test_scapy_available_is_a_bool(self) -> None:
         assert isinstance(scapy_available(), bool)
+
+
+# ---------------------------------------------------------------------------
+# Linux raw packet construction
+# ---------------------------------------------------------------------------
+
+
+def make_linux_raw(profile: ProfileName = ProfileName.UDP_FLOOD, **kw):
+    """A LinuxRawTransport with its addressing resolved but no socket opened.
+
+    Construction is deliberately cheap and privilege-free: the packet builders
+    only read precomputed header bytes and the two address fields, so they can
+    be exercised on a box that cannot open a raw socket at all.
+    """
+    from adobo.transports.linux_raw_transport import LinuxRawTransport
+
+    transport = LinuxRawTransport(Target(host="192.168.1.50", port=9999), profile, **kw)
+    transport._resolved_ip = "192.168.1.50"
+    transport._src_ip = "192.168.1.77"
+    transport._prebuild_headers(512)
+    return transport
+
+
+class TestLinuxRawBuilders:
+    """Every builder must produce a real packet, not just avoid raising.
+
+    These four builders used to be reachable only from the send path, which
+    needs CAP_NET_RAW, so the suite never called them. A refactor could leave
+    one referencing a deleted local and 400+ tests would still pass, because
+    send_one() catches the resulting NameError and logs it as a warning. A run
+    would then report zero packets and exit zero.
+    """
+
+    def test_icmp_fast_matches_reference_builder(self) -> None:
+        t = make_linux_raw(ProfileName.ICMP_FLOOD, seed=1234)
+        payload = bytes(range(256)) * 2
+        assert t._build_icmp_packet_fast(payload) == t._build_icmp_packet(payload)
+
+    def test_udp_fast_matches_reference_builder(self) -> None:
+        t = make_linux_raw(ProfileName.UDP_FLOOD, seed=1234)
+        payload = b"x" * 512
+        assert t._build_udp_packet_fast(payload) == t._build_udp_packet(payload)
+
+    def test_tcp_fast_matches_reference_builder(self) -> None:
+        t = make_linux_raw(ProfileName.SYN_FLOOD, seed=1234)
+        payload = b"x" * 512
+        flags = 0x02  # SYN
+        assert t._build_tcp_packet_fast(payload, flags) == t._build_tcp_packet(
+            payload, flags
+        )
+
+    @pytest.mark.parametrize(
+        "profile,build,flags,uses_pseudo",
+        [
+            (ProfileName.ICMP_FLOOD, "icmp", None, False),
+            (ProfileName.UDP_FLOOD, "udp", None, True),
+            (ProfileName.SYN_FLOOD, "tcp", 0x02, True),
+            (ProfileName.ACK_FLOOD, "tcp", 0x10, True),
+        ],
+    )
+    def test_transport_checksum_verifies_as_a_receiver_computes_it(
+        self, profile: ProfileName, build: str, flags: int | None, uses_pseudo: bool
+    ) -> None:
+        """Checksum the way a receiver does, not the way the sender did.
+
+        A sender can produce a self-consistent but wrong checksum and never
+        notice. The receiver recomputes over the segment - with the IPv4 pseudo
+        header for UDP and TCP, without one for ICMP - and drops anything that
+        does not sum to zero. That check is the only thing standing between a
+        bad builder and a target that silently ignores every packet, which
+        looks identical to a target that shrugged off the attack.
+        """
+        t = make_linux_raw(profile, seed=99)
+        payload = b"z" * 512
+        if build == "icmp":
+            packet = t._build_icmp_packet_fast(payload)
+        elif build == "udp":
+            packet = t._build_udp_packet_fast(payload)
+        else:
+            packet = t._build_tcp_packet_fast(payload, flags)
+
+        segment = packet[20:]
+        if uses_pseudo:
+            # The pseudo header's length is the segment length: the IP total
+            # length less the 20-byte IPv4 header. It is NOT the UDP length
+            # field - at segment[2:4] sits the destination port.
+            seg_len = int.from_bytes(packet[2:4], "big") - 20
+            assert seg_len == len(segment), "segment length disagrees with IP header"
+            pseudo = (
+                socket.inet_aton("192.168.1.77")
+                + socket.inet_aton("192.168.1.50")
+                + struct.pack("!BBH", 0, packet[9], seg_len)
+            )
+            assert t._checksum(pseudo + segment) == 0, "transport checksum invalid"
+        else:
+            assert t._checksum(segment) == 0, "ICMP checksum invalid"
+
+    @pytest.mark.parametrize(
+        "profile,build,expected_proto",
+        [
+            (ProfileName.ICMP_FLOOD, "icmp", socket.IPPROTO_ICMP),
+            (ProfileName.UDP_FLOOD, "udp", socket.IPPROTO_UDP),
+            (ProfileName.SYN_FLOOD, "tcp", socket.IPPROTO_TCP),
+        ],
+    )
+    def test_fast_builder_emits_correct_protocol_and_addresses(
+        self, profile: ProfileName, build: str, expected_proto: int
+    ) -> None:
+        """The IP header must name the right protocol and the real endpoints.
+
+        A builder that silently packs the wrong protocol byte still produces a
+        plausible-looking packet, and the error only surfaces as "the target did
+        not respond" - which reads like a target that shrugged off the attack.
+        """
+        t = make_linux_raw(profile, seed=99)
+        payload = b"z" * 512
+        if build == "icmp":
+            packet = t._build_icmp_packet_fast(payload)
+        elif build == "udp":
+            packet = t._build_udp_packet_fast(payload)
+        else:
+            packet = t._build_tcp_packet_fast(payload, 0x02)
+
+        assert packet[9] == expected_proto, "IP protocol byte"
+        assert socket.inet_ntoa(packet[12:16]) == "192.168.1.77", "source address"
+        assert socket.inet_ntoa(packet[16:20]) == "192.168.1.50", "destination address"
+        # IPv4 layout: total length at 2:4, header checksum at 10:12.
+        assert int.from_bytes(packet[2:4], "big") == len(packet), "IP total length"
+        assert t._checksum(packet[:20]) == 0, "IP header checksum verifies"
+
+    def test_fast_builders_are_reachable_before_prebuild(self) -> None:
+        """A builder must not raise when _prebuild_headers has not run.
+
+        The fast builders read cached header bases. Those are populated during
+        open(), so calling one on a fresh transport is a misuse - but it should
+        fail as a malformed packet, not an AttributeError, since the fast ICMP
+        path is the send path and a confusing crash there costs a whole run.
+        """
+        from adobo.transports.linux_raw_transport import LinuxRawTransport
+
+        t = LinuxRawTransport(TARGET, ProfileName.UDP_FLOOD)
+        t._resolved_ip = "127.0.0.1"
+        t._src_ip = "127.0.0.1"
+        packet = t._build_udp_packet_fast(b"x" * 32)
+        assert socket.inet_ntoa(packet[12:16]) == "127.0.0.1"
+
+
+class TestLinuxRawSourceAddressCaching:
+    """The source address is resolved once per run, not once per packet."""
+
+    def test_second_call_does_not_reopen_a_socket(self, monkeypatch) -> None:
+        from adobo.transports import linux_raw_transport as mod
+
+        t = make_linux_raw(ProfileName.ICMP_FLOOD)
+        assert t._source_address() == "192.168.1.77"
+
+        def explode(*a, **k):  # pragma: no cover - must never run
+            raise AssertionError("socket opened in the packet hot path")
+
+        monkeypatch.setattr(mod.socket, "socket", explode)
+        for _ in range(1000):
+            assert t._source_address() == "192.168.1.77"
+
+    def test_resolve_is_cached_after_first_call(self) -> None:
+        from adobo.transports.linux_raw_transport import LinuxRawTransport
+
+        t = LinuxRawTransport(TARGET, ProfileName.ICMP_FLOOD)
+        t._resolved_ip = "127.0.0.1"
+        assert t._src_ip == ""
+        first = t._source_address()
+        assert first
+        assert t._src_ip == first, "resolution should be stored for later calls"
+
+    def test_hot_path_builds_open_no_sockets(self, monkeypatch) -> None:
+        """Building 500 packets must not touch the socket module at all.
+
+        This is the regression that cost the ICMP path roughly two thirds of its
+        throughput: _source_address() used to open, connect, read and close a
+        throwaway UDP socket on every single packet.
+        """
+        from adobo.transports import linux_raw_transport as mod
+
+        t = make_linux_raw(ProfileName.ICMP_FLOOD)
+
+        def explode(*a, **k):  # pragma: no cover - must never run
+            raise AssertionError("socket opened while building packets")
+
+        monkeypatch.setattr(mod.socket, "socket", explode)
+        for _ in range(500):
+            t._build_icmp_packet_fast(b"x" * 512)
+            t._build_udp_packet_fast(b"x" * 512)
+            t._build_tcp_packet_fast(b"x" * 512, 0x02)
+
+
+class TestLinuxRawSendBuffer:
+    def test_default_send_buffer_is_bounded(self) -> None:
+        """A multi-megabyte send buffer is a measurement problem, not a speed one.
+
+        64MB held ~12s of traffic at flood rates, so the sender's own probes
+        queued behind its own backlog and latency the tool charged to the target
+        was really local queueing.
+        """
+        from adobo.transports.linux_raw_transport import DEFAULT_SNDBUF
+
+        assert DEFAULT_SNDBUF <= 4 * 1024 * 1024
+
+    def test_send_buffer_is_configurable(self) -> None:
+        from adobo.transports.linux_raw_transport import LinuxRawTransport
+
+        t = LinuxRawTransport(TARGET, ProfileName.UDP_FLOOD, sndbuf=256 * 1024)
+        assert t._sndbuf == 256 * 1024
+
+    def test_unset_socket_option_is_not_fatal(self, monkeypatch) -> None:
+        """A kernel that refuses the buffer size must not abort the run.
+
+        The buffer governs how much undelivered traffic the kernel will hold
+        before it starts refusing writes. Pacing governs the rate. Losing the
+        run over a tuning parameter is the wrong trade.
+        """
+        from adobo.transports.linux_raw_transport import LinuxRawTransport
+
+        t = LinuxRawTransport(TARGET, ProfileName.UDP_FLOOD, sndbuf=1)
+
+        class Refusing:
+            type = 17
+
+            def setsockopt(self, *a, **k):
+                raise OSError(22, "Invalid argument")
+
+        # Must not raise.
+        t._apply_sndbuf(Refusing())
 
 
 class TestScapyTransport:

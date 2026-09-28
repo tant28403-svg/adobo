@@ -619,7 +619,7 @@ class LinuxRawTransport(Transport):
         ip_header = self._build_ip_header(
             protocol=socket.IPPROTO_UDP,
             payload_len=8 + self._payload_len,
-            src_ip=src_ip,
+            src_ip=self._source_address(),
             dst_ip=self._resolved_ip,
         )
         return ip_header + udp_header + payload
@@ -636,7 +636,7 @@ class LinuxRawTransport(Transport):
         ip_header = self._build_ip_header(
             protocol=socket.IPPROTO_TCP,
             payload_len=20 + len(payload),
-            src_ip=src_ip,
+            src_ip=self._source_address(),
             dst_ip=self._resolved_ip,
         )
         return ip_header + tcp_header + payload
