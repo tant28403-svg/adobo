@@ -1404,6 +1404,8 @@ class TestCLIConfigFromArgs:
             keep_alive = True
             tls = False
             tls_no_verify = False
+            http2 = False
+            h2_concurrency = 100
             host = "127.0.0.1"
             port = 8000
             transport = "auto"
@@ -1425,6 +1427,8 @@ class TestCLIConfigFromArgs:
             keep_alive = False
             tls = True
             tls_no_verify = False
+            http2 = False
+            h2_concurrency = 100
             host = "127.0.0.1"
             port = 443
             transport = "auto"
@@ -1447,6 +1451,8 @@ class TestCLIConfigFromArgs:
             keep_alive = False
             tls = False
             tls_no_verify = True
+            http2 = False
+            h2_concurrency = 100
             host = "127.0.0.1"
             port = 8000
             transport = "auto"
@@ -1469,6 +1475,8 @@ class TestCLIConfigFromArgs:
             keep_alive = False
             tls = False
             tls_no_verify = False
+            http2 = False
+            h2_concurrency = 100
             host = "127.0.0.1"
             port = 443
             transport = "auto"

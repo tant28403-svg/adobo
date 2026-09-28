@@ -29,6 +29,7 @@ from .scapy_transport import (
     raw_capability,
     scapy_available,
 )
+from .http2_transport import H2Transport
 from .socket_transport import SocketTransport
 from .slowloris_transport import SlowlorisTransport
 from .virtual_transport import VirtualTransport
@@ -44,6 +45,7 @@ __all__ = [
     "TransportCounters",
     "TransportError",
     "VirtualTransport",
+    "H2Transport",
     "available_transports",
     "build_payload",
     "get_transport",
@@ -148,10 +150,31 @@ def get_transport(config: RunConfig) -> Transport:
     if config.transport is TransportKind.VIRTUAL:
         return VirtualTransport(config.target, profile)
 
+    if config.transport is TransportKind.H2:
+        attack = config.attack
+        return H2Transport(
+            config.target,
+            profile,
+            concurrency=getattr(attack, 'h2_concurrency', 100),
+            tls_verify=getattr(attack, 'tls_verify', True),
+            send_timeout=2.0,
+            connect_timeout=1.0,
+        )
+
     if config.transport is TransportKind.SOCKET:
         if profile is ProfileName.SLOWLORIS:
             return SlowlorisTransport(config.target, profile)
         attack = config.attack
+        # Check if HTTP/2 is requested
+        if getattr(attack, 'use_http2', False):
+            return H2Transport(
+                config.target,
+                profile,
+                concurrency=getattr(attack, 'h2_concurrency', 100),
+                tls_verify=getattr(attack, 'tls_verify', True),
+                send_timeout=2.0,
+                connect_timeout=1.0,
+            )
         return SocketTransport(
             config.target,
             profile,
@@ -210,6 +233,7 @@ def available_transports() -> dict[str, str]:
     return {
         TransportKind.VIRTUAL.value: "always available (no sockets opened)",
         TransportKind.SOCKET.value: "available (standard UDP/TCP sockets)",
+        "h2": "available (HTTP/2 over TLS, requires h2 library)",
         TransportKind.SCAPY.value: scapy_note,
         TransportKind.LINUX_RAW.value: linux_raw_note,
     }

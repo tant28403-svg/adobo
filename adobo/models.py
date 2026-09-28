@@ -36,6 +36,9 @@ class TransportKind(str, Enum):
     VIRTUAL = "virtual"
     """No sockets at all. Counter-only, for hermetic tests and CI."""
 
+    H2 = "h2"
+    """HTTP/2 over TLS with multiplexed streams. Requires h2 library."""
+
 
 class ProfileName(str, Enum):
     """Traffic profiles the engine knows how to generate.
@@ -120,6 +123,8 @@ class AttackProfile(BaseModel):
     keep_alive: bool = False
     use_tls: bool = False
     tls_verify: bool = True
+    use_http2: bool = False
+    h2_concurrency: int = Field(default=100, ge=1, le=1000)
 
     def clamped(self, **overrides: Any) -> "AttackProfile":
         """Return a copy with fields replaced. Used by the safety layer."""

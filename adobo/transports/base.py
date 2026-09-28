@@ -82,6 +82,8 @@ def supports_profile(kind: TransportKind, profile: ProfileName) -> bool:
     """Whether *kind* can generate *profile* at all, ignoring privileges."""
     if kind is TransportKind.VIRTUAL or kind is TransportKind.SCAPY or kind is TransportKind.LINUX_RAW:
         return True
+    if kind is TransportKind.H2:
+        return profile is ProfileName.HTTP_FLOOD
     return profile in SOCKET_CAPABLE_PROFILES
 
 

@@ -175,7 +175,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--profile", choices=ALL_PROFILES, default="udp_flood", help="attack profile (default: udp_flood)")
     parser.add_argument("--pps", type=int, default=5000, help="packets per second (default: 5000)")
     parser.add_argument("--duration", type=float, default=10.0, help="duration in seconds (default: 10)")
-    parser.add_argument("--transport", choices=["socket", "scapy", "linux_raw", "virtual"], default="auto", help="transport type (default: auto)")
+    parser.add_argument("--transport", choices=["socket", "scapy", "linux_raw", "virtual", "h2"], default="auto", help="transport type (default: auto)")
     parser.add_argument("--payload", type=int, default=512, help="payload size in bytes (default: 512)")
     parser.add_argument("--workers", type=int, default=4, help="worker threads (default: 4)")
     parser.add_argument("--spoof-sources", action="store_true", help="spoof source IP (requires --transport scapy + Admin)")
@@ -193,6 +193,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--tls-no-verify",
         action="store_true",
         help="Disable TLS certificate verification (lab only; implies --tls)",
+    )
+    parser.add_argument(
+        "--http2",
+        action="store_true",
+        help="Use HTTP/2 for http_flood (auto-enabled on port 443; requires h2 library)",
+    )
+    parser.add_argument(
+        "--h2-concurrency",
+        type=int,
+        default=100,
+        help="Number of concurrent HTTP/2 streams per connection (default: 100)",
     )
     parser.add_argument(
         "--nuclear",
@@ -251,6 +262,11 @@ def config_from_args(args: argparse.Namespace) -> RunConfig:
     if args.tls_no_verify:
         use_tls = True
 
+    # Auto-enable HTTP/2 on port 443
+    use_http2 = args.http2
+    if not use_http2 and args.port == 443:
+        use_http2 = True
+
     return RunConfig(
         target=Target(host=args.host, port=args.port if args.port is not None else 80),
         attack=AttackProfile(
@@ -263,6 +279,8 @@ def config_from_args(args: argparse.Namespace) -> RunConfig:
             keep_alive=args.keep_alive,
             use_tls=use_tls,
             tls_verify=not args.tls_no_verify,
+            use_http2=use_http2,
+            h2_concurrency=args.h2_concurrency,
         ),
         transport=TransportKind(transport),
         defenses=[],
