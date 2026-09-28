@@ -19,10 +19,11 @@ argument parser, so the two cannot drift.
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 from typing import Sequence
 
 from ..models import DefenseName
-from .app import TargetSettings, run_target
+from .app import TargetSettings, run_target, generate_self_signed_cert
 
 __all__ = ["build_parser", "settings_from_args", "main", "ALL_DEFENSES"]
 
@@ -67,6 +68,26 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="simulated database work per /api/data request, in ms",
+    )
+    parser.add_argument(
+        "--ssl-certfile",
+        default=None,
+        help="path to SSL certificate file (enables HTTPS)",
+    )
+    parser.add_argument(
+        "--ssl-keyfile",
+        default=None,
+        help="path to SSL private key file (enables HTTPS)",
+    )
+    parser.add_argument(
+        "--generate-cert",
+        action="store_true",
+        help="generate a self-signed certificate for testing (requires --ssl-certfile and --ssl-keyfile)",
+    )
+    parser.add_argument(
+        "--http2",
+        action="store_true",
+        help="enable HTTP/2 (requires HTTPS with --ssl-certfile and --ssl-keyfile)",
     )
     parser.add_argument("--log-level", default="warning", help="uvicorn log level (default: warning)")
     return parser
@@ -116,14 +137,40 @@ def settings_from_args(args: argparse.Namespace) -> TargetSettings:
     }
     if args.work_ms is not None:
         kwargs["work_ms"] = args.work_ms
+    if args.ssl_certfile is not None:
+        kwargs["ssl_certfile"] = args.ssl_certfile
+    if args.ssl_keyfile is not None:
+        kwargs["ssl_keyfile"] = args.ssl_keyfile
+    if args.http2 is not None:
+        kwargs["http2"] = args.http2
     return TargetSettings(**kwargs)  # type: ignore[arg-type]
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+
+    # Handle certificate generation
+    if args.generate_cert:
+        if not args.ssl_certfile or not args.ssl_keyfile:
+            print("Error: --generate-cert requires both --ssl-certfile and --ssl-keyfile")
+            return 1
+        from pathlib import Path
+        cert_path = Path(args.ssl_certfile)
+        key_path = Path(args.ssl_keyfile)
+        # Ensure parent directories exist
+        cert_path.parent.mkdir(parents=True, exist_ok=True)
+        key_path.parent.mkdir(parents=True, exist_ok=True)
+        from .app import generate_self_signed_cert
+        generate_self_signed_cert(cert_path, key_path, hostname="localhost")
+        print(f"Generated self-signed certificate:")
+        print(f"  Certificate: {cert_path}")
+        print(f"  Private key: {key_path}")
+        return 0
+
     settings = settings_from_args(args)
 
-    print(f"adobo lab target on http://{settings.host}:{settings.port}")
+    protocol = "https" if settings.ssl_certfile and settings.ssl_keyfile else "http"
+    print(f"adobo lab target on {protocol}://{settings.host}:{settings.port}")
     print(f"  defenses: {', '.join(settings.active()) or 'none (baseline)'}")
     print(f"  work_ms:  {settings.work_ms}")
     print("  read /stats for the target's own request count")

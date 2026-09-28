@@ -263,10 +263,9 @@ def config_from_args(args: argparse.Namespace) -> RunConfig:
     if args.tls_no_verify:
         use_tls = True
 
-    # Auto-enable HTTP/2 on common HTTPS ports
+    # HTTP/2 must be explicitly requested; do not auto-enable based on port
+    # because the socket transport doesn't support HTTP/2
     use_http2 = args.http2
-    if not use_http2 and args.port in HTTPS_PORTS:
-        use_http2 = True
 
     return RunConfig(
         target=Target(host=args.host, port=args.port if args.port is not None else 80),

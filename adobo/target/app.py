@@ -23,8 +23,10 @@ can be pushed to the point of saturation without needing real data behind it.
 from __future__ import annotations
 
 import asyncio
+import ssl
 import time
 from typing import Any, Iterable
+from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
@@ -43,7 +45,7 @@ from ..defenses import (
 )
 from ..models import DefenseName
 
-__all__ = ["TargetSettings", "create_app", "run_target"]
+__all__ = ["TargetSettings", "create_app", "run_target", "generate_self_signed_cert"]
 
 DEFAULT_WORK_MS = 6
 """Simulated database work per /api/data request. Tuned so an unhardened target
@@ -67,6 +69,64 @@ Allowlisting the monitoring path from the edge is standard production practice.
 """
 
 
+def generate_self_signed_cert(
+    cert_path: Path,
+    key_path: Path,
+    *,
+    hostname: str = "localhost",
+    valid_days: int = 365,
+) -> None:
+    """Generate a self-signed certificate for testing.
+
+    Creates a certificate suitable for local testing. Not for production use.
+    """
+    from cryptography import x509
+    from cryptography.x509.oid import NameOID
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    import datetime
+
+    # Generate private key
+    private_key = rsa.generate_private_key(
+        public_exponent=65537,
+        key_size=2048,
+    )
+
+    # Create certificate
+    subject = issuer = x509.Name([
+        x509.NameAttribute(NameOID.COMMON_NAME, hostname),
+    ])
+
+    cert = x509.CertificateBuilder().subject_name(
+        subject
+    ).issuer_name(
+        issuer
+    ).public_key(
+        private_key.public_key()
+    ).serial_number(
+        x509.random_serial_number()
+    ).not_valid_before(
+        datetime.datetime.now(datetime.timezone.utc)
+    ).not_valid_after(
+        datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=valid_days)
+    ).add_extension(
+        x509.SubjectAlternativeName([x509.DNSName(hostname)]),
+        critical=False,
+    ).sign(private_key, hashes.SHA256())
+
+    # Write private key
+    key_path.write_bytes(
+        private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+    )
+
+    # Write certificate
+    cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+
+
 class TargetSettings:
     """Everything about the target that a run might want to vary."""
 
@@ -85,12 +145,18 @@ class TargetSettings:
         exempt_paths: Iterable[str] | None = None,
         host: str = "127.0.0.1",
         port: int = 8000,
+        ssl_certfile: str | None = None,
+        ssl_keyfile: str | None = None,
+        http2: bool = False,
     ) -> None:
         self.defenses = [d for d in defenses if d is not DefenseName.NONE]
         self.waf_rules = waf_rules if waf_rules is not None else load_waf_rules()
         self.work_ms = work_ms
         self.host = host
         self.port = port
+        self.ssl_certfile = ssl_certfile
+        self.ssl_keyfile = ssl_keyfile
+        self.http2 = http2
         self.exempt_paths = set(
             exempt_paths if exempt_paths is not None else DEFAULT_EXEMPT_PATHS
         )
@@ -347,20 +413,39 @@ def run_target(
     settings: TargetSettings | None = None,
     *,
     log_level: str = "warning",
+    http2: bool = False,
 ) -> None:
     """Serve the target until interrupted.
 
     Bound to loopback by default. Serving this on a routable interface would put
     an intentionally fragile service on a network, which is exactly the situation
     the allowlist exists to prevent.
+
+    If ssl_certfile and ssl_keyfile are provided, serves over HTTPS.
+    If http2 is True, enables HTTP/2 (requires SSL).
     """
+    import ssl
     import uvicorn
 
     config = settings or TargetSettings()
-    uvicorn.run(
-        create_app(config),
-        host=config.host,
-        port=config.port,
-        log_level=log_level,
-        access_log=False,
-    )
+    uvicorn_kwargs = {
+        "app": create_app(config),
+        "host": config.host,
+        "port": config.port,
+        "log_level": log_level,
+        "access_log": False,
+    }
+    if config.ssl_certfile and config.ssl_keyfile:
+        uvicorn_kwargs["ssl_certfile"] = config.ssl_certfile
+        uvicorn_kwargs["ssl_keyfile"] = config.ssl_keyfile
+    if http2 and config.ssl_certfile and config.ssl_keyfile:
+        # Create SSL context with ALPN for HTTP/2
+        ssl_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        ssl_ctx.load_cert_chain(config.ssl_certfile, config.ssl_keyfile)
+        ssl_ctx.set_alpn_protocols(['h2'])
+        uvicorn_kwargs["ssl_context"] = ssl_ctx
+        # Don't pass certfile/keyfile when using custom ssl_context
+        uvicorn_kwargs.pop("ssl_certfile", None)
+        uvicorn_kwargs.pop("ssl_keyfile", None)
+
+    uvicorn.run(**uvicorn_kwargs)
