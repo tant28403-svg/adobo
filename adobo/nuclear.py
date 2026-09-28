@@ -223,6 +223,14 @@ def build_profiles(
     wizard_port: int,
     reflector_ports: dict[str, int] | int,
     enable_spoofing: bool = False,
+    use_http2: bool = False,
+    h2_concurrency: int = 100,
+    keep_alive: bool = False,
+    use_tls: bool = False,
+    tls_verify: bool = True,
+    workers: int = 4,
+    payload_size: int = 512,
+    tcp_path: str = "/api/data",
 ) -> list[NuclearProfile]:
     """Build the nuclear profiles from wizard input.
 
@@ -334,7 +342,7 @@ def build_profiles(
         NuclearProfile(
             name="http_flood",
             profile=ProfileName.HTTP_FLOOD,
-            transport=TransportKind.SOCKET,
+            transport=TransportKind.H2 if use_http2 else TransportKind.SOCKET,
             port=wizard_port,
             spoof=False,
             requires_admin=False,
@@ -1311,6 +1319,37 @@ def nuclear_wizard() -> int:
     pps = _ask_int("PPS per profile", 500)
     duration = _ask_float("Duration (s)", 60)
 
+    # HTTP/2 for http_flood (requires TLS)
+    use_http2 = _ask_yes_no(
+        "Use HTTP/2 for http_flood? (requires TLS, enables multiplexing)",
+        default=False,
+    )
+    h2_concurrency = 100
+    if use_http2:
+        h2_concurrency = _ask_int("HTTP/2 concurrent streams per connection", 100)
+
+    # HTTP/1.1 keep-alive
+    keep_alive = _ask_yes_no(
+        "Enable HTTP/1.1 keep-alive for http_flood? (higher throughput, delivery may overcount)",
+        default=False,
+    )
+
+    # TLS options
+    use_tls = _ask_yes_no(
+        "Use TLS/HTTPS for http_flood? (auto-enabled on port 443)",
+        default=False,
+    )
+    tls_verify = True
+    if use_tls:
+        tls_verify = _ask_yes_no(
+            "Verify TLS certificates? (disable for self-signed certs)",
+            default=True,
+        )
+
+    # Workers and payload
+    workers = _ask_int("Worker threads per profile", 4)
+    payload_size = _ask_int("Payload size (bytes)", 512)
+
     # Spoofing is off by default (non-spoofed, real source IP).
     # Spoofed variants require raw socket privileges and are for controlled
     # reflection testing only. Default is non-spoofed (real source IP).
@@ -1322,7 +1361,17 @@ def nuclear_wizard() -> int:
     # Check privileges
     is_admin, parent_raw = check_privileges()
     child_raw, child_reason = check_child_raw_capability()
-    profiles = build_profiles(host, port, reflector_ports, enable_spoofing=enable_spoofing)
+    profiles = build_profiles(
+        host, port, reflector_ports,
+        enable_spoofing=enable_spoofing,
+        use_http2=use_http2,
+        h2_concurrency=h2_concurrency,
+        keep_alive=keep_alive,
+        use_tls=use_tls,
+        tls_verify=tls_verify,
+        workers=workers,
+        payload_size=payload_size,
+    )
 
     if not (is_admin and parent_raw):
         print("\n[!] Not running as Administrator or raw sending unavailable")
