@@ -1165,6 +1165,19 @@ class NuclearAggregator:
             print("\nInterrupted, stopping all profiles...")
 
         self._reap()
+
+        # Clean up multiprocessing queue to avoid atexit traceback on interrupt.
+        # The Queue has a background feeder thread that must be joined.
+        try:
+            if hasattr(self.result_queue, '_writer'):
+                writer = self.result_queue._writer
+                if writer and writer.is_alive():
+                    writer.join(timeout=1.0)
+            self.result_queue.close()
+            self.result_queue.join_thread()
+        except Exception:
+            pass
+
         if interrupted:
             # The strike was cut short, so the totals are not a measurement of
             # anything. Say so rather than presenting a partial run as a result.
