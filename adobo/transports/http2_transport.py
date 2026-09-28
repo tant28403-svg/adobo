@@ -60,7 +60,7 @@ class H2Transport(Transport):
         tcp_path: str = "/api/data",
     ) -> None:
         super().__init__(target, profile)
-        if not supports_profile(TransportKind.SOCKET, profile):
+        if not supports_profile(TransportKind.H2, profile):
             raise TransportError(
                 f"HTTP/2 transport only supports http_flood profile, got {profile.value!r}"
             )

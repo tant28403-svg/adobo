@@ -41,6 +41,7 @@ from adobo.transports import (
     TransportCounters,
     TransportError,
     VirtualTransport,
+    H2Transport,
     available_transports,
     build_payload,
     get_transport,
@@ -49,6 +50,7 @@ from adobo.transports import (
     supports_profile,
 )
 from adobo.transports.scapy_transport import _resolve_iface
+from adobo.transports.http2_transport import DEFAULT_STREAM_TIMEOUT
 
 TARGET = Target(host="127.0.0.1", port=9)
 
@@ -1503,3 +1505,91 @@ class TestCLIConfigFromArgs:
         assert transport.keep_alive is True
         assert transport.use_tls is True
         assert transport.tls_verify is False
+
+
+# ---------------------------------------------------------------------------
+# H2 Transport tests
+# ---------------------------------------------------------------------------
+
+
+class TestH2Transport:
+    """Tests for HTTP/2 transport (H2Transport)."""
+
+    def test_h2_transport_creation(self) -> None:
+        """H2Transport can be constructed with default parameters."""
+        target = Target(host="example.com", port=443)
+        transport = H2Transport(
+            target,
+            ProfileName.HTTP_FLOOD,
+            concurrency=50,
+            tls_verify=False,
+        )
+        assert transport.kind is TransportKind.H2
+        assert transport.concurrency == 50
+        assert transport.tls_verify is False
+        assert transport.stream_timeout == DEFAULT_STREAM_TIMEOUT
+
+    def test_h2_supports_only_http_flood(self) -> None:
+        """H2 transport only supports HTTP_FLOOD profile."""
+        from adobo.transports.base import supports_profile
+        assert supports_profile(TransportKind.H2, ProfileName.HTTP_FLOOD) is True
+        assert supports_profile(TransportKind.H2, ProfileName.UDP_FLOOD) is False
+        assert supports_profile(TransportKind.H2, ProfileName.SYN_FLOOD) is False
+
+    def test_h2_describe_includes_h2_fields(self) -> None:
+        """describe() includes h2-specific fields."""
+        target = Target(host="example.com", port=443)
+        transport = H2Transport(
+            target,
+            ProfileName.HTTP_FLOOD,
+            concurrency=75,
+            tls_verify=True,
+        )
+        desc = transport.describe()
+        assert desc["protocol"] == "h2"
+        assert desc["concurrency"] == 75
+        assert desc["tls_verify"] is True
+
+    def test_h2_request_stop_sets_flag(self) -> None:
+        """request_stop() sets the external stop flag."""
+        target = Target(host="example.com", port=443)
+        transport = H2Transport(
+            target,
+            ProfileName.HTTP_FLOOD,
+        )
+        assert transport._external_stop is False
+        transport.request_stop()
+        assert transport._external_stop is True
+        assert transport._should_stop_external() is True
+
+    def test_h2_concurrency_validation(self) -> None:
+        """Concurrency validation happens at model level, not transport level."""
+        from pydantic import ValidationError
+        # Should work
+        H2Transport(
+            Target(host="example.com", port=443),
+            ProfileName.HTTP_FLOOD,
+            concurrency=1,
+        )
+        H2Transport(
+            Target(host="example.com", port=443),
+            ProfileName.HTTP_FLOOD,
+            concurrency=1000,
+        )
+        # Concurrency 0 is validated by pydantic in AttackProfile, not in transport
+        # This test just verifies transport accepts valid concurrency values
+        H2Transport(
+            Target(host="example.com", port=443),
+            ProfileName.HTTP_FLOOD,
+            concurrency=1,
+        )
+
+    def test_h2_only_http_flood_profile(self) -> None:
+        """H2Transport only accepts HTTP_FLOOD profile."""
+        target = Target(host="example.com", port=443)
+        # HTTP_FLOOD should work
+        H2Transport(target, ProfileName.HTTP_FLOOD)
+        # Others should fail
+        for profile in (ProfileName.UDP_FLOOD, ProfileName.SYN_FLOOD, ProfileName.SLOWLORIS):
+            with pytest.raises(TransportError, match="only supports http_flood"):
+                H2Transport(target, profile)
