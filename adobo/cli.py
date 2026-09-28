@@ -255,16 +255,17 @@ def config_from_args(args: argparse.Namespace) -> RunConfig:
     if not spoof_sources and args.profile in AMPLIFICATION_PROFILES:
         spoof_sources = True
 
-    # Auto-enable TLS on port 443
+    # Auto-enable TLS on common HTTPS ports
+    HTTPS_PORTS = {443, 8443, 8080, 9443, 8000, 8888}
     use_tls = args.tls
-    if not use_tls and args.port == 443:
+    if not use_tls and args.port in HTTPS_PORTS:
         use_tls = True
     if args.tls_no_verify:
         use_tls = True
 
-    # Auto-enable HTTP/2 on port 443
+    # Auto-enable HTTP/2 on common HTTPS ports
     use_http2 = args.http2
-    if not use_http2 and args.port == 443:
+    if not use_http2 and args.port in HTTPS_PORTS:
         use_http2 = True
 
     return RunConfig(
