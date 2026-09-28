@@ -10,6 +10,7 @@ import socket
 import ssl
 import time
 from dataclasses import dataclass
+from enum import IntEnum
 from typing import TYPE_CHECKING
 
 import h2.config
@@ -23,7 +24,7 @@ from .base import PeerUnavailable, Transport, TransportError, supports_profile
 if TYPE_CHECKING:
     from ..engine import RunController
 
-__all__ = ["H2Transport"]
+__all__ = ["H2Transport", "H2ErrorCode"]
 
 DEFAULT_H2_CONCURRENCY = 100
 """Streams per connection. Equivalent to keep-alive concurrency multiplier."""
@@ -34,6 +35,24 @@ DEFAULT_STREAM_TIMEOUT = 10.0  # Per-stream timeout
 DEFAULT_DRAIN_TIMEOUT = 30.0  # Max time to drain all streams
 
 
+class H2ErrorCode(IntEnum):
+    """HTTP/2 error codes (RFC 7540 Section 7)."""
+    NO_ERROR = 0x0
+    PROTOCOL_ERROR = 0x1
+    INTERNAL_ERROR = 0x2
+    FLOW_CONTROL_ERROR = 0x3
+    SETTINGS_TIMEOUT = 0x4
+    STREAM_CLOSED = 0x5
+    FRAME_SIZE_ERROR = 0x6
+    REFUSED_STREAM = 0x7
+    CANCEL = 0x8
+    COMPRESSION_ERROR = 0x9
+    CONNECT_ERROR = 0xA
+    ENHANCE_YOUR_CALM = 0xB
+    INADEQUATE_SECURITY = 0xC
+    HTTP_1_1_REQUIRED = 0xD
+
+
 @dataclass
 class StreamState:
     """Track a single HTTP/2 stream's lifecycle."""
@@ -41,6 +60,8 @@ class StreamState:
     state: str = "idle"  # idle -> headers_sent -> headers_received -> data_receiving -> done
     started_at: float = 0.0
     response_bytes: int = 0
+    rst_received: bool = False
+    rst_error_code: int | None = None
 
 
 class H2Transport(Transport):
@@ -80,6 +101,12 @@ class H2Transport(Transport):
         self._local_window = 65535  # Local flow control window
         self._remote_window = 65535  # Remote flow control window (what we can send)
         self._external_stop = False  # Engine cancellation flag
+        self._goaway_received = False
+        self._goaway_error_code: int | None = None
+        self._goaway_last_stream_id: int | None = None
+        self._ping_outstanding: bool = False
+        self._last_ping_time: float = 0
+        self._ping_rtt: float = 0.0
 
     def _build_tls_context(self) -> ssl.SSLContext:
         ctx = ssl.create_default_context()
@@ -267,13 +294,39 @@ class H2Transport(Transport):
             # Server sent new SETTINGS
             pass  # h2 handles automatically
 
-        elif isinstance(event, (h2.events.ConnectionTerminated, h2.events.GoawayReceived)):
+        elif isinstance(event, h2.events.ConnectionTerminated):
+            # Connection terminated by peer
+            self._teardown()
+
+        elif isinstance(event, h2.events.GoawayReceived):
+            # Server sent GOAWAY
+            self._goaway_received = True
+            self._goaway_error_code = event.error_code
+            self._goaway_last_stream_id = event.last_stream_id
             self._teardown()
 
         elif isinstance(event, h2.events.RstStreamReceived):
-            # Server reset stream - remove from tracking
+            # Server reset stream
             if event.stream_id in self._streams:
-                self._streams.pop(event.stream_id, None)
+                stream = self._streams.pop(event.stream_id, None)
+                if stream:
+                    stream.rst_received = True
+                    stream.rst_error_code = event.error_code
+
+        elif isinstance(event, h2.events.PingReceived):
+            # Server sent PING - we should respond with PING_ACK
+            # h2 handles this automatically, but we can track it
+            pass
+
+        elif isinstance(event, h2.events.PingAckReceived):
+            # Our PING was acknowledged - calculate RTT
+            if self._ping_outstanding:
+                self._ping_rtt = time.monotonic() - self._last_ping_time
+                self._ping_outstanding = False
+
+        elif isinstance(event, h2.events.AlternativeServiceAvailable):
+            # Server offered alternative service (ALTSVC)
+            pass  # Could be used for connection migration
 
     def _check_stream_timeouts(self) -> None:
         """Check for and clean up timed-out streams."""
@@ -358,5 +411,9 @@ class H2Transport(Transport):
             "protocol": "h2",
             "concurrency": self.concurrency,
             "tls_verify": self.tls_verify,
+            "goaway_received": self._goaway_received,
+            "goaway_error_code": self._goaway_error_code,
+            "goaway_last_stream_id": self._goaway_last_stream_id,
+            "ping_rtt": self._ping_rtt,
         })
         return info
