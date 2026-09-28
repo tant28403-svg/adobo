@@ -18,6 +18,7 @@ from .cancellation import CancelReason
 from .engine import EngineHooks, RunEngine
 from .observation import TargetObserver, refused_connection
 from .transports import raw_capability
+from .config import load_lab_config
 @dataclass(frozen=True, slots=True)
 class NuclearProfile:
     """Configuration for one profile in the nuclear strike."""
@@ -1348,7 +1349,8 @@ def nuclear_wizard(skip_reflector_prompts: bool = False) -> int:
         )
 
     # Workers and payload
-    workers = _ask_int("Worker threads per profile", 4)
+    default_workers = load_lab_config().limits.max_workers
+    workers = _ask_int("Worker threads per profile", default_workers)
     payload_size = _ask_int("Payload size (bytes)", 512)
 
     # Spoofing is off by default (non-spoofed, real source IP).
