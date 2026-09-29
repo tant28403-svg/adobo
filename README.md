@@ -12,9 +12,7 @@ An authorised DDoS resilience lab: measures how your services behave under load.
 
 ## Download
 
-**Windows:** download `ADOBO.exe` from the [releases page](https://github.com/tant28403-svg/adobo/releases). No install, no dependencies.
-
-**Or clone it** (Python 3.11+):
+Python 3.11+ required.
 
 ```bash
 git clone https://github.com/tant28403-svg/adobo.git
