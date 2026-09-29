@@ -136,6 +136,39 @@ def probe_udp_port(host: str, port: int, timeout: float = 0.5) -> bool:
         probe.close()
 
 
+#: Profiles whose packets ride a TCP connection. Everything else with a port is
+#: UDP, and the two need different liveness probes - see filter_available_profiles.
+_TCP_PROFILES = frozenset(
+    {
+        ProfileName.SYN_FLOOD,
+        ProfileName.SYN_FLOOD_NS,
+        ProfileName.ACK_FLOOD,
+        ProfileName.ACK_FLOOD_NS,
+        ProfileName.HTTP_FLOOD,
+        ProfileName.SLOWLORIS,
+    }
+)
+
+
+def probe_tcp_port(host: str, port: int, timeout: float = 0.5) -> bool:
+    """True if *port* accepts a TCP connection.
+
+    The complement of :func:`probe_udp_port`. HTTP and slowloris profiles
+    connect over TCP, so probing them with a UDP datagram reports a live web
+    service as closed and silently drops the run's only profiles that have
+    independent delivery evidence.
+    """
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.settimeout(timeout)
+        probe.connect((host, port))
+        return True
+    except (socket.gaierror, OSError):
+        return False
+    finally:
+        probe.close()
+
+
 def filter_available_profiles(
     profiles: list[NuclearProfile],
     host: str,
@@ -146,6 +179,12 @@ def filter_available_profiles(
     packets are discarded by the host before any application sees them, and the
     result is indistinguishable from a successful run at a target that ignored
     the load. Skipping them is reported rather than done silently.
+
+    Each profile is probed on the protocol it actually uses. A UDP datagram is
+    the right test for a reflector and the wrong one for a web server: probing
+    TCP with UDP reports a live HTTP target as closed, and a silent drop here
+    is worse than an honest failed run because the strike still looks like it
+    did something.
     """
     keep: list[NuclearProfile] = []
     skipped: list[tuple[str, str]] = []
@@ -155,7 +194,11 @@ def filter_available_profiles(
         if profile.port is None:
             keep.append(profile)
             continue
-        if probe_udp_port(host, profile.port):
+        if profile.profile in _TCP_PROFILES:
+            reachable = probe_tcp_port(host, profile.port)
+        else:
+            reachable = probe_udp_port(host, profile.port)
+        if reachable:
             keep.append(profile)
         else:
             skipped.append((profile.name, f"{host}:{profile.port} is closed"))
@@ -225,15 +268,17 @@ def build_profiles(
     reflector_ports: dict[str, int] | int,
     enable_spoofing: bool = False,
     use_http2: bool = False,
-    h2_concurrency: int = 100,
-    keep_alive: bool = False,
-    use_tls: bool = False,
-    tls_verify: bool = True,
-    workers: int = 4,
-    payload_size: int = 512,
-    tcp_path: str = "/api/data",
 ) -> list[NuclearProfile]:
     """Build the nuclear profiles from wizard input.
+
+    Only *use_http2* affects the result: it picks the transport for the HTTP
+    profile. Per-child tuning (workers, payload size, keep-alive, TLS, h2
+    concurrency) is deliberately *not* accepted here. NuclearProfile is a frozen
+    routing record with no transport-tuning fields, so such arguments would be
+    accepted and silently discarded - which is exactly what happened: the wizard
+    asked for workers and payload size, they were passed here, and they went
+    nowhere. Those values are carried by NuclearAggregator and set on each
+    child's AttackProfile instead.
 
     *reflector_ports* can be either:
     - A dict mapping protocol names to reflector ports:
@@ -498,6 +543,11 @@ class NuclearAggregator:
         duration: float,
         payload_size: int = 512,
         workers: int = 4,
+        keep_alive: bool = False,
+        use_tls: bool = False,
+        tls_verify: bool = True,
+        use_http2: bool = False,
+        h2_concurrency: int = 100,
     ):
         self.profiles = profiles
         self.target_ip = target_ip
@@ -505,6 +555,16 @@ class NuclearAggregator:
         self.duration = duration
         self.payload_size = payload_size
         self.workers = workers
+        # HTTP-layer options. The transport layer reads these off the
+        # AttackProfile, so the aggregator has to carry them here and set them
+        # per child. NuclearProfile is a frozen routing record and deliberately
+        # has no transport-tuning fields, so these values cannot ride along on
+        # the profiles themselves.
+        self.keep_alive = keep_alive
+        self.use_tls = use_tls
+        self.tls_verify = tls_verify
+        self.use_http2 = use_http2
+        self.h2_concurrency = h2_concurrency
 
         # Use spawn context for Windows compatibility
         self._ctx = mp.get_context('spawn')
@@ -1123,6 +1183,39 @@ class NuclearAggregator:
             for line in reason.split("; "):
                 print(f"    - {line}")
 
+    def _build_configs(self) -> list[RunConfig]:
+        """Build one RunConfig per profile, carrying every operator value.
+
+        Extracted from run() so it can be asserted on directly. This is the
+        function where the wizard's answers become the child processes'
+        configuration, which makes it the one place a dropped value turns into a
+        run that reports a number it did not use.
+        """
+        configs = []
+        for profile in self.profiles:
+            target = Target(host=self.target_ip, port=profile.port or 80)
+            config = RunConfig(
+                target=target,
+                attack=AttackProfile(
+                    profile=profile.profile,
+                    pps=self.pps,
+                    duration_seconds=self.duration,
+                    payload_size=self.payload_size,
+                    workers=self.workers,
+                    spoof_sources=profile.spoof,
+                    keep_alive=self.keep_alive,
+                    use_tls=self.use_tls,
+                    tls_verify=self.tls_verify,
+                    use_http2=self.use_http2,
+                    h2_concurrency=self.h2_concurrency,
+                ),
+                transport=profile.transport,
+                defenses=[],
+                label=self._label(profile),
+            )
+            configs.append(config)
+        return configs
+
     def run(self) -> int:
         """Execute the nuclear strike."""
         self.start_time = time.time()
@@ -1137,24 +1230,7 @@ class NuclearAggregator:
         self._stats_before = _read_stats(self._observer)
 
         # Pre-create configs for each profile
-        configs = []
-        for profile in self.profiles:
-            target = Target(host=self.target_ip, port=profile.port or 80)
-            config = RunConfig(
-                target=target,
-                attack=AttackProfile(
-                    profile=profile.profile,
-                    pps=self.pps,
-                    duration_seconds=self.duration,
-                    payload_size=self.payload_size,
-                    workers=self.workers,
-                    spoof_sources=profile.spoof,
-                ),
-                transport=profile.transport,
-                defenses=[],
-                label=self._label(profile),
-            )
-            configs.append(config)
+        configs = self._build_configs()
 
         # Spawn processes
         for config in configs:
@@ -1368,12 +1444,6 @@ def nuclear_wizard(skip_reflector_prompts: bool = False) -> int:
         host, port, reflector_ports,
         enable_spoofing=enable_spoofing,
         use_http2=use_http2,
-        h2_concurrency=h2_concurrency,
-        keep_alive=keep_alive,
-        use_tls=use_tls,
-        tls_verify=tls_verify,
-        workers=workers,
-        payload_size=payload_size,
     )
 
     if not (is_admin and parent_raw):
@@ -1441,13 +1511,24 @@ def nuclear_wizard(skip_reflector_prompts: bool = False) -> int:
         print("No profiles available to run. Exiting.")
         return 1
 
+    # These must be the values the operator was asked for, not literals. The
+    # aggregator is what builds the per-child AttackProfile, so hardcoding them
+    # here silently discarded the wizard answers: a run configured for 200
+    # workers spawned children with 4, and reported nothing about the
+    # difference. The wizard prints the number, so a wrong literal is a
+    # measurement the tool reports but did not perform.
     aggregator = NuclearAggregator(
         profiles=profiles,
         target_ip=host,
         pps=pps,
         duration=duration,
-        payload_size=512,
-        workers=4,
+        payload_size=payload_size,
+        workers=workers,
+        keep_alive=keep_alive,
+        use_tls=use_tls,
+        tls_verify=tls_verify,
+        use_http2=use_http2,
+        h2_concurrency=h2_concurrency,
     )
 
     return aggregator.run()

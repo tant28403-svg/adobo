@@ -384,6 +384,149 @@ class TestBuildProfiles:
         assert len(amplification) == 4
 
 
+# ---------------------------------------------------------------------------
+# Wizard answers must reach the children
+# ---------------------------------------------------------------------------
+
+
+def _aggregator(**kwargs) -> NuclearAggregator:
+    """An aggregator over one socket profile, with no processes spawned."""
+    return NuclearAggregator(
+        profiles=[make_profile("http_flood", 8000, ProfileName.HTTP_FLOOD)],
+        target_ip="127.0.0.1",
+        pps=1000,
+        duration=1.0,
+        **kwargs,
+    )
+
+
+def _child_attack(**kwargs) -> AttackProfile:
+    """The AttackProfile the aggregator hands to a spawned child.
+
+    Calls the production _build_configs rather than rebuilding the same
+    constructor here: a reimplementation in the test would keep passing even if
+    the code under test regressed back to literals.
+    """
+    configs = _aggregator(**kwargs)._build_configs()
+    assert len(configs) == 1
+    return configs[0].attack
+
+
+class TestOperatorValuesReachTheChildren:
+    """The wizard asks for these numbers, so the children must run with them.
+
+    All of these were once hardcoded literals at the aggregator call, so a run
+    configured for 200 workers spawned children with 4 and printed nothing about
+    the difference. A tool that reports a number it did not use is the exact
+    failure this project exists to rule out, so the numbers are pinned here.
+    """
+
+    def test_workers_reach_the_child_instead_of_a_literal_four(self) -> None:
+        attack = _child_attack(workers=200)
+        assert attack.workers == 200
+
+    def test_a_non_default_worker_count_is_not_silently_replaced(self) -> None:
+        """The regression that matters: a literal would pass the test above
+        only if it happened to equal 200. Check a second value so no constant
+        can satisfy both."""
+        assert _child_attack(workers=7).workers == 7
+        assert _child_attack(workers=1).workers == 1
+
+    def test_payload_size_reaches_the_child_instead_of_a_literal_512(self) -> None:
+        assert _child_attack(payload_size=1400).payload_size == 1400
+        assert _child_attack(payload_size=64).payload_size == 64
+
+    def test_keep_alive_reaches_the_child(self) -> None:
+        assert _child_attack(keep_alive=True).keep_alive is True
+
+    def test_tls_options_reach_the_child(self) -> None:
+        attack = _child_attack(use_tls=True, tls_verify=False)
+        assert attack.use_tls is True
+        assert attack.tls_verify is False
+
+    def test_http2_options_reach_the_child(self) -> None:
+        attack = _child_attack(use_http2=True, h2_concurrency=250)
+        assert attack.use_http2 is True
+        assert attack.h2_concurrency == 250
+
+    def test_http2_picks_the_h2_transport_for_the_http_profile(self) -> None:
+        """Routing is decided in build_profiles, tuning in the aggregator. Both
+        halves have to be right or the run silently uses plain HTTP/1.1."""
+        profiles = build_profiles("127.0.0.1", 8000, 53, use_http2=True)
+        http_profile = next(p for p in profiles if p.name == "http_flood")
+        assert http_profile.transport is TransportKind.H2
+
+    def test_build_profiles_does_not_accept_per_child_tuning(self) -> None:
+        """The parameters are gone on purpose.
+
+        NuclearProfile is frozen and has no fields for them, so accepting them
+        was accepting-and-discarding. A TypeError here is the intended outcome.
+        """
+        for dead in ("workers", "payload_size", "keep_alive", "use_tls"):
+            with pytest.raises(TypeError):
+                build_profiles("127.0.0.1", 8000, 53, **{dead: 1})
+
+
+class TestProbeMatchesTheProtocol:
+    """A profile must be probed on the protocol it actually sends on.
+
+    These all used a UDP datagram for everything. A UDP probe against a live
+    TCP web service reports the port closed, so http_flood and slowloris were
+    dropped from every nuclear run - the two profiles whose delivery the target
+    can independently confirm. The run still reported a completed strike.
+    """
+
+    def test_a_live_tcp_service_is_kept(self) -> None:
+        """A real bound listener, not an assumed-open well-known port."""
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+        try:
+            profiles = [
+                make_profile("http_flood", port, ProfileName.HTTP_FLOOD),
+            ]
+            keep, skipped = filter_available_profiles(profiles, "127.0.0.1")
+        finally:
+            listener.close()
+
+        assert [p.name for p in keep] == ["http_flood"]
+        assert skipped == []
+
+    def test_a_closed_tcp_port_is_still_dropped(self) -> None:
+        """The fix must not make the filter accept everything."""
+        profiles = [
+            make_profile("http_flood", _a_closed_port(), ProfileName.HTTP_FLOOD),
+            make_profile("slowloris", _a_closed_port(), ProfileName.SLOWLORIS),
+        ]
+        keep, skipped = filter_available_profiles(profiles, "127.0.0.1")
+        assert keep == []
+        assert len(skipped) == 2
+
+    def test_slowloris_is_probed_over_tcp(self) -> None:
+        """It holds a TCP connection open, so a UDP probe cannot see it."""
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+        try:
+            keep, _ = filter_available_profiles(
+                [make_profile("slowloris", port, ProfileName.SLOWLORIS)],
+                "127.0.0.1",
+            )
+        finally:
+            listener.close()
+        assert len(keep) == 1
+
+    def test_icmp_still_needs_no_port(self) -> None:
+        profiles = [
+            make_profile("icmp_flood", None, ProfileName.ICMP_FLOOD),
+        ]
+        keep, skipped = filter_available_profiles(profiles, "127.0.0.1")
+        assert len(keep) == 1
+        assert skipped == []
+
+
 class TestPreflight:
     def test_a_closed_port_is_dropped_with_a_reason(self) -> None:
         """An open port is kept, a closed one is dropped and explained.

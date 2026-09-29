@@ -16,3 +16,10 @@ dist/
 *.egg-info/
 .ruff_cache/
 .mypy_cache/
+
+# TLS material is generated per-machine by `adobo.target --generate-cert` and
+# must never be committed. Private keys in a repository are a real finding, not
+# a nitpick, even when the certificate is self-signed for a lab.
+*.pem
+*.key
+*.crt
