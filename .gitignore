@@ -5,6 +5,7 @@ __pycache__/
 .coverage
 htmlcov/
 
+
 # Run artefacts contain real measured traffic data and an audit trail.
 logs/
 reports/
@@ -23,3 +24,7 @@ dist/
 *.pem
 *.key
 *.crt
+
+# Local lab policy. These hold per-machine settings rather than defaults, so
+# they stay out of the shared repository.
+config/
