@@ -1400,30 +1400,22 @@ def _ask_yes_no(prompt: str, default: bool) -> bool:
         print("  Please answer 'y' or 'n'")
 
 
-def nuclear_wizard(skip_reflector_prompts: bool = False) -> int:
+def nuclear_wizard() -> int:
     """Interactive wizard for nuclear mode."""
     print("\n=== Nuclear Strike ===")
     host = _ask("Target IP")
     port = _ask_int("Port (for TCP/UDP profiles)", 80)
     
-    # Auto-fill default reflector ports for amplification protocols
+    # Reflector ports are the well-known service ports and are not asked. A
+    # different reflector means a different service, and the amplification
+    # profiles are built around these, so offering the question invited an
+    # answer that no profile could honour.
     reflector_ports = {
         "dns": 53,
         "ntp": 123,
         "cldap": 389,
         "ssdp": 1900,
     }
-    if not skip_reflector_prompts:
-        print("\n--- Amplification Reflector Ports (auto-filled) ---")
-        print(f"  DNS reflector port: {reflector_ports['dns']}")
-        print(f"  NTP reflector port: {reflector_ports['ntp']}")
-        print(f"  CLDAP reflector port: {reflector_ports['cldap']}")
-        print(f"  SSDP reflector port: {reflector_ports['ssdp']}")
-        print("  (Press Enter to use defaults, or enter custom values)")
-        reflector_ports["dns"] = _ask_int("DNS reflector port", reflector_ports["dns"])
-        reflector_ports["ntp"] = _ask_int("NTP reflector port", reflector_ports["ntp"])
-        reflector_ports["cldap"] = _ask_int("CLDAP reflector port", reflector_ports["cldap"])
-        reflector_ports["ssdp"] = _ask_int("SSDP reflector port", reflector_ports["ssdp"])
     
     # The ceilings come from lab.yaml, so the prompt and the gate can never
     # disagree about what the limit is.

@@ -78,43 +78,27 @@ Every applicable profile in parallel.
 python -m adobo --nuclear
 ```
 
-It asks 16 questions:
+It asks 12 questions:
 
 ```
 === Nuclear Strike ===
 Target IP: 127.0.0.1
 Port (for TCP/UDP profiles) [80]: 8001
-
---- Amplification Reflector Ports (auto-filled) ---
-  DNS reflector port: 53
-  NTP reflector port: 123
-  CLDAP reflector port: 389
-  SSDP reflector port: 1900
-  (Press Enter to use defaults, or enter custom values)
-DNS reflector port [53]:
-NTP reflector port [123]:
-CLDAP reflector port [389]:
-SSDP reflector port [1900]:
-
-PPS per profile [500]:
+PPS per profile (max 20,000 - max_pps) [500]:
 Duration (s) [60]:
 Use HTTP/2 for http_flood? (requires TLS, enables multiplexing) [y/N]:
 Enable HTTP/1.1 keep-alive for http_flood? (higher throughput, delivery may overcount) [y/N]:
 Use TLS/HTTPS for http_flood? (auto-enabled on port 443) [y/N]:
-Payload size (bytes) [512]:
+Payload size (bytes) (max 1,400 - max_payload_bytes) [512]:
 Enable IP spoofing for raw profiles? (requires root/CAP_NET_RAW) [y/N]:
 ```
 
-To skip the four reflector ports:
+Two questions aren't asked, because there was no decision to make:
 
-```bash
-python -m adobo --nuclear --skip-reflector-prompts
-```
+**Reflector ports** use the well-known service ports (53 / 123 / 389 / 1900).
 
-That asks 12 instead of 16 and uses the default ports (53 / 123 / 389 / 1900).
-
-Worker threads are not asked. They always use the `max_workers` ceiling, so
-every profile runs with 200 by default.
+**Worker threads** use the `max_workers` ceiling, so every profile runs with
+200 by default.
 
 | Question | What it does |
 |---|---|

@@ -207,11 +207,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Number of concurrent HTTP/2 streams per connection (default: 100)",
     )
     parser.add_argument(
-        "--skip-reflector-prompts",
-        action="store_true",
-        help="Skip reflector port prompts in nuclear wizard, use defaults",
-    )
-    parser.add_argument(
         "--nuclear",
         action="store_true",
         help="run the interactive nuclear wizard instead of a single profile",
@@ -364,7 +359,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     # out and is handled here rather than left to escape as a traceback.
     if args.nuclear or not args.host:
         try:
-            exit_code = nuclear_wizard(skip_reflector_prompts=args.skip_reflector_prompts)
+            exit_code = nuclear_wizard()
         except KeyboardInterrupt:
             # Same code as an interrupted run, so a caller can treat "the
             # operator stopped this" as one condition however it was stopped.
