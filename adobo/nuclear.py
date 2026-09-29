@@ -1470,13 +1470,12 @@ def nuclear_wizard(skip_reflector_prompts: bool = False) -> int:
         )
 
     # Workers and payload
-    workers = _ask_int_bounded(
-        "Worker threads per profile",
-        limits.max_workers,
-        1,
-        limits.max_workers,
-        "max_workers",
-    )
+    # Worker threads are not asked. The policy ceiling is the value, so there
+    # is no decision for the operator to make here: a prompt that only ever
+    # wants the same answer is a step to skip. It was a prompt, and it was the
+    # one value the wizard used to discard anyway - it used to be collected and
+    # then replaced by a literal, which is the bug this removed.
+    workers = limits.max_workers
     payload_size = _ask_int_bounded(
         "Payload size (bytes)", 512, 0, limits.max_payload_bytes, "max_payload_bytes"
     )

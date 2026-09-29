@@ -78,7 +78,7 @@ Every applicable profile in parallel.
 python -m adobo --nuclear
 ```
 
-It asks 17 questions:
+It asks 16 questions:
 
 ```
 === Nuclear Strike ===
@@ -101,7 +101,6 @@ Duration (s) [60]:
 Use HTTP/2 for http_flood? (requires TLS, enables multiplexing) [y/N]:
 Enable HTTP/1.1 keep-alive for http_flood? (higher throughput, delivery may overcount) [y/N]:
 Use TLS/HTTPS for http_flood? (auto-enabled on port 443) [y/N]:
-Worker threads per profile [200]:
 Payload size (bytes) [512]:
 Enable IP spoofing for raw profiles? (requires root/CAP_NET_RAW) [y/N]:
 ```
@@ -112,7 +111,10 @@ To skip the four reflector ports:
 python -m adobo --nuclear --skip-reflector-prompts
 ```
 
-That asks 13 instead of 17 and uses the default ports (53 / 123 / 389 / 1900).
+That asks 12 instead of 16 and uses the default ports (53 / 123 / 389 / 1900).
+
+Worker threads are not asked. They always use the `max_workers` ceiling, so
+every profile runs with 200 by default.
 
 | Question | What it does |
 |---|---|
