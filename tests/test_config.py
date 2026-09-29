@@ -29,43 +29,68 @@ from adobo.models import Target
 # ---------------------------------------------------------------------------
 
 
-class TestShippedConfig:
-    def test_lab_yaml_loads(self) -> None:
-        config = load_lab_config()
+class TestConfigFallbacks:
+    """The tool runs with no config/ directory present at all.
+
+    ``config/`` is gitignored, so a fresh clone has neither lab.yaml nor
+    authorization.yaml, and this is the state a new user actually gets. These
+    tests state what that state produces rather than asserting values from a
+    file that is not there: the defaults in config.py are what runs, and they
+    have to be sane on their own.
+    """
+
+    def test_missing_lab_yaml_falls_back_to_working_defaults(self) -> None:
+        config = load_lab_config("definitely_absent.yaml")
         assert config.lab_id == "adobo"
         assert config.limits.max_pps == 20_000
 
-    def test_lab_yaml_is_loopback_only_by_default(self) -> None:
-        """The out-of-the-box posture must not permit touching the LAN."""
-        config = load_lab_config()
+    def test_the_fallback_allowlist_is_loopback_only(self) -> None:
+        """The out-of-the-box posture must not reach the LAN."""
+        config = load_lab_config("definitely_absent.yaml")
         for network in config.networks():
             assert network.is_loopback, f"default allowlist leaks {network}"
 
-    def test_lab_yaml_allowlist_is_minimal(self) -> None:
-        config = load_lab_config()
-        assert set(config.allowed_cidrs) == {"127.0.0.0/8", "::1/128"}
-
-    def test_lab_yaml_target_is_loopback(self) -> None:
-        config = load_lab_config()
+    def test_the_fallback_target_is_loopback(self) -> None:
+        config = load_lab_config("definitely_absent.yaml")
         assert config.target.host == "127.0.0.1"
 
-    def test_shipped_authorisation_is_expired(self) -> None:
-        auth = load_authorization()
-        assert auth is not None
-        assert auth.is_expired()
+    def test_the_fallback_ceilings_are_sane(self) -> None:
+        """These are the numbers a fresh clone is actually capped at.
 
-    def test_shipped_authorisation_scopes_loopback_only(self) -> None:
-        auth = load_authorization()
-        assert auth is not None
-        for network in auth.networks():
-            assert network.is_loopback
-
-    def test_lab_yaml_ceiling_is_sane(self) -> None:
-        limits = load_lab_config().limits
+        max_workers is 8 here, not the 200 in the local config/lab.yaml, so a
+        claim about the worker ceiling only holds for a configured checkout.
+        Stated so the difference is visible rather than surprising.
+        """
+        limits = load_lab_config("definitely_absent.yaml").limits
         assert 0 < limits.max_pps <= 1_000_000
         assert 0 < limits.max_duration_seconds <= 3600
         assert 0 < limits.max_payload_bytes <= 65_507
         assert 0 < limits.max_workers <= 256
+
+    def test_a_missing_authorization_record_is_not_an_error(self) -> None:
+        """No gate, so no record is needed and none is expected.
+
+        load_authorization still exists and still returns None when the file is
+        absent; nothing in the run path consults it.
+        """
+        assert load_authorization("definitely_absent.yaml") is None
+
+
+class TestLocalConfigWhenPresent:
+    """A configured checkout reads config/lab.yaml.
+
+    Skipped rather than failed when the file is absent, so the suite passes on
+    a fresh clone and still says something on a configured one.
+    """
+
+    @pytest.mark.skipif(
+        not (project_path("config/lab.yaml")).exists(),
+        reason="no local config/lab.yaml (config/ is gitignored)",
+    )
+    def test_local_allowlist_is_loopback_only(self) -> None:
+        config = load_lab_config()
+        for network in config.networks():
+            assert network.is_loopback, f"local allowlist leaks {network}"
 
 
 # ---------------------------------------------------------------------------
