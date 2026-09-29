@@ -28,3 +28,7 @@ dist/
 # Local lab policy. These hold per-machine settings rather than defaults, so
 # they stay out of the shared repository.
 config/
+
+# Personal working notes, not part of the project.
+CHECKPOINT.md
+PROGRESS.md
