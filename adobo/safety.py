@@ -80,9 +80,13 @@ class SafetyGuard:
         values: dict[str, Any] = dict(requested)
         notes: list[str] = []
 
-        def _cap(name: str, limit: int, source: str, unit: str = "") -> None:
+        def _cap(name: str, limit: Any, source: str, unit: str = "") -> None:
             value = values.get(name)
-            if not isinstance(value, (int, float)) or value <= limit:
+            # A None limit means "no ceiling configured", so the requested
+            # value stands. Throughput is deliberately left uncapped.
+            if limit is None or not isinstance(value, (int, float)):
+                return
+            if value <= limit:
                 return
             values[name] = limit
             shown = f"{value:,}" if isinstance(value, int) else f"{value:g}"
@@ -111,7 +115,9 @@ class SafetyGuard:
         notes: list[str] = []
         updates: dict[str, Any] = {}
 
-        if profile.pps > limits.max_pps:
+        # No pps clamp: throughput is not capped, so a run sends what it was
+        # asked to send. See LimitsConfig for why.
+        if limits.max_pps is not None and profile.pps > limits.max_pps:
             updates["pps"] = limits.max_pps
             notes.append(
                 f"pps clamped from {profile.pps:,} to {limits.max_pps:,} "
@@ -147,8 +153,9 @@ class SafetyGuard:
     def describe_ceilings(self) -> str:
         """A one-line summary, for prompts and refusal messages."""
         limits = self.lab.limits
+        pps = "uncapped" if limits.max_pps is None else f"pps<={limits.max_pps:,}"
         return (
-            f"pps<={limits.max_pps:,} duration<={limits.max_duration_seconds:g}s "
+            f"{pps} duration<={limits.max_duration_seconds:g}s "
             f"payload<={limits.max_payload_bytes:,}B workers<={limits.max_workers:,}"
         )
 

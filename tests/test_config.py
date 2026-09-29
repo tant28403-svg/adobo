@@ -42,7 +42,9 @@ class TestConfigFallbacks:
     def test_missing_lab_yaml_falls_back_to_working_defaults(self) -> None:
         config = load_lab_config("definitely_absent.yaml")
         assert config.lab_id == "adobo"
-        assert config.limits.max_pps == 20_000
+        # Throughput is deliberately uncapped, so a run sends what was asked
+        # for rather than an amount this file happened to allow.
+        assert config.limits.max_pps is None
 
     def test_the_fallback_allowlist_is_loopback_only(self) -> None:
         """The out-of-the-box posture must not reach the LAN."""
@@ -59,10 +61,11 @@ class TestConfigFallbacks:
 
         max_workers is 8 here, not the 200 in the local config/lab.yaml, so a
         claim about the worker ceiling only holds for a configured checkout.
-        Stated so the difference is visible rather than surprising.
+        Stated so the difference is visible rather than surprising. Throughput
+        has no ceiling at all.
         """
         limits = load_lab_config("definitely_absent.yaml").limits
-        assert 0 < limits.max_pps <= 1_000_000
+        assert limits.max_pps is None
         assert 0 < limits.max_duration_seconds <= 3600
         assert 0 < limits.max_payload_bytes <= 65_507
         assert 0 < limits.max_workers <= 256
@@ -112,7 +115,7 @@ class TestLabConfig:
     def test_missing_file_falls_back_to_defaults(self, tmp_path: Path) -> None:
         config = load_lab_config(tmp_path / "absent.yaml")
         assert config.lab_id == "adobo"
-        assert config.limits.max_pps == 20_000
+        assert config.limits.max_pps is None
 
     def test_non_mapping_yaml_is_rejected(self, tmp_path: Path) -> None:
         bad = tmp_path / "lab.yaml"

@@ -56,11 +56,19 @@ def config_path(name: str) -> Path:
 
 
 class LimitsConfig(BaseModel):
-    """Hard ceilings. Runs are clamped down to these, never above."""
+    """Hard ceilings. Runs are clamped down to these, never above.
+
+    *max_pps* is optional and unset by default: throughput is not capped. The
+    other three stay, because they bound what a run can do to a machine rather
+    than how hard it pushes. Throughput is limited in practice by the network
+    and by the sender itself, and a cap here only ever understated a result the
+    operator had asked for - a run that sent less than requested reads as a run
+    that tested less than intended.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
-    max_pps: int = Field(default=20_000, gt=0)
+    max_pps: int | None = Field(default=None, gt=0)
     max_duration_seconds: float = Field(default=60.0, gt=0)
     max_payload_bytes: int = Field(default=1400, gt=0)
     max_workers: int = Field(default=8, gt=0)

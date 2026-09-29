@@ -42,12 +42,40 @@ def _profile(**kw) -> AttackProfile:
 # ---------------------------------------------------------------------------
 
 
-class TestCeilingsClampAndReport:
-    def test_pps_above_the_ceiling_is_capped(self) -> None:
-        guard = SafetyGuard(lab=_lab(max_pps=20_000))
-        fields, _ = guard.clamp_fields(pps=2_000_000)
-        assert fields["pps"] == 20_000
+class TestThroughputIsNotCapped:
+    """Throughput has no ceiling, so a run sends what it was asked to send.
 
+    A pps cap only ever understated the run: the operator asked for a rate, the
+    tool sent less, and the result described a smaller test than the one on
+    screen. What the machine can actually send is the honest limit, and that
+    shows up in the achieved figure rather than being hidden in a config file.
+    """
+
+    def test_throughput_is_left_alone_by_default(self) -> None:
+        guard = SafetyGuard()
+        assert guard.lab.limits.max_pps is None
+        fields, notes = guard.clamp_fields(pps=2_000_000)
+        assert fields["pps"] == 2_000_000
+        assert notes == []
+
+    def test_a_configured_pps_limit_is_still_honoured(self) -> None:
+        """Optional means optional: an operator who sets one still gets it."""
+        guard = SafetyGuard(lab=_lab(max_pps=20_000))
+        fields, notes = guard.clamp_fields(pps=2_000_000)
+        assert fields["pps"] == 20_000
+        assert any("pps clamped" in n for n in notes)
+
+    def test_clamp_profile_leaves_a_high_rate_alone(self) -> None:
+        guard = SafetyGuard()
+        result = guard.clamp_profile(_profile(pps=500_000))
+        assert result.applied.pps == 500_000
+        assert result.changed is False
+
+    def test_the_summary_says_uncapped(self) -> None:
+        assert "uncapped" in SafetyGuard().describe_ceilings()
+
+
+class TestCeilingsClampAndReport:
     def test_payload_above_the_ceiling_is_capped(self) -> None:
         """The reported crash, in the form the clamp has to handle.
 

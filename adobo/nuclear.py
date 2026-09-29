@@ -1421,9 +1421,12 @@ def nuclear_wizard() -> int:
     # disagree about what the limit is.
     limits = load_lab_config().limits
 
-    pps = _ask_int_bounded(
-        "PPS per profile", 500, 1, limits.max_pps, "max_pps"
-    )
+    # PPS is not bounded: there is no throughput ceiling, so the prompt only
+    # enforces that the value is a positive whole number.
+    pps = _ask_int("PPS per profile", 500)
+    if pps < 1:
+        print("  must be at least 1")
+        pps = _ask_int("PPS per profile", 500)
     duration = _ask_float("Duration (s)", 60)
     if duration > limits.max_duration_seconds:
         print(

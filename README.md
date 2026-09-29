@@ -131,22 +131,22 @@ Run `python -m adobo --help` for everything else.
 
 ## Limits
 
-Runs are clamped to the ceilings in `config/lab.yaml`. No flag raises them, and every reduction is reported:
+Throughput is not capped. Ask for the rate you want and the run sends it — what the machine can actually achieve shows up in the achieved figure rather than being trimmed in advance. Add `max_pps` to `config/lab.yaml` if you want a limit.
+
+The other three are capped, and every reduction is reported rather than applied silently:
 
 ```
 Ceiling adjustments from lab.yaml:
-  pps clamped from 2,000,000 to 20,000 (max_pps in lab.yaml)
   payload_size clamped from 1,900,000 to 1,400 bytes (max_payload_bytes in lab.yaml)
+  workers clamped from 99,999 to 200 (max_workers in lab.yaml)
 ```
 
 | Ceiling | Value |
 |---|---|
-| Throughput | 20,000 pps |
+| Throughput | none |
 | Duration | 60 seconds |
 | Payload | 1,400 bytes |
 | Workers | 200 |
-
-The nuclear wizard asks for these within their limits, and says what the limit is rather than rejecting the value without explanation.
 
 ## Tests
 
