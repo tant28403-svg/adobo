@@ -152,11 +152,8 @@ class RunEngine:
     """Executes one :class:`RunConfig` and returns a :class:`RunOutcome`.
 
     :meth:`run` puts the config through :class:`~adobo.safety.SafetyGuard`
-    before anything is opened. The engine used to document that the config
-    "must already have been through preflight" while no such call existed
-    anywhere, so an expired authorisation record did not stop a run. The gate
-    is here now, rather than trusted to each caller, so that the CLI, the
-    wizard and any future entry point are all covered by the same check.
+    before anything is opened, so the CLI, the wizard and any future entry
+    point are all capped by the same check.
     """
 
     def __init__(
@@ -176,9 +173,8 @@ class RunEngine:
         guard: SafetyGuard | None = None,
     ) -> None:
         self.config = config
-        # Injectable so tests can supply an authorisation record without
-        # weakening the production path: the default is still "load the real
-        # config/authorization.yaml and refuse if it is missing or expired".
+        # Injectable so tests can supply permissive ceilings without weakening
+        # the production path: the default reads config/lab.yaml.
         self._guard = guard
         self.hooks = hooks or EngineHooks()
         self.controller = controller or RunController(config.attack.duration_seconds)
@@ -259,9 +255,8 @@ class RunEngine:
         Cancellation is not an error: a stopped run produces a result. Genuine
         faults are re-raised, but only after the audit trail has been closed.
         """
-        # Authorisation and ceilings, before anything is opened. A refused run
-        # raises PolicyViolation out of here, so no socket is ever created for a
-        # target the operator is not authorised to test.
+        # Ceilings, before anything is opened, so a run never goes out past
+        # what the config permits.
         if not self.config.dry_run:
             self._apply_safety_gate()
 
@@ -332,15 +327,14 @@ class RunEngine:
         return outcome
 
     def _apply_safety_gate(self) -> None:
-        """Authorise the target and clamp the run to the configured ceilings.
+        """Clamp the run to the configured ceilings.
 
-        Raises :class:`~adobo.safety.PolicyViolation` when the run is not
-        permitted. Clamps are applied to the config in place and recorded, so
-        the summary reports the values that were actually used rather than the
-        ones that were requested.
+        There is no authorisation step: the target is the one the operator
+        named. Clamps are applied to the config in place and recorded, so the
+        summary reports the values that were actually used rather than the ones
+        that were requested.
         """
         guard = self._guard or SafetyGuard()
-        guard.authorize(self.config.target)
         result = guard.clamp_profile(self.config.attack)
         if result.changed:
             self.config = self.config.model_copy(

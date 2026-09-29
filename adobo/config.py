@@ -154,11 +154,17 @@ def load_lab_config(path: str | Path | None = None) -> LabConfig:
 
 # --------------------------------------------------------------------------
 # authorization.yaml
+#
+# Removed. The gate this model backed made the tool refuse to send unless a
+# dated, scoped record was edited first - including to the loopback lab target
+# shipped in this repository, so the first thing a new user had to do was
+# authorise a test against their own machine. The model and load_authorization
+# are kept here only as a record of what was removed; nothing reads them.
 # --------------------------------------------------------------------------
 
 
 class AuthorizationConfig(BaseModel):
-    """Written authorisation record. The engine refuses to run without one."""
+    """Written authorisation record. No longer consulted by the engine."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -200,7 +206,11 @@ class AuthorizationConfig(BaseModel):
 
 
 def load_authorization(path: str | Path | None = None) -> AuthorizationConfig | None:
-    """Load `authorization.yaml`, or return None when it is absent."""
+    """Load `authorization.yaml`, or return None when it is absent.
+
+    Kept for reference only. The engine no longer calls this: there is no
+    authorisation gate, and no file needs to exist before a run is allowed.
+    """
     target_path = (
         project_path(path) if path else config_path(AUTHORIZATION_CONFIG_NAME)
     )

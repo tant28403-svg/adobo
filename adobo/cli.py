@@ -318,10 +318,8 @@ def run_once(config: RunConfig, quiet: bool = False) -> int:
         _say("\nInterrupted.")
         return EXIT_INTERRUPTED
     except PolicyViolation as exc:
-        # A refusal is a result, not a crash. Someone refusing to send traffic
-        # is the tool working, and it should read as a decision rather than a
-        # traceback the operator has to decode.
-        _say("\n[!] Refused: not authorised to run this test")
+        # A refusal is a result, not a crash.
+        _say("\n[!] Refused by policy")
         _say(f"    {exc}")
         return EXIT_ERROR
     finally:

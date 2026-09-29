@@ -14,11 +14,8 @@ the authorisation record is supplied per-test instead, and
 
 from __future__ import annotations
 
-from datetime import date, timedelta
-
 import pytest
 
-from adobo.config import AuthorizationConfig
 from adobo.models import (
     AttackProfile,
     ProfileName,
@@ -29,31 +26,10 @@ from adobo.models import (
 from adobo.safety import SafetyGuard
 
 
-def make_authorization(
-    scope: list[str] | None = None,
-    expires_in_days: int = 30,
-) -> AuthorizationConfig:
-    """An authorisation record that permits *scope*, valid for a month."""
-    return AuthorizationConfig(
-        operator="test",
-        issuer="test",
-        reference="TEST",
-        scope=scope if scope is not None else ["127.0.0.0/8"],
-        issued_on=date.today(),
-        expires_on=date.today() + timedelta(days=expires_in_days),
-    )
-
-
 @pytest.fixture
-def authorization() -> AuthorizationConfig:
-    """A valid, in-scope record for loopback."""
-    return make_authorization()
-
-
-@pytest.fixture
-def guard(authorization: AuthorizationConfig) -> SafetyGuard:
-    """A guard that permits loopback, so a test is not blocked by policy."""
-    return SafetyGuard(authorization=authorization)
+def guard() -> SafetyGuard:
+    """A guard using the shipped lab.yaml ceilings."""
+    return SafetyGuard()
 
 
 @pytest.fixture

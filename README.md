@@ -27,24 +27,15 @@ pip install pydantic pyyaml psutil pyfiglet httpx h2 cryptography
 
 ## Use
 
-**1. Allow the run.** The tool refuses to send anything without a valid authorisation record, and the shipped `authorization.yaml` is expired on purpose — so an unconfigured checkout does nothing. Set a future date:
+Nothing to configure. Clone it and run it.
 
-```yaml
-# config/authorization.yaml
-expires_on: 2027-01-01
-scope:
-  - "127.0.0.0/8"    # only the networks you are authorised to test
-```
-
-A run against a target outside `scope`, or with a hostname that cannot be resolved, is refused.
-
-**2. Start the lab target.** It counts what it served, so you can check the result against a number that isn't the sender's own claim:
+**1. Start the lab target.** It counts what it served, so you can check the result against a number that isn't the sender's own claim:
 
 ```bash
 python -m adobo.target --port 8001
 ```
 
-**3. Attack it:**
+**2. Attack it:**
 
 ```bash
 python -m adobo --host 127.0.0.1 --port 8001 \

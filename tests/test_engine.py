@@ -60,27 +60,33 @@ def make_engine(config: RunConfig, **kwargs) -> RunEngine:
 
 
 @pytest.fixture(autouse=True)
-def _permitted_run(monkeypatch):
-    """Let these tests run without editing the repository's authorisation.
+def _no_clamping(monkeypatch):
+    """Run these tests at the values they ask for.
 
-    The engine refuses to send without a valid record, and the shipped record
-    is expired on purpose. These tests are about the engine, not about policy,
-    so the default SafetyGuard is replaced with one holding a valid loopback
-    authorisation. The refusal paths have their own tests in test_safety.py -
-    patching it here is what keeps those honest, since without this patch every
-    test in the file would fail closed.
+    The engine caps a run to the lab.yaml ceilings, which would quietly lower
+    the duration and payload some of these tests rely on. The guard is replaced
+    with permissive limits so each test measures the engine rather than the
+    policy. Ceiling behaviour has its own tests in test_safety.py.
     """
+    from adobo.config import LabConfig, LimitsConfig
     from adobo.safety import SafetyGuard
 
-    from tests.conftest import make_authorization
+    def permissive(self, lab=None):
+        object.__setattr__(
+            self,
+            "lab",
+            lab
+            or LabConfig(
+                limits=LimitsConfig(
+                    max_pps=10_000_000,
+                    max_duration_seconds=3600,
+                    max_payload_bytes=65_507,
+                    max_workers=1000,
+                )
+            ),
+        )
 
-    permitted = SafetyGuard(authorization=make_authorization())
-    original = SafetyGuard.__init__
-
-    def patched(self, lab=None, authorization=None):
-        original(self, lab=lab, authorization=permitted.authorization)
-
-    monkeypatch.setattr(SafetyGuard, "__init__", patched)
+    monkeypatch.setattr(SafetyGuard, "__init__", permissive)
 
 
 # ---------------------------------------------------------------------------

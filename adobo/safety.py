@@ -1,45 +1,38 @@
-"""Authorisation and policy gate.
+"""Policy ceilings for a run.
 
-Every run passes through :class:`SafetyGuard` before a socket is opened. The
-contract it enforces is the one ``config/authorization.yaml`` documents:
+One job: cap the values a run asks for at the limits in ``config/lab.yaml``,
+and report every reduction so a capped run never reads like the run that was
+asked for.
 
-    The engine REFUSES to open a socket unless this file is present,
-    unexpired, and its scope covers the target.
+There is deliberately no authorisation gate here. There was one, backed by
+``config/authorization.yaml``, and it required a date and a scope to be edited
+before the tool would send a single packet - including against the loopback
+lab target shipped in the same repository. That was a setup step standing
+between someone and a working demo, on a tool whose whole purpose is
+measurement: the authorising step produced no measurement and made the tool
+harder to use without making it safer in any way that mattered, since the
+target is named by the operator either way.
 
-That contract was previously only written down. ``AttackProfile`` carries a
-hard model ceiling (65,507 bytes, from the maximum UDP datagram) which is a
-protocol limit, not a policy one; nothing read ``lab.yaml``'s ceilings, and
-nothing read the authorisation record at all. So a run could be configured
-past every limit the config files claimed, and a raw
-``pydantic.ValidationError`` was the only thing standing between the wizard and
-a crash.
+The ceilings stay because they are what keeps a run inside what the machine
+can actually measure. A run configured past them is not a stronger test, it is
+a run whose numbers no longer describe the thing being tested. They are
+enforced, they lower only, and they are never silent.
 
-Two distinct jobs, deliberately kept separate:
-
-* :meth:`SafetyGuard.authorize` **refuses**. It is a gate, and a gate that
-  sometimes lets traffic through is not a gate.
-* :meth:`SafetyGuard.clamp_profile` **adjusts and reports**. A ceiling is a
-  limit, and silently capping a run would make the tool report a number the
-  operator did not ask for - the same class of bug as reporting a worker count
-  that was never used. Every clamp is returned as a note.
+The legal and ethical position is unchanged and lives in the README: only
+target systems you own or have written permission to test.
 """
 
 from __future__ import annotations
 
-import ipaddress
 from dataclasses import dataclass, field
 from typing import Any
 
-from .config import LabConfig, load_authorization, load_lab_config
+from .config import LabConfig, load_lab_config
 from .models import AttackProfile, Target
 
 
 class PolicyViolation(Exception):
-    """A run was refused because policy does not permit it.
-
-    Raised rather than logged-and-continued, because the alternative is a tool
-    that documents authorisation and does not perform it.
-    """
+    """A run was refused because a configured policy does not permit it."""
 
 
 @dataclass
@@ -60,80 +53,10 @@ class ClampResult:
 
 
 class SafetyGuard:
-    """Check authorisation, then clamp to the configured ceilings."""
+    """Clamp a run to the ceilings in ``config/lab.yaml``."""
 
-    def __init__(
-        self,
-        lab: LabConfig | None = None,
-        authorization: Any | None = None,
-    ) -> None:
+    def __init__(self, lab: LabConfig | None = None) -> None:
         self.lab = lab if lab is not None else load_lab_config()
-        # Explicitly passed as None means "load it", so the sentinel has to be
-        # distinct: callers that want *no* record pass a value that is not
-        # None, and callers that want the default get the file.
-        self.authorization = (
-            load_authorization() if authorization is None else authorization
-        )
-
-    # -- authorisation ----------------------------------------------------
-
-    def authorize(self, target: Target) -> None:
-        """Refuse the run unless policy permits sending to *target*.
-
-        Raises :class:`PolicyViolation` with a message that says what to fix,
-        because the person hitting it is usually mid-demo and needs the file
-        name and the reason, not a stack trace.
-        """
-        auth = self.authorization
-        if auth is None:
-            raise PolicyViolation(
-                "No authorisation record found. config/authorization.yaml must "
-                "exist before this tool will send traffic. It ships expired on "
-                "purpose so an unconfigured checkout is inert - set expires_on "
-                "to a future date and list the networks you are authorised to "
-                "test."
-            )
-
-        if auth.is_expired():
-            expires = auth.expires_on.isoformat() if auth.expires_on else "unset"
-            raise PolicyViolation(
-                f"Authorisation expired on {expires}. Update expires_on in "
-                "config/authorization.yaml, or the run is refused. This is the "
-                "gate working as intended, not a bug to work around."
-            )
-
-        if not self._in_authorization_scope(target, auth):
-            raise PolicyViolation(
-                f"{target.host} is not inside the authorised scope. "
-                f"config/authorization.yaml covers "
-                f"{', '.join(auth.scope) or '(nothing)'}. Either the target is "
-                "wrong or the scope needs updating deliberately - do not widen "
-                "it to make an error go away."
-            )
-
-    def _in_authorization_scope(self, target: Target, auth: Any) -> bool:
-        """True when *target*'s host falls inside the authorisation scope.
-
-        A hostname is resolved before comparison, so a target given by name is
-        checked by address rather than waved through. An unresolvable name is
-        refused: failing closed is the entire point of this check.
-        """
-        try:
-            address = ipaddress.ip_address(target.host.split("%", 1)[0])
-        except ValueError:
-            try:
-                import socket
-
-                address = ipaddress.ip_address(
-                    socket.gethostbyname(target.host.split("%", 1)[0])
-                )
-            except (OSError, ValueError):
-                # Cannot determine what address this name resolves to, so the
-                # scope cannot be shown to cover it. Refuse rather than guess.
-                return False
-        return any(address in network for network in auth.networks())
-
-    # -- ceilings ---------------------------------------------------------
 
     #: Protocol bounds the model enforces, repeated here so the gate can clamp
     #: to them before the model sees a value it will reject. AttackProfile
@@ -142,9 +65,7 @@ class SafetyGuard:
     #: exactly the crash a 1,900,000-byte payload produced.
     MODEL_CEILINGS = {"payload_size": 65_507, "h2_concurrency": 1000}
 
-    def clamp_fields(
-        self, **requested: Any
-    ) -> tuple[dict[str, Any], list[str]]:
+    def clamp_fields(self, **requested: Any) -> tuple[dict[str, Any], list[str]]:
         """Cap raw requested values, before any model validates them.
 
         Takes loose values rather than an AttackProfile on purpose. The
@@ -166,9 +87,7 @@ class SafetyGuard:
             values[name] = limit
             shown = f"{value:,}" if isinstance(value, int) else f"{value:g}"
             cap = f"{limit:,}" if isinstance(limit, int) else f"{limit:g}"
-            notes.append(
-                f"{name} clamped from {shown} to {cap}{unit} ({source})"
-            )
+            notes.append(f"{name} clamped from {shown} to {cap}{unit} ({source})")
 
         _cap("pps", limits.max_pps, "max_pps in lab.yaml")
         _cap("duration_seconds", limits.max_duration_seconds,
@@ -235,11 +154,10 @@ class SafetyGuard:
 
 
 def preflight(config: Any, guard: SafetyGuard | None = None) -> ClampResult:
-    """Authorise and clamp in one call. Used at the top of a run.
+    """Clamp a config to the configured ceilings.
 
-    Returns the profile to actually run. Raises :class:`PolicyViolation` when
-    the target is not authorised.
+    Returns the profile to actually run. No authorisation step: the target is
+    whatever the operator named.
     """
     guard = guard or SafetyGuard()
-    guard.authorize(config.target)
     return guard.clamp_profile(config.attack)

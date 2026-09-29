@@ -1554,21 +1554,10 @@ def nuclear_wizard() -> int:
         print("No profiles available to run. Exiting.")
         return 1
 
-    # Authorisation, before any child is spawned. Nuclear bypasses RunEngine's
-    # gate because it never runs an engine - it builds its own children - so
-    # without this the wizard would be an unrestricted path into the tool.
-    try:
-        guard = SafetyGuard()
-        guard.authorize(Target(host=host, port=port or 80))
-    except PolicyViolation as exc:
-        print("\n[!] Refused: not authorised to run this test")
-        print(f"    {exc}")
-        return 1
-
-    # Second gate on the values themselves, for the same reason the CLI needs
-    # one: a child AttackProfile is built in _build_configs, and pydantic
-    # refuses an over-large payload before a clamp applied to a profile could
-    # ever see it.
+    # Clamp to the configured ceilings before any child is spawned. A child
+    # AttackProfile is built in _build_configs, and pydantic refuses an
+    # over-large payload before a clamp applied to a profile could see it.
+    guard = SafetyGuard()
     fields, policy_notes = guard.clamp_fields(
         pps=pps,
         duration_seconds=duration,

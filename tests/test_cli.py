@@ -44,17 +44,25 @@ def _config(**kw) -> RunConfig:
 
 
 def permitted_guard():
-    """A guard holding a valid loopback authorisation.
+    """A guard with permissive ceilings, so these runs are not capped.
 
     These tests are about how a result is *worded*, so they need runs that
-    happen. The repository's own authorization.yaml ships expired, and the
-    engine now refuses on that, so the record is supplied here instead of by
-    editing shared config. Refusal is covered in test_safety.py.
+    happen at the values they set. Ceiling behaviour is covered in
+    test_safety.py.
     """
+    from adobo.config import LabConfig, LimitsConfig
     from adobo.safety import SafetyGuard
-    from tests.conftest import make_authorization
 
-    return SafetyGuard(authorization=make_authorization())
+    return SafetyGuard(
+        lab=LabConfig(
+            limits=LimitsConfig(
+                max_pps=10_000_000,
+                max_duration_seconds=3600,
+                max_payload_bytes=65_507,
+                max_workers=1000,
+            )
+        )
+    )
 
 
 def _render(result) -> str:
