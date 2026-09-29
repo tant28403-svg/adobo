@@ -1,29 +1,14 @@
 # ADOBO
 
----
-
 # ⚠️  FOR EDUCATIONAL AND AUTHORISED RESILIENCE TESTING ONLY  ⚠️
 
-**Any use against systems you do not own or have explicit written permission to test is illegal in most jurisdictions.**  
-The author accepts **no responsibility** for misuse.
+**Any use against systems you do not own or have explicit written permission to test is illegal in most jurisdictions.**
 
----
+An authorised DDoS resilience lab: a tool for measuring how your services behave under load, against hosts you own and have explicitly authorised.
 
-An authorised DDoS resilience lab: a tool for measuring how your services behave
-under load, against hosts you own and have explicitly authorised.
+ADOBO reports a number only when something independent confirms it. The attack side counts what it handed to the OS; the lab target counts what it actually served; the two are printed side by side. When they disagree, or when no independent number exists, the tool says so rather than estimating.
 
-ADOBO is built around one rule — **a number is only reported if something
-independent confirms it.** The attack side counts what it handed to the OS; the
-lab target counts what it actually served; the two are reconciled and printed
-side by side. When they disagree, or when no independent number exists, the tool
-says so instead of estimating.
-
-## Installation
-
-### Pre-built executable (Windows)
-Download `ADOBO.exe` from the releases page. No dependencies, no install.
-
-### From source (Python 3.11+)
+## Install
 
 ```bash
 git clone https://github.com/tant28403-svg/adobo.git
@@ -31,137 +16,76 @@ cd adobo
 python -m adobo --help
 ```
 
-No install step is required to run from the clone. If dependencies are missing
-(Kali blocks system pip):
+No install step needed. If dependencies are missing:
 
 ```bash
 pip install pydantic pyyaml psutil pyfiglet httpx h2 cryptography
-# or create a venv:
-python -m venv .venv && source .venv/bin/activate && pip install -e .
 ```
 
-Optional extras:
-
-```bash
-pip install -e .[raw]     # scapy transport (needs Npcap + Admin on Windows)
-```
-
-> **Linux raw sockets (no root):** the `linux_raw` transport uses native
-> `AF_INET SOCK_RAW` and only needs `CAP_NET_RAW`:
-> ```bash
-> sudo setcap cap_net_raw+ep $(which python3)
-> python -m adobo --host 10.0.0.7 --profile syn_flood --transport linux_raw --pps 5000 --duration 10
-> ```
-
----
+Windows users can also download `ADOBO.exe` from the releases page.
 
 ## Quick start
 
-### 1. One-time setup
-
-Two config files must be edited before anything can be sent. The shipped
-`authorization.yaml` is **deliberately expired** so an unconfigured checkout is
-inert.
+**1. Enable the run.** The shipped `authorization.yaml` is expired on purpose, so an unconfigured checkout is inert. Set a future date, and allow your lab network:
 
 ```yaml
 # config/authorization.yaml
-expires_on: 2027-01-01        # must be a future date
+expires_on: 2027-01-01
 
 # config/lab.yaml
-allowed_cidrs:
-  - "127.0.0.0/8"             # add your lab network deliberately
+allowed_cidrs: ["127.0.0.0/8"]
 ```
 
-`lab.yaml` is the single source of truth for what runs are *permitted* to do.
-Every value under `limits` is a hard ceiling — the engine clamps runs down to
-them and no flag can raise them:
-
-| Ceiling | Default |
-|---|---|
-| `max_pps` | 20,000 |
-| `max_duration_seconds` | 60 |
-| `max_payload_bytes` | 1,400 |
-| `max_workers` | 200 |
-
-### 2. Start the lab target
-
-An attack on its own only proves packets were sent. The **lab target** is the
-other half: a deliberately fragile HTTP service that keeps its own count, so a
-run can be checked against an independent number instead of the sender's claim.
+**2. Start the lab target** — the other half of the tool. It keeps its own count, so a run can be checked against an independent number instead of the sender's claim.
 
 ```bash
 python -m adobo.target --port 8001
 ```
 
-Verify it is up:
-
-```bash
-python -c "import httpx; print(httpx.get('http://127.0.0.1:8001/stats').json())"
-# {'requests': 0, 'errors': 0, 'settings': {'defenses': [], 'work_ms': 6}}
-```
-
-> **Use 8001, not 8000, for a plain-HTTP target.** ADOBO auto-enables TLS on
-> `443, 8443, 8080, 9443, 8000, 8888`. On one of those ports the attack side
-> opens a TLS connection to a plaintext target and fails with
-> `SSL: WRONG_VERSION_NUMBER`. The target's own default is 8000, so this trips
-> people immediately — serving on 8000 requires a certificate
-> (see [TLS and HTTP/2](#tls-and-http-2)).
-
 | Endpoint | Purpose |
 |---|---|
-| `GET /healthz` | cheap liveness check; exempt from every mitigation so the prober measures the target rather than the WAF |
-| `GET /api/data` | the expensive one — simulated database work, tunable with `--work-ms` |
-| `GET /stats` | the target's own counts, for corroborating the attack side |
+| `/healthz` | liveness check, exempt from all mitigations |
+| `/api/data` | expensive simulated work (`--work-ms`) |
+| `/stats` | the target's own counts |
 
-### 3. Run one profile and read the result
+**3. Run a profile:**
 
 ```bash
 python -m adobo --host 127.0.0.1 --port 8001 \
                 --profile http_flood --pps 2000 --duration 10 --workers 8
 ```
 
-Real output from that command:
-
 ```
-=== Result ===
-  resilience   90.0 / 100  (grade B)
   sent to OS   1,210 packets (619,520 bytes)
-  throughput   120 pps
   availability 100.0% over 35 probes (p95 38ms)
   target served 1,208 requests (0 errors)
   delivery     99.8% of packets sent reached the target
 ```
 
-`target served` and `delivery` come from the target's own `/stats`. That is the
-line that makes the run a measurement rather than a claim. Note that the sender
-counted 1,210 and the target counted 1,208 — the two are reported side by side
-precisely because they are allowed to differ.
+The sender counted 1,210, the target counted 1,208. They are allowed to differ — that is the point.
 
----
+> Use port **8001**, not 8000. ADOBO auto-enables TLS on `443, 8443, 8080, 9443, 8000, 8888`, and a TLS client against a plaintext target fails with `WRONG_VERSION_NUMBER`. The target's own default is 8000, so this bites immediately.
 
 ## Nuclear mode
 
-Nuclear mode runs every applicable profile in parallel, as separate processes.
+Runs every applicable profile in parallel.
 
 ```bash
-python -m adobo --nuclear
+python -m adobo --nuclear                        # 17 prompts
+python -m adobo --nuclear --skip-reflector-prompts # 13 prompts, default reflector ports
 ```
 
-### The prompts, in order
-
-With reflector prompts shown (17 total):
+Prompts, in order:
 
 ```
-=== Nuclear Strike ===
 Target IP: 127.0.0.1
-Port (for TCP/UDP profiles) [80]: 8000
+Port (for TCP/UDP profiles) [80]: 8001
 
---- Amplification Reflector Ports (auto-filled) ---
+--- Amplification Reflector Ports (auto-filled) ---   ← skipped with --skip-reflector-prompts
   DNS reflector port: 53
   NTP reflector port: 123
   CLDAP reflector port: 389
   SSDP reflector port: 1900
-  (Press Enter to use defaults, or enter custom values)
 DNS reflector port [53]:
 NTP reflector port [123]:
 CLDAP reflector port [389]:
@@ -177,74 +101,11 @@ Payload size (bytes) [512]:
 Enable IP spoofing for raw profiles? (requires root/CAP_NET_RAW) [y/N]:
 ```
 
-Answering **y** to the TLS prompt adds one more prompt:
+Answering **y** to the TLS prompt adds `Verify TLS certificates? [Y/n]:`.
 
-```
-Verify TLS certificates? (disable for self-signed certs) [Y/n]:
-```
+Every value reaches the child processes. PPS and duration apply to **each** profile, not divided across them.
 
-### Skipping the reflector prompts
-
-```bash
-python -m adobo --nuclear --skip-reflector-prompts
-```
-
-This takes **13 prompts** instead of 17 and uses the default reflector ports
-(53 / 123 / 389 / 1900). Use it when you are not testing amplification against
-reflectors you control.
-
-### What the prompts actually do
-
-Every value you enter reaches the child processes. This was not always true —
-`workers` and `payload size` were collected and then discarded in favour of
-hardcoded literals, so a run configured for 200 workers ran with 4 and said
-nothing. It is now covered by tests in
-`tests/test_nuclear.py::TestOperatorValuesReachTheChildren`.
-
-| Prompt | Effect |
-|---|---|
-| PPS per profile | Applied to **each** profile, not divided across them |
-| Duration | Applied to each profile |
-| HTTP/2 | Selects the `h2` transport for `http_flood` |
-| Keep-alive | Reuses connections; delivery may overcount if the target closes them |
-| TLS / verify | Applied to `http_flood`; verification is on by default |
-| Workers | Worker threads per profile (ceiling: `max_workers`, default 200) |
-| Payload size | Bytes per packet (ceiling: `max_payload_bytes`, default 1,400) |
-| Spoofing | Adds the spoofed raw variants; needs root/CAP_NET_RAW |
-
-### What nuclear prints afterwards
-
-Profiles that cannot run are reported with the reason, never silently dropped:
-
-```
-[!] Not running as Administrator or raw sending unavailable
-   Skipping 4 raw profiles, running 6 socket profiles
-```
-
-The results table labels its column **"Handed to OS"**, not "sent". That
-distinction is deliberate — it counts packets given to the operating system and
-is not confirmation of delivery:
-
-```
-  'Handed to OS' counts packets given to the operating system. It is not
-  confirmation of delivery: the target may have dropped them, been firewalled,
-  or never received them at all.
-```
-
-When the target's count cannot support a delivery ratio, nuclear says so instead
-of dividing the two numbers:
-
-```
-Target-side evidence (/stats, read by the target itself):
-  requests served by target : 554
-  No profile addressed this endpoint, so no delivery ratio can
-  be formed. The served count above covers traffic from outside
-  this run.
-```
-
-On Windows, the four raw profiles (icmp, syn, ack, and the spoofed variants)
-cannot run at all and each reports why. That is a platform limit, not a silent
-skip:
+Profiles that cannot run are reported with the reason, never silently dropped. On Windows the four raw profiles always fail:
 
 ```
 icmp_flood: never attempted a packet
@@ -252,221 +113,111 @@ icmp_flood: never attempted a packet
     available on Linux. Use scapy transport on Windows/macOS, ...')
 ```
 
-### Amplification and reflectors
+The results table says **"Handed to OS"**, not "sent" — it counts packets given to the operating system, which is not confirmation of delivery. When the target's count cannot support a ratio, nuclear says so instead of dividing the numbers anyway.
 
-The four amplification profiles (`dns`, `ntp`, `cldap`, `ssdp`) need a reflector
-you control. Nuclear probes the reflector port first and asks before continuing
-if it looks closed. Without a valid reflector they send at low rate with no
-amplification.
-
----
+Amplification profiles need a reflector you control. Nuclear probes the reflector port first and asks before continuing if it looks closed.
 
 ## Profiles & Transports
 
-| Profile | Transports | Description |
-|---------|------------|-------------|
-| `udp_flood` / `udp_flood_ns` | socket, scapy, linux_raw, virtual | Raw UDP datagrams |
-| `syn_flood` / `syn_flood_ns` | scapy, linux_raw | TCP SYN packets |
-| `icmp_flood` / `icmp_flood_ns` | scapy, linux_raw | ICMP echo requests |
-| `ack_flood` / `ack_flood_ns` | scapy, linux_raw | TCP ACK packets |
-| `dns_amplification` | socket, scapy, virtual | DNS queries to open resolvers |
-| `ntp_amplification` | socket, scapy, virtual | NTP time queries |
-| `cldap_amplification` | socket, scapy, virtual | CLDAP search requests |
-| `ssdp_amplification` | socket, scapy, virtual | SSDP M-SEARCH discovery |
-| `http_flood` | socket, scapy, virtual, h2 | HTTP/1.1 GET requests |
-| `slowloris` | socket | Partial HTTP requests (connection exhaustion) |
-
-The `_ns` variants are non-spoofed (real source IP) and work without elevated
-privileges. Spoofed variants require raw socket privileges.
-
-**Transports:**
-
-| Transport | What it is |
+| Profile | Transports |
 |---|---|
-| `socket` (default) | standard UDP/TCP sockets, no privileges needed |
-| `scapy` | raw L3/L4 crafting; needs Npcap + Admin (Windows) or root/CAP_NET_RAW (Linux) |
-| `linux_raw` | native `AF_INET SOCK_RAW`; root or CAP_NET_RAW, Linux only |
-| `virtual` | **no network I/O at all** — counters only |
-| `h2` | HTTP/2 over TLS with multiplexed streams (requires `h2`) |
+| `udp_flood` / `_ns` | socket, scapy, linux_raw, virtual |
+| `syn_flood` / `_ns` | scapy, linux_raw |
+| `icmp_flood` / `_ns` | scapy, linux_raw |
+| `ack_flood` / `_ns` | scapy, linux_raw |
+| `dns_` / `ntp_` / `cldap_` / `ssdp_amplification` | socket, scapy, virtual |
+| `http_flood` | socket, scapy, virtual, h2 |
+| `slowloris` | socket |
 
-### The virtual transport is a control, not a feature
+`_ns` variants are non-spoofed (real source IP) and need no privileges.
 
-`--transport virtual` generates the packets it is asked to generate and delivers
-**none** of them:
+| Transport | Notes |
+|---|---|
+| `socket` (default) | no privileges needed |
+| `scapy` | needs Npcap + Admin (Windows) or root (Linux) |
+| `linux_raw` | root or CAP_NET_RAW, Linux only |
+| `virtual` | **no network I/O at all** |
+| `h2` | HTTP/2 over TLS with multiplexed streams |
+
+### The virtual transport is a control
 
 ```bash
 python -m adobo --host 127.0.0.1 --port 8001 \
                 --profile http_flood --pps 1000 --duration 5 --transport virtual
 ```
 
-The target's `/stats` count does not move, and the tool prints **no delivery
-claim** — because it has none to make. That is the falsification control: the
-harness generates 5,000 packets and correctly reports that none were delivered.
+Generates 5,000 packets, delivers none. The target's count does not move and **no delivery claim is printed** — because there is none to make. This is the falsification control: the harness can be shown not to fabricate numbers.
 
----
+## Defenses
+
+```bash
+python -m adobo.target --port 8001 --defenses all
+python -m adobo.target --port 8001 --defenses rate_limit,waf
+```
+
+`rate_limit`, `connection_cap`, `waf`, `circuit_breaker`, `challenge_page`.
+
+> **The WAF runs with no rules by default.** `config/waf_rules.yaml` is not shipped and an absent file means an empty rule set. A `--defenses waf` run measures nothing until you write that file. `/stats` reports `rules_loaded` so you can tell which case you are in.
 
 ## TLS and HTTP/2
 
-TLS is enabled automatically on common HTTPS ports
-(`443, 8443, 8080, 9443, 8000, 8888`). HTTP/2 is **never** auto-enabled — the
-socket transport cannot speak it, so it must be requested explicitly.
+TLS auto-enables on `443, 8443, 8080, 9443, 8000, 8888`. HTTP/2 is **never** automatic — the socket transport cannot speak it, so `--http2` is required.
 
 ```bash
-# HTTPS, HTTP/1.1
-python -m adobo --host 127.0.0.1 --port 8443 --profile http_flood \
-                --pps 2000 --duration 10 --tls --tls-no-verify
-
-# HTTPS, HTTP/2 with 100 multiplexed streams per connection
 python -m adobo --host 127.0.0.1 --port 8443 --profile http_flood \
                 --pps 2000 --duration 10 --http2 --h2-concurrency 100 \
                 --tls --tls-no-verify
 ```
 
-Serve a matching target:
+`--tls-no-verify` is for self-signed lab certs only.
 
-```bash
-python -m adobo.target --port 8443 --generate-cert \
-                --ssl-certfile cert.pem --ssl-keyfile key.pem --http2
-```
+> **Two limitations.** The prober builds a plaintext `http://` URL, so against an HTTPS target availability reads 0% and `/stats` cannot be read — take all availability and delivery evidence over plaintext. And end-to-end HTTP/2 against the local `adobo.target` does not complete; test HTTP/2 against a real server.
 
-Serve a matching target:
-
-```bash
-python -m adobo.target --port 8443 --generate-cert \
-                --ssl-certfile cert.pem --ssl-keyfile key.pem --http2
-```
-
-`--tls-no-verify` is for self-signed lab certificates only. Never point it at a
-third-party host.
-
-> **The prober does not speak TLS.** The attack side negotiates TLS correctly
-> and does deliver packets to an HTTPS target, but `TargetObserver` builds a
-> plaintext `http://` URL (`adobo/observation.py:117`). Against an HTTPS target
-> that means availability reports **0%** and the target's `/stats` cannot be
-> read, so there is **no independent evidence for HTTPS runs**. The 0% is a
-> measurement failure, not an outage.
->
-> Until the prober learns TLS, **take availability and delivery evidence over
-> plaintext HTTP**. Use the TLS and HTTP/2 paths for attack-surface coverage,
-> not for measurement.
-
-> **Known limitation:** the HTTP/2 client works against real internet servers,
-> but end-to-end HTTP/2 against the local `adobo.target` does not currently
-> complete — the target's SETTINGS exchange fails. Test HTTP/2 against a real
-> server, and treat local HTTP/2 as unimplemented.
-
----
-
-## Defenses
-
-Enable mitigations on the target and measure their effect:
-
-```bash
-python -m adobo.target --port 8000 --defenses all
-python -m adobo.target --port 8000 --defenses rate_limit,waf
-```
-
-| Defense | What it simulates |
-|---------|-------------------|
-| `rate_limit` | Token-bucket rate limiting |
-| `connection_cap` | Max concurrent connections |
-| `waf` | Request inspection/blocking |
-| `circuit_breaker` | Trips on error rate |
-| `challenge_page` | Interstitial challenge |
-
-> **The WAF runs with no rules by default.** `config/waf_rules.yaml` is not
-> shipped, and `load_waf_rules` treats an absent file as an empty rule set — a
-> legitimate, if useless, configuration. A `--defenses waf` run measures
-> nothing unless you write that file first. The target reports
-> `rules_loaded` in `/stats` so you can confirm which case you are in.
-
----
-
-## Reading results
-
-Every run produces:
-
-| File | Format | Purpose |
-|------|--------|---------|
-| `results/<run_id>.json` | JSON | machine-readable complete result |
-| `reports/<run_id>.html` | HTML | human-readable report with charts |
-| `logs/audit.jsonl` | JSONL | append-only audit trail |
-
-Run `python -m adobo --help` to see your resolved config and output directories.
-
-### Availability is reported as two separate questions
-
-The tool does not collapse "the target stopped answering" into a single
-availability percentage, because two very different situations look identical
-from the sender's side:
-
-- **Was there an HTTP surface at all?** If every probe was refused, the honest
-  reading is *"the target served no HTTP endpoint at any point in the run"* —
-  which is **not** evidence that it failed under load.
-- **Did the target collapse?** Answered separately, from refusal-versus-timeout
-  counts.
-
-Silence is also never read as death. A run with no probes answered and none
-refused says exactly that, and no more.
-
-### What is and is not independently verified
+## What is actually verified
 
 | Profile | Independent evidence |
 |---|---|
 | `http_flood` | **Yes** — counted by the target's `/stats` |
-| `slowloris` | Partial — opens a real connection, but the request never completes |
-| `udp_flood`, `syn_flood`, `icmp_flood`, `ack_flood` | **No** — the target counts HTTP only |
-| `dns_`, `ntp_`, `cldap_`, `ssdp_amplification` | **No** — same reason |
+| `slowloris` | Partial — opens a connection, request never completes |
+| all raw and amplification profiles | **No** — the target counts HTTP only |
 
-So 1 of 10 profiles has a fully witnessed delivery figure. For the others the
-tool reports *packets handed to the OS* and says plainly that this is not
-confirmation of delivery. If you need delivery evidence for a non-HTTP profile,
-capture the traffic on the target host and count it there.
+**1 of 10 profiles has a fully witnessed delivery figure.** For the rest the tool reports packets handed to the OS and says plainly that this is not delivery. To evidence a non-HTTP profile, capture the traffic on the target host and count it there.
 
----
+Availability is reported as two separate questions, because two different situations look identical from the sender's side: was there an HTTP surface at all, and did the target collapse. A run where every probe was refused means *"the target served no HTTP endpoint at any point"* — which is **not** evidence it failed under load. Silence is never read as death.
+
+## Output
+
+| File | Purpose |
+|---|---|
+| `results/<run_id>.json` | machine-readable result |
+| `reports/<run_id>.html` | report with charts |
+| `logs/audit.jsonl` | append-only audit trail |
 
 ## Configuration
 
 | File | Purpose |
 |---|---|
-| `lab.yaml` | policy ceilings, allowlist, default target, lab ID |
-| `authorization.yaml` | dated authorisation record (must not be expired) |
+| `lab.yaml` | policy ceilings, allowlist, default target |
+| `authorization.yaml` | dated authorisation record, must not be expired |
 | `waf_rules.yaml` | WAF rules — **optional, absent by default** |
 
-`lab.yaml` is the only place ceilings live. The Python model defaults
-(`max_workers: 8`, `max_pps: 20_000`) are a fallback used only when no
-`lab.yaml` is present — the shipped file is what applies in practice.
+`lab.yaml` is the only place ceilings live, and runs are clamped down to them. No flag can raise them.
 
----
+| Ceiling | Value |
+|---|---|
+| `max_pps` | 20,000 |
+| `max_duration_seconds` | 60 |
+| `max_payload_bytes` | 1,400 |
+| `max_workers` | 200 |
 
-## CI Example
+## CI
 
-The `virtual` transport makes a hermetic run that needs no target, no network
-and no listener:
-
-```yaml
-# .github/workflows/resilience.yml
-- name: Resilience test
-  run: |
-    python -m adobo --host 127.0.0.1 --port 8001 \
-      --profile http_flood --pps 5000 --duration 30 \
-      --transport virtual --quiet
-```
-
-To assert on the result, read the JSON rather than scraping stdout:
+The `virtual` transport needs no target, no network, and no listener:
 
 ```bash
-python -c "
-import json, pathlib, sys
-run = sorted(pathlib.Path('results').glob('*.json'))[-1]
-r = json.loads(run.read_text())
-sys.exit(0 if r['score']['total'] >= 80 else 1)
-"
+python -m adobo --host 127.0.0.1 --port 8001 \
+  --profile http_flood --pps 5000 --duration 30 --transport virtual --quiet
 ```
-
-Note `--defenses` is a **target-side** flag: it configures the service being
-attacked, so it only applies together with `--serve-target` or
-`python -m adobo.target`. It is not an attack-side option.
 
 ## Tests
 
@@ -474,16 +225,12 @@ attacked, so it only applies together with `--serve-target` or
 python -m pytest tests/ -q
 ```
 
-564 tests, including the regression cases for the display and wiring bugs this
-tool has had: falsely asserted outages, a prober that measured the wrong thing,
-worker and payload values that were reported but never used, and a virtual
-transport that must never claim delivery.
+568 tests, covering the display and wiring bugs this tool has had: falsely asserted outages, a prober measuring the wrong thing, worker and payload values that were reported but never used, a UDP probe that hid a live web service, and a virtual transport that must never claim delivery.
 
 ## License
 
-MIT — see `LICENSE` for details.
+MIT — see `LICENSE`.
 
 ---
 
-**Remember:** only send traffic to hosts you control or have written permission
-to test. Unauthorised testing is illegal in most jurisdictions.
+**Only send traffic to hosts you control or have written permission to test.**
