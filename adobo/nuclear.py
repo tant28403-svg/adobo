@@ -17,6 +17,7 @@ from .models import ProfileName, RunConfig, Target, TransportKind, AttackProfile
 from .cancellation import CancelReason
 from .engine import EngineHooks, RunEngine
 from .observation import TargetObserver, refused_connection
+from .safety import PolicyViolation, SafetyGuard
 from .transports import raw_capability
 from .config import load_lab_config
 @dataclass(frozen=True, slots=True)
@@ -1354,6 +1355,36 @@ def _ask_float(prompt: str, default: float) -> float:
             print(f"  {raw!r} is not a number")
 
 
+def _ask_int_bounded(
+    prompt: str,
+    default: int,
+    minimum: int,
+    maximum: int,
+    ceiling_name: str,
+) -> int:
+    """Ask for a whole number that is actually within policy.
+
+    The bounds are stated in the question rather than discovered later. A value
+    over the ceiling used to travel all the way to AttackProfile and come back
+    as a raw pydantic ValidationError, so the operator was told the answer was
+    invalid without being told what the valid range was.
+    """
+    suffix = f" (max {maximum:,} - {ceiling_name})"
+    while True:
+        value = _ask_int(f"{prompt}{suffix}", default)
+        if value < minimum:
+            print(f"  must be at least {minimum:,}")
+            continue
+        if value > maximum:
+            print(
+                f"  {value:,} exceeds the {ceiling_name} of {maximum:,}. "
+                f"Raise it in lab.yaml if this is deliberate, or enter a value "
+                f"within the limit."
+            )
+            continue
+        return value
+
+
 def _ask_yes_no(prompt: str, default: bool) -> bool:
     """Ask a yes/no question with a default."""
     suffix = " [y/N]" if not default else " [Y/n]"
@@ -1394,8 +1425,20 @@ def nuclear_wizard(skip_reflector_prompts: bool = False) -> int:
         reflector_ports["cldap"] = _ask_int("CLDAP reflector port", reflector_ports["cldap"])
         reflector_ports["ssdp"] = _ask_int("SSDP reflector port", reflector_ports["ssdp"])
     
-    pps = _ask_int("PPS per profile", 500)
+    # The ceilings come from lab.yaml, so the prompt and the gate can never
+    # disagree about what the limit is.
+    limits = load_lab_config().limits
+
+    pps = _ask_int_bounded(
+        "PPS per profile", 500, 1, limits.max_pps, "max_pps"
+    )
     duration = _ask_float("Duration (s)", 60)
+    if duration > limits.max_duration_seconds:
+        print(
+            f"  {duration:g}s exceeds max_duration_seconds of "
+            f"{limits.max_duration_seconds:g}s; using the ceiling."
+        )
+        duration = float(limits.max_duration_seconds)
 
     # HTTP/2 for http_flood (requires TLS)
     use_http2 = _ask_yes_no(
@@ -1404,7 +1447,9 @@ def nuclear_wizard(skip_reflector_prompts: bool = False) -> int:
     )
     h2_concurrency = 100
     if use_http2:
-        h2_concurrency = _ask_int("HTTP/2 concurrent streams per connection", 100)
+        h2_concurrency = _ask_int_bounded(
+            "HTTP/2 concurrent streams per connection", 100, 1, 1000, "model limit"
+        )
 
     # HTTP/1.1 keep-alive
     keep_alive = _ask_yes_no(
@@ -1425,9 +1470,16 @@ def nuclear_wizard(skip_reflector_prompts: bool = False) -> int:
         )
 
     # Workers and payload
-    default_workers = load_lab_config().limits.max_workers
-    workers = _ask_int("Worker threads per profile", default_workers)
-    payload_size = _ask_int("Payload size (bytes)", 512)
+    workers = _ask_int_bounded(
+        "Worker threads per profile",
+        limits.max_workers,
+        1,
+        limits.max_workers,
+        "max_workers",
+    )
+    payload_size = _ask_int_bounded(
+        "Payload size (bytes)", 512, 0, limits.max_payload_bytes, "max_payload_bytes"
+    )
 
     # Spoofing is off by default (non-spoofed, real source IP).
     # Spoofed variants require raw socket privileges and are for controlled
@@ -1510,6 +1562,38 @@ def nuclear_wizard(skip_reflector_prompts: bool = False) -> int:
     if not profiles:
         print("No profiles available to run. Exiting.")
         return 1
+
+    # Authorisation, before any child is spawned. Nuclear bypasses RunEngine's
+    # gate because it never runs an engine - it builds its own children - so
+    # without this the wizard would be an unrestricted path into the tool.
+    try:
+        guard = SafetyGuard()
+        guard.authorize(Target(host=host, port=port or 80))
+    except PolicyViolation as exc:
+        print("\n[!] Refused: not authorised to run this test")
+        print(f"    {exc}")
+        return 1
+
+    # Second gate on the values themselves, for the same reason the CLI needs
+    # one: a child AttackProfile is built in _build_configs, and pydantic
+    # refuses an over-large payload before a clamp applied to a profile could
+    # ever see it.
+    fields, policy_notes = guard.clamp_fields(
+        pps=pps,
+        duration_seconds=duration,
+        payload_size=payload_size,
+        workers=workers,
+        h2_concurrency=h2_concurrency,
+    )
+    if policy_notes:
+        print("Ceiling adjustments from lab.yaml:")
+        for note in policy_notes:
+            print(f"  {note}")
+    pps = fields["pps"]
+    duration = fields["duration_seconds"]
+    payload_size = fields["payload_size"]
+    workers = fields["workers"]
+    h2_concurrency = fields["h2_concurrency"]
 
     # These must be the values the operator was asked for, not literals. The
     # aggregator is what builds the per-child AttackProfile, so hardcoding them

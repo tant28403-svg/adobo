@@ -56,6 +56,7 @@ from .models import (
 )
 from .monitor import ResourceMonitor, process_for_pid
 from .observation import TargetObserver, refused_connection
+from .safety import SafetyGuard
 from .transports import (
     PeerUnavailable,
     Transport,
@@ -150,10 +151,12 @@ class RunOutcome:
 class RunEngine:
     """Executes one :class:`RunConfig` and returns a :class:`RunOutcome`.
 
-    The config must already have been through
-    :meth:`adobo.safety.SafetyGuard.preflight`. The allowlist is not re-checked
-    here; the engine is only reachable with a transport the guarded factory
-    produced.
+    :meth:`run` puts the config through :class:`~adobo.safety.SafetyGuard`
+    before anything is opened. The engine used to document that the config
+    "must already have been through preflight" while no such call existed
+    anywhere, so an expired authorisation record did not stop a run. The gate
+    is here now, rather than trusted to each caller, so that the CLI, the
+    wizard and any future entry point are all covered by the same check.
     """
 
     def __init__(
@@ -170,8 +173,13 @@ class RunEngine:
         enable_probes: bool = True,
         target_pid: int | None = None,
         observe_target: bool = True,
+        guard: SafetyGuard | None = None,
     ) -> None:
         self.config = config
+        # Injectable so tests can supply an authorisation record without
+        # weakening the production path: the default is still "load the real
+        # config/authorization.yaml and refuse if it is missing or expired".
+        self._guard = guard
         self.hooks = hooks or EngineHooks()
         self.controller = controller or RunController(config.attack.duration_seconds)
         self.sample_interval_s = sample_interval_s
@@ -187,6 +195,10 @@ class RunEngine:
         self._counter_samples: list[CounterSample] = []
         self._resource_samples: list[ResourceSample] = []
         self._probes: list[ProbeResult] = []
+
+        # Ceiling adjustments made by the safety gate. Reported in the summary
+        # so a clamped run never reads like the run that was asked for.
+        self._policy_notes: list[str] = []
 
         # Target-side observation. Kept apart from the monitor because that one
         # needs psutil and therefore only works locally, while this works over
@@ -247,6 +259,12 @@ class RunEngine:
         Cancellation is not an error: a stopped run produces a result. Genuine
         faults are re-raised, but only after the audit trail has been closed.
         """
+        # Authorisation and ceilings, before anything is opened. A refused run
+        # raises PolicyViolation out of here, so no socket is ever created for a
+        # target the operator is not authorised to test.
+        if not self.config.dry_run:
+            self._apply_safety_gate()
+
         # The opening /stats reading is the first thing that happens, ahead of
         # `started`, so it is setup rather than part of the run. It has to be
         # taken before the workers start for two reasons: once the flood is
@@ -312,6 +330,23 @@ class RunEngine:
         if fatal is not None:
             raise fatal
         return outcome
+
+    def _apply_safety_gate(self) -> None:
+        """Authorise the target and clamp the run to the configured ceilings.
+
+        Raises :class:`~adobo.safety.PolicyViolation` when the run is not
+        permitted. Clamps are applied to the config in place and recorded, so
+        the summary reports the values that were actually used rather than the
+        ones that were requested.
+        """
+        guard = self._guard or SafetyGuard()
+        guard.authorize(self.config.target)
+        result = guard.clamp_profile(self.config.attack)
+        if result.changed:
+            self.config = self.config.model_copy(
+                update={"attack": result.applied}
+            )
+            self._policy_notes.extend(result.notes)
 
     def _validate_transport(self) -> bool:
         """Open and immediately close one transport to fail fast.
@@ -877,6 +912,9 @@ class RunEngine:
                 "Abandoned: a worker did not stop within "
                 f"{self.controller.grace.join_grace_s}s. Counters may be incomplete."
             )
+        # Ceiling adjustments come first: they change what the rest of the
+        # numbers describe, so they belong above anything derived from them.
+        notes.extend(self._policy_notes)
         if self._setup_error:
             # Stated first and separately: when setup fails, nothing was ever
             # sent, so every figure below is zero for a reason that has nothing

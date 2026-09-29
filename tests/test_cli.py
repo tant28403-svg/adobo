@@ -43,6 +43,20 @@ def _config(**kw) -> RunConfig:
     )
 
 
+def permitted_guard():
+    """A guard holding a valid loopback authorisation.
+
+    These tests are about how a result is *worded*, so they need runs that
+    happen. The repository's own authorization.yaml ships expired, and the
+    engine now refuses on that, so the record is supplied here instead of by
+    editing shared config. Refusal is covered in test_safety.py.
+    """
+    from adobo.safety import SafetyGuard
+    from tests.conftest import make_authorization
+
+    return SafetyGuard(authorization=make_authorization())
+
+
 def _render(result) -> str:
     buffer = io.StringIO()
     with redirect_stdout(buffer):
@@ -53,12 +67,12 @@ def _render(result) -> str:
 class TestSummaryWording:
     def test_the_headline_does_not_claim_delivery(self) -> None:
         """'sent' alone invites reading it as packets that arrived."""
-        outcome = RunEngine(_config()).run()
+        outcome = RunEngine(_config(), guard=permitted_guard()).run()
         output = _render(outcome.result)
         assert "sent to OS" in output
 
     def test_an_observed_target_shows_its_own_count(self) -> None:
-        outcome = RunEngine(_config()).run()
+        outcome = RunEngine(_config(), guard=permitted_guard()).run()
         result = outcome.result.model_copy(
             update={
                 "target_stats": TargetStats(
@@ -76,7 +90,7 @@ class TestSummaryWording:
         The sender's 1,000 and the target's 250 are not the same measurement, so
         the ratio between them is the actual finding.
         """
-        outcome = RunEngine(_config()).run()
+        outcome = RunEngine(_config(), guard=permitted_guard()).run()
         result = outcome.result.model_copy(
             update={
                 "target_stats": TargetStats(
@@ -90,14 +104,14 @@ class TestSummaryWording:
 
     def test_an_unobserved_target_adds_no_delivery_claim(self) -> None:
         """A dry run or a virtual run has nothing to observe, so it says nothing."""
-        outcome = RunEngine(_config()).run()
+        outcome = RunEngine(_config(), guard=permitted_guard()).run()
         output = _render(outcome.result)
         assert "target served" not in output
         assert "delivery" not in output
 
     def test_a_low_ratio_is_explained(self) -> None:
         """Otherwise a mixed UDP/HTTP run always looks like a failing flood."""
-        outcome = RunEngine(_config()).run()
+        outcome = RunEngine(_config(), guard=permitted_guard()).run()
         result = outcome.result.model_copy(
             update={
                 "target_stats": TargetStats(
@@ -110,7 +124,7 @@ class TestSummaryWording:
 
     def test_a_full_ratio_is_not_annotated_with_a_caveat(self) -> None:
         """The caveat is noise on a run that delivered everything it sent."""
-        outcome = RunEngine(_config()).run()
+        outcome = RunEngine(_config(), guard=permitted_guard()).run()
         sent = outcome.result.attack.packets_sent
         result = outcome.result.model_copy(
             update={

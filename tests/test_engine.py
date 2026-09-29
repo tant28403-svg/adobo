@@ -59,6 +59,30 @@ def make_engine(config: RunConfig, **kwargs) -> RunEngine:
     return RunEngine(config, **kwargs)
 
 
+@pytest.fixture(autouse=True)
+def _permitted_run(monkeypatch):
+    """Let these tests run without editing the repository's authorisation.
+
+    The engine refuses to send without a valid record, and the shipped record
+    is expired on purpose. These tests are about the engine, not about policy,
+    so the default SafetyGuard is replaced with one holding a valid loopback
+    authorisation. The refusal paths have their own tests in test_safety.py -
+    patching it here is what keeps those honest, since without this patch every
+    test in the file would fail closed.
+    """
+    from adobo.safety import SafetyGuard
+
+    from tests.conftest import make_authorization
+
+    permitted = SafetyGuard(authorization=make_authorization())
+    original = SafetyGuard.__init__
+
+    def patched(self, lab=None, authorization=None):
+        original(self, lab=lab, authorization=permitted.authorization)
+
+    monkeypatch.setattr(SafetyGuard, "__init__", patched)
+
+
 # ---------------------------------------------------------------------------
 # Running to the deadline
 # ---------------------------------------------------------------------------
@@ -275,9 +299,32 @@ class TestCancellation:
 
 
 class TestFailureHandling:
+    """A target the transport cannot open at all.
+
+    Two separate mechanisms are being avoided here, both of which used to be
+    reached by aiming at an unresolvable name. The safety gate now refuses a
+    name it cannot resolve (correct - it cannot show the scope covers the
+    target). And a *resolvable* host that merely refuses connections is
+    ``PeerUnavailable``, which the engine treats as the lab's central
+    observation rather than a fault, so it never reaches the worker-error hook.
+
+    A missing raw capability is used instead: it fails in transport
+    construction, which is the path these tests are about, and it is chosen
+    here because it is deterministic on every platform.
+    """
+
+    @staticmethod
+    def _unopenable(config: RunConfig) -> RunConfig:
+        return config.model_copy(
+            update={"transport": TransportKind.LINUX_RAW}
+        )
+
+    def _unreachable(self, config: RunConfig) -> RunConfig:
+        return self._unopenable(config)
+
     def test_unresolvable_target_does_not_hang(self) -> None:
         config = make_config(duration=0.3, transport=TransportKind.SOCKET)
-        config = config.model_copy(update={"target": Target(host="nope.invalid", port=80)})
+        config = self._unreachable(config)
         started = time.monotonic()
         outcome = make_engine(config).run()
         assert time.monotonic() - started < 5.0
@@ -286,24 +333,26 @@ class TestFailureHandling:
 
     def test_worker_errors_are_surfaced_as_notes(self) -> None:
         config = make_config(duration=0.2, transport=TransportKind.SOCKET)
-        config = config.model_copy(update={"target": Target(host="nope.invalid", port=80)})
+        config = self._unreachable(config)
         outcome = make_engine(config).run()
         assert any("error" in note.lower() for note in outcome.result.notes)
 
     def test_worker_error_hook_is_called(self) -> None:
         seen: list[BaseException] = []
         config = make_config(duration=0.2, transport=TransportKind.SOCKET)
-        config = config.model_copy(update={"target": Target(host="nope.invalid", port=80)})
+        config = self._unreachable(config)
         engine = make_engine(config, hooks=EngineHooks(on_worker_error=seen.append))
         engine.run()
         assert seen, "the CLI needs to be able to report transport failures"
 
     def test_result_is_still_built_after_a_failure(self) -> None:
         config = make_config(duration=0.2, transport=TransportKind.SOCKET)
-        config = config.model_copy(update={"target": Target(host="nope.invalid", port=80)})
+        config = self._unreachable(config)
         outcome = make_engine(config).run()
         assert outcome.result.run_id
-        assert outcome.result.attack.transport is TransportKind.SOCKET
+        # The result records the transport that was attempted, so a failure is
+        # still attributable to a specific transport rather than to "a run".
+        assert outcome.result.attack.transport is TransportKind.LINUX_RAW
 
 
 class TestDeadTargetIsMeasuredNotAborted:

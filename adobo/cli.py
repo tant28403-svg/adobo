@@ -13,6 +13,7 @@ from pyfiglet import Figlet
 from .engine import EngineHooks, RunEngine, RunOutcome
 from .models import AttackProfile, ProfileName, RunConfig, Target, TransportKind
 from .nuclear import nuclear_wizard
+from .safety import PolicyViolation, SafetyGuard
 from .wizard import wizard
 
 __all__ = ["main"]
@@ -272,20 +273,38 @@ def config_from_args(args: argparse.Namespace) -> RunConfig:
     # because the socket transport doesn't support HTTP/2
     use_http2 = args.http2
 
+    # Clamp before the model sees the values. AttackProfile refuses anything
+    # over 65,507 bytes, so a --payload of 1900000 raised a pydantic
+    # ValidationError here - before any policy was consulted and with no
+    # mention of the 1,400-byte ceiling. Clamping the raw arguments first turns
+    # a crash into a value the policy allows plus a note saying it was reduced.
+    guard = SafetyGuard()
+    fields, policy_notes = guard.clamp_fields(
+        pps=args.pps,
+        duration_seconds=args.duration,
+        payload_size=args.payload,
+        workers=args.workers,
+        h2_concurrency=args.h2_concurrency,
+    )
+    if policy_notes:
+        print("Ceiling adjustments from lab.yaml:")
+        for note in policy_notes:
+            print(f"  {note}")
+
     return RunConfig(
         target=Target(host=args.host, port=args.port if args.port is not None else 80),
         attack=AttackProfile(
             profile=profile,
-            pps=args.pps,
-            duration_seconds=args.duration,
-            payload_size=args.payload,
-            workers=args.workers,
+            pps=fields["pps"],
+            duration_seconds=fields["duration_seconds"],
+            payload_size=fields["payload_size"],
+            workers=fields["workers"],
             spoof_sources=spoof_sources,
             keep_alive=args.keep_alive,
             use_tls=use_tls,
             tls_verify=not args.tls_no_verify,
             use_http2=use_http2,
-            h2_concurrency=args.h2_concurrency,
+            h2_concurrency=fields["h2_concurrency"],
         ),
         transport=TransportKind(transport),
         defenses=[],
@@ -303,6 +322,13 @@ def run_once(config: RunConfig, quiet: bool = False) -> int:
     except KeyboardInterrupt:
         _say("\nInterrupted.")
         return EXIT_INTERRUPTED
+    except PolicyViolation as exc:
+        # A refusal is a result, not a crash. Someone refusing to send traffic
+        # is the tool working, and it should read as a decision rather than a
+        # traceback the operator has to decode.
+        _say("\n[!] Refused: not authorised to run this test")
+        _say(f"    {exc}")
+        return EXIT_ERROR
     finally:
         finish()
 

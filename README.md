@@ -29,12 +29,16 @@ pip install pydantic pyyaml psutil pyfiglet httpx h2 cryptography
 
 ## Use
 
-**1. Allow the run.** The shipped `authorization.yaml` is expired on purpose, so an unconfigured checkout does nothing. Set a future date:
+**1. Allow the run.** The tool refuses to send anything without a valid authorisation record, and the shipped `authorization.yaml` is expired on purpose — so an unconfigured checkout does nothing. Set a future date:
 
 ```yaml
 # config/authorization.yaml
 expires_on: 2027-01-01
+scope:
+  - "127.0.0.0/8"    # only the networks you are authorised to test
 ```
+
+A run against a target outside `scope`, or with a hostname that cannot be resolved, is refused.
 
 **2. Start the lab target.** It counts what it served, so you can check the result against a number that isn't the sender's own claim:
 
@@ -152,7 +156,13 @@ Run `python -m adobo --help` for everything else.
 
 ## Limits
 
-Runs are clamped to the ceilings in `config/lab.yaml`. No flag raises them.
+Runs are clamped to the ceilings in `config/lab.yaml`. No flag raises them, and every reduction is reported:
+
+```
+Ceiling adjustments from lab.yaml:
+  pps clamped from 2,000,000 to 20,000 (max_pps in lab.yaml)
+  payload_size clamped from 1,900,000 to 1,400 bytes (max_payload_bytes in lab.yaml)
+```
 
 | Ceiling | Value |
 |---|---|
@@ -160,6 +170,8 @@ Runs are clamped to the ceilings in `config/lab.yaml`. No flag raises them.
 | Duration | 60 seconds |
 | Payload | 1,400 bytes |
 | Workers | 200 |
+
+The nuclear wizard asks for these within their limits, and says what the limit is rather than rejecting the value without explanation.
 
 ## Tests
 
