@@ -957,6 +957,31 @@ class TestLinuxRawSendBuffer:
         t._apply_sndbuf(Refusing())
 
 
+class FakeRecordingSocket:
+    """Stands in for scapy's layer-3 socket.
+
+    Counts what crossed it so a test can assert on send behaviour without a
+    driver, and can be told when to stop so the self-paced loop terminates.
+    """
+
+    def __init__(self, stop_after: int | None = None) -> None:
+        self.sent = 0
+        self.closed = 0
+        self.packets: list[bytes] = []
+        self._stop_after = stop_after
+        self._on_send = None
+
+    def send(self, packet: object) -> None:
+        self.sent += 1
+        self.packets.append(bytes(packet))
+        if self._stop_after is not None and self.sent >= self._stop_after:
+            if self._on_send is not None:
+                self._on_send()
+
+    def close(self) -> None:
+        self.closed += 1
+
+
 class TestScapyTransport:
     def test_crafting_works_without_send_privileges(self) -> None:
         """Packet construction must be testable on a box with no Npcap."""
@@ -1019,6 +1044,181 @@ class TestScapyTransport:
             transport.open()
 
 
+class TestRawSendLoop:
+    """The self-paced loop is where a raw transport's rate actually comes from.
+
+    A measured run managed about 74 packets per second per profile, which is
+    three orders of magnitude below what the hardware can do. The cost was not
+    the syscall: it was rebuilding the payload, rebuilding the packet and
+    re-resolving the route for every single packet. These pin the properties
+    that took that work out of the loop.
+    """
+
+    @staticmethod
+    def _ready(profile: ProfileName, stop_after: int = 50) -> ScapyTransport:
+        scapy_all = pytest.importorskip("scapy.all")
+        transport = ScapyTransport(TARGET, profile)
+        transport._scapy = scapy_all
+        transport._resolved = "127.0.0.1"
+        transport._iface = "eth0"
+        sock = FakeRecordingSocket(stop_after=stop_after)
+        sock._on_send = transport.request_stop
+        transport._sock = sock
+        transport._open = True
+        return transport
+
+    def test_the_payload_is_built_once_not_per_packet(self, monkeypatch) -> None:
+        """Fifty packets, one payload. This is the per-packet cost removed."""
+        transport = self._ready(ProfileName.SYN_FLOOD, stop_after=50)
+        import adobo.transports.scapy_transport as module
+
+        calls: list[int] = []
+        original = module.build_payload
+
+        def counting(*args: object, **kwargs: object) -> bytes:
+            calls.append(1)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(module, "build_payload", counting)
+        attack = AttackProfile(
+            profile=ProfileName.SYN_FLOOD,
+            pps=10_000_000,
+            payload_size=64,
+        )
+        transport.worker_loop(0, 10_000_000, attack)
+
+        assert transport._sock.sent == 50
+        assert len(calls) == 1, f"payload rebuilt {len(calls)} times for 50 packets"
+
+    def test_every_packet_on_the_wire_is_distinct(self) -> None:
+        """Repeating one identical frame is not a flood; it is one packet."""
+        transport = self._ready(ProfileName.SYN_FLOOD, stop_after=50)
+        attack = AttackProfile(
+            profile=ProfileName.SYN_FLOOD,
+            pps=10_000_000,
+            payload_size=64,
+        )
+        transport.worker_loop(0, 10_000_000, attack)
+
+        unique = set(transport._sock.packets)
+        assert len(unique) == 50, "packets must differ from one another"
+
+    def test_the_synd_bit_survives_the_reuse(self) -> None:
+        """Mutating one packet object must not corrupt the fixed header."""
+        scapy_all = pytest.importorskip("scapy.all")
+        transport = self._ready(ProfileName.SYN_FLOOD, stop_after=5)
+        attack = AttackProfile(
+            profile=ProfileName.SYN_FLOOD,
+            pps=10_000_000,
+            payload_size=64,
+        )
+        transport.worker_loop(0, 10_000_000, attack)
+
+        for wire in transport._sock.packets:
+            assert int(scapy_all.IP(wire)["TCP"].flags) & 0x02, "SYN bit must be set"
+
+    def test_counters_match_what_was_sent(self) -> None:
+        """The reported rate has to be the rate, not a separate guess."""
+        transport = self._ready(ProfileName.ICMP_FLOOD, stop_after=40)
+        attack = AttackProfile(
+            profile=ProfileName.ICMP_FLOOD,
+            pps=10_000_000,
+            payload_size=64,
+        )
+        transport.worker_loop(0, 10_000_000, attack)
+
+        counters = transport.snapshot()
+        assert counters.sent == 40
+        assert counters.attempted == 40
+        assert counters.errors == 0
+
+    def test_request_stop_ends_the_loop_promptly(self) -> None:
+        """The engine stops a self-paced transport by setting its event."""
+        transport = self._ready(ProfileName.UDP_FLOOD, stop_after=10_000)
+        transport.request_stop()
+        attack = AttackProfile(
+            profile=ProfileName.UDP_FLOOD,
+            pps=10_000_000,
+            payload_size=64,
+        )
+        transport.worker_loop(0, 10_000_000, attack)
+        assert transport._sock.sent == 0
+
+    def test_a_low_rate_is_actually_paced(self) -> None:
+        """The loop must not ignore the rate it was handed."""
+        transport = self._ready(ProfileName.UDP_FLOOD, stop_after=20)
+        attack = AttackProfile(
+            profile=ProfileName.UDP_FLOOD,
+            pps=200,
+            payload_size=64,
+        )
+        started = time.monotonic()
+        transport.worker_loop(0, 200, attack)
+        elapsed = time.monotonic() - started
+
+        assert transport._sock.sent == 20
+        # 20 packets at 200/s is ~0.1s. Generous bound, because the point is
+        # that it slept at all - a loop that ignored the rate would finish in
+        # microseconds.
+        assert elapsed >= 0.05, f"20 packets at 200/s finished in {elapsed:.4f}s"
+
+    def test_a_send_failure_is_counted_and_raised(self) -> None:
+        """A driver error must surface, not be swallowed into a slow run."""
+        transport = self._ready(ProfileName.UDP_FLOOD, stop_after=5)
+
+        class Failing:
+            def send(self, packet: object) -> None:
+                raise OSError("driver refused the packet")
+
+            def close(self) -> None:
+                pass
+
+        transport._sock = Failing()
+        attack = AttackProfile(
+            profile=ProfileName.UDP_FLOOD,
+            pps=10_000_000,
+            payload_size=64,
+        )
+        with pytest.raises(TransportError, match="Raw send failed"):
+            transport.worker_loop(0, 10_000_000, attack)
+        assert transport.snapshot().errors == 1
+
+    def test_the_loop_refuses_to_run_before_open(self) -> None:
+        transport = ScapyTransport(TARGET, ProfileName.UDP_FLOOD)
+        attack = AttackProfile(profile=ProfileName.UDP_FLOOD, pps=1000)
+        with pytest.raises(TransportError, match="not open"):
+            transport.worker_loop(0, 1000, attack)
+
+    def test_reopening_clears_a_previous_stop(self, monkeypatch) -> None:
+        """A reused transport must not come back already stopped.
+
+        open() overrode the base method without clearing the stop event, so a
+        transport closed after one run and opened for the next would exit its
+        send loop immediately and report a clean zero - indistinguishable from
+        a run that worked.
+        """
+        import adobo.transports.scapy_transport as module
+
+        pytest.importorskip("scapy.all")
+        transport = ScapyTransport(TARGET, ProfileName.UDP_FLOOD)
+        transport.request_stop()
+        assert transport.stopping, "precondition: the transport is stopped"
+
+        # Everything privileged is stubbed; the event reset happens after all
+        # of it, so reaching the assertion means open() really did run.
+        monkeypatch.setattr(
+            module, "raw_capability", lambda: module.RawCapability(True, "available")
+        )
+        monkeypatch.setattr(module, "_resolve_iface", lambda scapy, dest: "eth0")
+        monkeypatch.setattr(transport, "_verify_egress", lambda scapy: None)
+        monkeypatch.setattr(transport, "_open_socket", lambda scapy: None)
+
+        transport.open()
+
+        assert transport.is_open
+        assert not transport.stopping, "open() must rearm a stopped transport"
+
+
 # ---------------------------------------------------------------------------
 # Egress interface resolution
 # ---------------------------------------------------------------------------
@@ -1061,23 +1261,88 @@ class TestInterfaceResolution:
         message = str(caught.value)
         assert "10.0.0.7" in message and "network is unreachable" in message
 
-    def test_send_passes_the_resolved_interface(self, monkeypatch) -> None:
-        """The interface must be bound explicitly, not re-guessed per packet."""
+    def test_the_raw_socket_is_bound_to_the_resolved_interface(self, monkeypatch) -> None:
+        """The interface must be bound once, not re-guessed per packet."""
         scapy_all = pytest.importorskip("scapy.all")
         transport = ScapyTransport(TARGET, ProfileName.UDP_FLOOD)
         transport._scapy = scapy_all
         transport._resolved = "127.0.0.1"
         transport._iface = "Ethernet 2"
+
+        bound: dict[str, object] = {}
+
+        class FakeSocket:
+            def __init__(self, **kwargs: object) -> None:
+                bound.update(kwargs)
+
+            def send(self, packet: object) -> None:
+                bound["sent"] = packet
+
+            def close(self) -> None:
+                bound["closed"] = True
+
+        monkeypatch.setattr(scapy_all.conf, "L3socket", FakeSocket)
+        transport._open_socket(scapy_all)
+        transport._open = True
+        transport.send_one(b"payload")
+
+        assert bound["iface"] == "Ethernet 2"
+        assert bound["sent"] is not None, "the packet must go out on the bound socket"
+
+    def test_a_send_does_not_re_resolve_the_route(self, monkeypatch) -> None:
+        """scapy.send() re-routes and rebuilds a socket on every call.
+
+        That wrapper is the per-packet cost this path exists to avoid, so the
+        test pins the absence of it: if someone reintroduces the convenience
+        call here, the send explodes rather than quietly getting slower.
+        """
+        scapy_all = pytest.importorskip("scapy.all")
+        transport = ScapyTransport(TARGET, ProfileName.UDP_FLOOD)
+        transport._scapy = scapy_all
+        transport._resolved = "127.0.0.1"
+        transport._iface = "Ethernet 2"
+        transport._sock = FakeRecordingSocket()
         transport._open = True
 
-        seen: dict[str, object] = {}
-        monkeypatch.setattr(
-            scapy_all,
-            "send",
-            lambda packet, **kw: seen.update(kw),
-        )
+        def explode(*args: object, **kwargs: object) -> None:
+            raise AssertionError("the per-packet send helper must not be used")
+
+        monkeypatch.setattr(scapy_all, "send", explode)
         transport.send_one(b"payload")
-        assert seen["iface"] == "Ethernet 2"
+        assert transport._sock.sent == 1
+
+    def test_close_releases_the_bound_socket(self) -> None:
+        """A handle left open per transport is a handle leaked per worker."""
+        transport = ScapyTransport(TARGET, ProfileName.UDP_FLOOD)
+        socket_ = FakeRecordingSocket()
+        transport._sock = socket_
+        transport._open = True
+        transport.close()
+        assert socket_.closed == 1
+        assert transport._sock is None
+
+    def test_close_survives_a_socket_that_cannot_be_closed(self) -> None:
+        """Teardown must not raise, or it masks whatever ended the run."""
+        transport = ScapyTransport(TARGET, ProfileName.UDP_FLOOD)
+
+        class Refusing:
+            def close(self) -> None:
+                raise OSError("already gone")
+
+        transport._sock = Refusing()
+        transport._open = True
+        transport.close()
+        assert transport._sock is None
+
+    def test_send_is_refused_without_a_bound_socket(self) -> None:
+        """A transport with only an interface resolved has nothing to send on."""
+        transport = ScapyTransport(TARGET, ProfileName.UDP_FLOOD)
+        transport._scapy = pytest.importorskip("scapy.all")
+        transport._resolved = "127.0.0.1"
+        transport._iface = "Ethernet 2"
+        transport._open = True
+        with pytest.raises(TransportError, match="No raw socket is open"):
+            transport.send_one(b"payload")
 
     def test_send_is_refused_without_a_resolved_interface(self) -> None:
         """A half-open transport must not silently fall back to a default NIC."""

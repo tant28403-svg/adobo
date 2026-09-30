@@ -404,9 +404,19 @@ class RunEngine:
             # total offered load is pps regardless of worker count. Previously
             # this passed payload_size, which a rate-named parameter then turned
             # into a connection count 25x higher than intended.
+            #
+            # The attack profile comes along too. A self-paced transport has to
+            # build the payload itself, and it cannot: the generic path builds
+            # it in _pump and hides that behind send_one, so a transport taking
+            # over the loop had no way to learn the payload size or the
+            # keep-alive flag it was meant to be sending.
             if hasattr(transport, 'worker_loop'):
                 attack = self.config.attack
-                transport.worker_loop(index, attack.pps / max(1, attack.workers))
+                transport.worker_loop(
+                    index,
+                    attack.pps / max(1, attack.workers),
+                    attack,
+                )
             else:
                 self._pump(transport, index)
         except TransportError as exc:

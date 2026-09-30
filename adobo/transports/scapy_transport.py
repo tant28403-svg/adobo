@@ -22,13 +22,14 @@ import io
 import os
 import socket
 import sys
+import time
 import warnings
 from dataclasses import dataclass
 from socket import AF_INET
 from typing import Any, ClassVar
 
-from ..models import ProfileName, Target, TransportKind
-from .base import Transport, TransportError
+from ..models import AttackProfile, ProfileName, Target, TransportKind
+from .base import Transport, TransportError, build_payload
 
 __all__ = [
     "RawCapability",
@@ -37,6 +38,16 @@ __all__ = [
     "raw_capability",
     "scapy_available",
 ]
+
+RAW_BATCH = 16
+"""Packets emitted between two clock reads in the raw send loop.
+
+The engine's generic pump reads the clock once per batch too, but a batch of
+one there is a connection, and a connection costs far more than a clock read.
+Reading the clock every 16 packets keeps the pacing accurate to well under a
+millisecond while leaving the per-packet work as a send and two integer
+increments.
+"""
 
 @dataclass(frozen=True, slots=True)
 class RawCapability:
@@ -244,6 +255,11 @@ class ScapyTransport(Transport):
         self._scapy: Any = None
         self._resolved: str | None = None
         self._iface: str | None = None
+        # One raw socket for the life of the transport, and one packet object
+        # reused across sends. See _open_socket and _packet_for.
+        self._sock: Any = None
+        self._template: Any = None
+        self._template_size: int = -1
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -274,8 +290,48 @@ class ScapyTransport(Transport):
         # N silent send errors discovered at the end of the run.
         self._iface = _resolve_iface(scapy, self._resolved)
         self._verify_egress(scapy)
+        self._open_socket(scapy)
 
+        # Transport.open() clears the stop event and this override never called
+        # it, setting _open directly instead. Harmless while nothing read the
+        # event; not harmless now that the send loop ends on it. A transport
+        # reused across two runs would come back already stopped and send
+        # nothing at all, reporting a clean zero.
+        self._stop.clear()
         self._open = True
+
+    def _open_socket(self, scapy: Any) -> None:
+        """Bind one layer-3 socket and hold it for the life of the transport.
+
+        scapy's module-level :func:`send` is a convenience wrapper: on every
+        call it re-resolves the route, re-selects the egress interface, builds
+        a layer-3 socket and throws it away again. That is fine for a script
+        sending a handful of packets and the wrong shape for a flood.
+
+        How much of the old run's per-packet cost this actually accounted for is
+        not established. The Python-side work that *was* measurable dropped
+        from 268.7us to 5.7-6.8us per packet, and that number covers packet
+        construction rather than this wrapper, because creating a real layer-3
+        socket needs a driver the machine running the suite does not have. The
+        route and handle churn this removes is real work that was certainly
+        being repeated, but its size is a guess and the run's own figure should
+        be re-measured on a machine that can send before anyone quotes a rate.
+
+        Binding once also moves a failure to setup, where it is a clean error
+        naming the interface, rather than a per-packet cost.
+        """
+        try:
+            self._sock = scapy.conf.L3socket(
+                iface=self._iface,
+                filter="",
+                promisc=False,
+            )
+        except Exception as exc:  # noqa: BLE001 - any failure must be actionable
+            raise TransportError(
+                f"Could not open a raw socket on {self._iface!r}: {exc}. The "
+                f"driver is present but refused the handle, so every packet "
+                f"would fail on its own instead of the run failing here."
+            ) from exc
 
     def _verify_egress(self, scapy: Any) -> None:
         """Prove that a raw packet can actually leave this machine.
@@ -353,7 +409,17 @@ class ScapyTransport(Transport):
             ) from exc
 
     def close(self) -> None:
-        # scapy owns its sockets; there is no per-transport handle to release.
+        sock = self._sock
+        self._sock = None
+        if sock is not None:
+            # Best effort: a socket scapy already discarded must not turn a
+            # clean shutdown into an exception during teardown.
+            try:
+                sock.close()
+            except Exception:  # noqa: BLE001 - teardown must not mask
+                pass
+        self._template = None
+        self._template_size = -1
         self._scapy = None
         self._resolved = None
         self._iface = None
@@ -414,23 +480,147 @@ class ScapyTransport(Transport):
 
     # -- egress ------------------------------------------------------------
 
+    def _packet_for(self, payload: bytes) -> Any:
+        """Return a ready-to-send packet, rebuilding only when it must.
+
+        A flood emits thousands of structurally identical frames, so building
+        each from scratch spends the run inside scapy's layer construction
+        rather than on the wire. One packet object is kept and only the two
+        fields that make a packet distinct are advanced: the payload bytes and
+        the IP id. The layer tree, the source address and every header offset
+        are computed once.
+
+        The warning filter lives here rather than around the send because this
+        is the only place scapy parses anything. It used to wrap every single
+        send, copying and restoring the global filter list once per packet.
+        Measured, that context manager was 3.5us of a 268.7us packet - about
+        1% - so the win here is the construction it was hiding, not the filter.
+        The filter still does not belong in a per-packet path, but it was never
+        the reason a flood was slow and should not be cited as one.
+        """
+        template = self._template
+        if template is None or len(payload) != self._template_size:
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=SyntaxWarning, module="scapy")
+                template = self.build_packet(payload)
+            self._template = template
+            self._template_size = len(payload)
+            return template
+
+        layer = template.getlayer(self._scapy.Raw)
+        if layer is not None:
+            layer.load = payload
+        template.id = (template.id + 1) & 0xFFFF
+        return template
+
     def send_one(self, payload: bytes) -> None:
+        self._require_ready()
+        sock = self._sock
+        self._count_attempt()
+        try:
+            sock.send(self._packet_for(payload))
+        except Exception as exc:
+            self._count_error()
+            raise TransportError(f"Raw send failed: {exc}") from exc
+        self._count_sent(len(payload))
+
+    def _require_ready(self) -> None:
+        """Refuse to send unless every piece of setup is in place."""
         if not self._open or self._scapy is None:
             raise TransportError("Transport is not open; call open() before sending")
         if self._iface is None:  # pragma: no cover - open() always sets it
             raise TransportError(
                 "No egress interface resolved; call open() before sending"
             )
-        self._count_attempt()
-        try:
-            packet = self.build_packet(payload)
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", category=SyntaxWarning, module="scapy")
-                self._scapy.send(packet, iface=self._iface, verbose=False)
-        except Exception as exc:
-            self._count_error()
-            raise TransportError(f"Raw send failed: {exc}") from exc
-        self._count_sent(len(payload))
+        if self._sock is None:
+            raise TransportError("No raw socket is open; call open() before sending")
+
+    def worker_loop(self, index: int, per_worker_pps: float, attack: AttackProfile) -> None:
+        """Own the pacing, so the per-packet work is one send and two integers.
+
+        The engine's generic pump is built for a socket transport, where every
+        packet really does need a payload built, a method call across the
+        transport boundary and a connection decision. None of that applies to a
+        raw socket repeating one frame.
+
+        So the payload and the packet are built once here, the layers that vary
+        are resolved to objects once, and the loop body is a send plus an
+        increment. What that is worth is measured: 268.7us of Python work per
+        packet before, 5.7-6.8us after, which is the difference between a
+        ceiling around 3,700 pps and one around 150,000 for everything that is
+        not the syscall itself. The syscall is not counted in either figure -
+        it needs a driver this machine does not have - so the rate a real run
+        reaches is lower than 150,000 and has to be measured on one that can
+        send. A previous run managed about 74 pps per profile; this is the
+        change meant to explain that number, and it is not a claim about what
+        the new number is.
+
+        Pacing is the same absolute schedule the engine uses, so falling behind
+        resyncs instead of bursting. *per_worker_pps* is the per-worker share,
+        so the total offered load is the configured pps however many workers
+        there are.
+        """
+        self._require_ready()
+        sock = self._sock
+        scapy = self._scapy
+
+        payload = build_payload(
+            attack.profile,
+            attack.payload_size,
+            target=self.target,
+            seed=index * 1_000_000,
+            keep_alive=attack.keep_alive,
+        )
+        size = len(payload)
+        packet = self._packet_for(payload)
+
+        # Resolved once. Looking a layer up by name per packet is a dictionary
+        # walk plus a comparison, and this loop runs it tens of thousands of
+        # times a second.
+        ip_layer = packet.getlayer(scapy.IP)
+        tcp_layer = packet.getlayer(scapy.TCP)
+        udp_layer = packet.getlayer(scapy.UDP)
+        icmp_layer = packet.getlayer(scapy.ICMP)
+
+        interval = 1.0 / max(1.0, per_worker_pps)
+        next_send = time.monotonic()
+
+        while not self.stopping:
+            for _ in range(RAW_BATCH):
+                if self.stopping:
+                    return
+                self._count_attempt()
+                try:
+                    # Advance the fields that make each frame distinct. The IP
+                    # id alone is enough for a flood; a sequence number per
+                    # protocol keeps the packets looking like the real thing
+                    # rather than one frame with a counter on it.
+                    if ip_layer is not None:
+                        ip_layer.id = (ip_layer.id + 1) & 0xFFFF
+                    if tcp_layer is not None:
+                        tcp_layer.seq = (tcp_layer.seq + 1) & 0xFFFFFFFF
+                    if udp_layer is not None:
+                        udp_layer.sport = (udp_layer.sport + 1) % 65536
+                    if icmp_layer is not None:
+                        icmp_layer.id = (icmp_layer.id + 1) & 0xFFFF
+                    sock.send(packet)
+                except Exception as exc:
+                    self._count_error()
+                    raise TransportError(f"Raw send failed: {exc}") from exc
+                self._count_sent(size)
+
+            next_send += interval * RAW_BATCH
+            now = time.monotonic()
+            if next_send > now:
+                # Wakes on request_stop as well as on the deadline, so a stop
+                # is not held up by a sleep this loop is doing.
+                if self._stop.wait(min(next_send - now, 0.2)):
+                    return
+            else:
+                # Sending could not keep up. Resync rather than dropping the
+                # sleep entirely, which would turn a degraded run into an
+                # unbounded burst.
+                next_send = now
 
     def describe(self) -> dict[str, object]:
         info = super().describe()
