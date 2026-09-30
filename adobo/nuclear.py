@@ -19,7 +19,7 @@ from .engine import EngineHooks, RunEngine
 from .observation import TargetObserver, refused_connection
 from .safety import PolicyViolation, SafetyGuard
 from .transports import raw_capability
-from .config import load_lab_config
+from .config import config_path, load_lab_config, LAB_CONFIG_NAME
 @dataclass(frozen=True, slots=True)
 class NuclearProfile:
     """Configuration for one profile in the nuclear strike."""
@@ -150,6 +150,38 @@ _TCP_PROFILES = frozenset(
     }
 )
 
+#: Profiles that put a connectionless datagram on the wire toward the host.
+#:
+#: These are exempt from the closed-port drop, and the reason is that the drop's
+#: stated justification is false for them. The pre-flight tells the operator it
+#: is skipping profiles because "the packets would be discarded before reaching
+#: any application" - true of a SYN or an HTTP request against a port with no
+#: listener, and not true of a datagram, which arrives, is charged to the
+#: target's ingress bandwidth, and is dropped by the kernel afterwards. A
+#: volumetric test does not need a willing application to measure load.
+#:
+#: What a closed reflector port does change is amplification: with no responder
+#: there is nothing to amplify, and a query to it returns nothing. That is a
+#: separate question with its own prompt - see the reflector check in
+#: nuclear_wizard. Collapsing "may I run this" into "will it amplify" is what
+#: cost a run four profiles, silently, whenever VM2 had nothing bound to the
+#: reflector ports.
+_CONNECTIONLESS_PROFILES = frozenset(
+    {
+        ProfileName.UDP_FLOOD,
+        # The _NS variants send the same datagram from a real source address
+        # instead of a forged one, so they are exempt for the same reason. This
+        # is not a detail: declining the spoofing prompt selects _NS, so
+        # omitting it here would have left the non-elevated path - the one most
+        # operators actually run - still dropping its UDP flood.
+        ProfileName.UDP_FLOOD_NS,
+        ProfileName.DNS_AMPLIFICATION,
+        ProfileName.NTP_AMPLIFICATION,
+        ProfileName.CLDAP_AMPLIFICATION,
+        ProfileName.SSDP_AMPLIFICATION,
+    }
+)
+
 
 def probe_tcp_port(host: str, port: int, timeout: float = 0.5) -> bool:
     """True if *port* accepts a TCP connection.
@@ -186,6 +218,10 @@ def filter_available_profiles(
     TCP with UDP reports a live HTTP target as closed, and a silent drop here
     is worse than an honest failed run because the strike still looks like it
     did something.
+
+    Datagram profiles are kept even when the probe fails - see
+    :data:`_CONNECTIONLESS_PROFILES` for why, and for where the amplification
+    question is actually asked.
     """
     keep: list[NuclearProfile] = []
     skipped: list[tuple[str, str]] = []
@@ -193,6 +229,9 @@ def filter_available_profiles(
     for profile in profiles:
         # ICMP has no port, and a raw-socket profile will fail loudly anyway.
         if profile.port is None:
+            keep.append(profile)
+            continue
+        if profile.profile in _CONNECTIONLESS_PROFILES:
             keep.append(profile)
             continue
         if profile.profile in _TCP_PROFILES:
@@ -205,6 +244,39 @@ def filter_available_profiles(
             skipped.append((profile.name, f"{host}:{profile.port} is closed"))
 
     return keep, skipped
+
+
+def _drop_privilege_profiles(profiles: list[NuclearProfile]) -> list[NuclearProfile]:
+    """Remove the profiles that need a forged source, naming each one.
+
+    The old wording was a count - "Skipping 4 raw profiles" - which reads as
+    though the four were interchangeable and as though raw sockets were the only
+    thing missing. They are not the same thing: every dropped profile is here
+    because it needs a *forged source address*, which is why answering ``n`` to
+    the spoofing prompt forfeits the four amplification profiles even when the
+    process is already root. Naming them, and saying what would bring them
+    back, is the difference between a run the operator can interpret and one
+    that silently came back short.
+    """
+    kept: list[NuclearProfile] = []
+    dropped: list[NuclearProfile] = []
+    for profile in profiles:
+        (dropped if profile.requires_admin else kept).append(profile)
+
+    if not dropped:
+        return kept
+
+    print(
+        f"   {len(dropped)} of {len(profiles)} profiles need a forged source "
+        f"address and are not running:"
+    )
+    for profile in dropped:
+        print(f"      - {profile.name}")
+    print(
+        "     Run as root and answer y to the spoofing prompt to include them."
+    )
+    print(f"   Running {len(kept)} of {len(profiles)} profiles.\n")
+    return kept
 
 
 def check_privileges() -> tuple[bool, bool]:
@@ -1471,6 +1543,15 @@ def nuclear_wizard() -> int:
     # one value the wizard used to discard anyway - it used to be collected and
     # then replaced by a literal, which is the bug this removed.
     workers = limits.max_workers
+    # State the value and where it came from. A missing lab.yaml is not an
+    # error, it is the normal case, and it silently supplied 8 workers for a
+    # run the operator believed was configured otherwise - so the number
+    # governing the result was never visible anywhere before the strike began.
+    if config_path(LAB_CONFIG_NAME).exists():
+        worker_source = f"{config_path(LAB_CONFIG_NAME)}"
+    else:
+        worker_source = "built-in default (no lab.yaml)"
+    print(f"  Worker threads per profile: {workers} (from {worker_source})")
     payload_size = _ask_int_bounded(
         "Payload size (bytes)", 512, 0, limits.max_payload_bytes, "max_payload_bytes"
     )
@@ -1497,23 +1578,13 @@ def nuclear_wizard() -> int:
         print(f"   Reason: {raw_capability().reason}")
         if not child_raw:
             print(f"   Child check also failed: {child_reason}")
-        before = len(profiles)
-        profiles = [p for p in profiles if not p.requires_admin]
-        print(
-            f"   Skipping {before - len(profiles)} raw profiles, "
-            f"running {len(profiles)} socket profiles\n"
-        )
+        profiles = _drop_privilege_profiles(profiles)
     elif not child_raw:
         print("\n[!] This process is elevated, but a spawned child cannot send raw packets")
         print(f"   Child reason: {child_reason}")
         print("   This happens when the PyInstaller re-exec does not preserve elevation.")
         print("   Raw profiles will fail silently; skipping them for this run.")
-        before = len(profiles)
-        profiles = [p for p in profiles if not p.requires_admin]
-        print(
-            f"   Skipping {before - len(profiles)} raw profiles, "
-            f"running {len(profiles)} socket profiles\n"
-        )
+        profiles = _drop_privilege_profiles(profiles)
 
     # Only after the privilege filter: a port probe against a host we cannot
     # even address would report every profile closed and be mistaken for a
@@ -1534,24 +1605,28 @@ def nuclear_wizard() -> int:
         "ssdp": [p for p in profiles if p.profile == ProfileName.SSDP_AMPLIFICATION],
     }
     
-    from adobo.nuclear import probe_udp_port
     for protocol, profiles_list in amp_profiles_by_protocol.items():
         if not profiles_list:
             continue
         port = reflector_ports.get(protocol)
         if not port:
             continue
-        reflector_open = probe_udp_port(host, port)
-        if not reflector_open:
-            print(f"\n[!] WARNING: {protocol.upper()} reflector port {port} on {host} appears closed.")
-            print(f"    {protocol.upper()} amplification requires a valid open reflector on port {port}.")
-            print("    Without a valid reflector, this profile will only send requests at")
-            print("    low rate with no amplification.")
-            print()
-            proceed = _ask_yes_no(f"Continue {protocol.upper()} amplification anyway?", default=False)
-            if not proceed:
-                print("Exiting.")
-                return 1
+        # Only warn when the probe actually established the port is closed. A
+        # timeout is not evidence of anything, and calling it "appears closed"
+        # when it may equally have been a filtered packet is how this check came
+        # to interrupt runs against reflectors that were working fine.
+        if probe_udp_port(host, port):
+            continue
+        print(f"\n[!] WARNING: {protocol.upper()} reflector port {port} on {host} is closed.")
+        print(f"    {protocol.upper()} amplification requires a valid open reflector on port {port}.")
+        print("    Without a valid reflector, this profile will only send requests at")
+        print("    low rate with no amplification.")
+        print()
+        proceed = _ask_yes_no(f"Continue {protocol.upper()} amplification anyway?", default=False)
+        if not proceed:
+            print("Exiting.")
+            return 1
+        print(f"    Continuing. {protocol.upper()} numbers will show queries sent, not traffic delivered.")
 
     if not profiles:
         print("No profiles available to run. Exiting.")

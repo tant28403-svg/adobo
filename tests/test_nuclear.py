@@ -13,6 +13,8 @@ and racy, and the logic under test is the bookkeeping, not the multiprocessing.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import queue
 import socket
 
@@ -30,6 +32,7 @@ from adobo.models import (
 from adobo.nuclear import (
     NuclearAggregator,
     NuclearProfile,
+    _drop_privilege_profiles,
     build_profiles,
     filter_available_profiles,
     probe_udp_port,
@@ -527,7 +530,124 @@ class TestProbeMatchesTheProtocol:
         assert skipped == []
 
 
+class TestDatagramProfilesSurviveAClosedPort:
+    """A closed port is a fact about responders, not about packets arriving.
+
+    Six of the ten profiles were dropped together whenever nothing was bound to
+    the reflector ports, so a run came back short with one line of output the
+    operator had to decode. The justification the pre-flight prints - that the
+    packets "would be discarded before reaching any application" - is false for
+    a datagram: it arrives, is charged to the target's ingress, and is dropped
+    afterwards. TCP profiles still get the probe, because for those a closed
+    port really does mean nothing will ever serve the request.
+    """
+
+    def test_a_reflector_profile_is_kept_when_its_port_is_closed(self) -> None:
+        keep, skipped = filter_available_profiles(
+            [make_profile("dns_amplification", _a_closed_port(), ProfileName.DNS_AMPLIFICATION)],
+            "127.0.0.1",
+        )
+        assert [p.name for p in keep] == ["dns_amplification"]
+        assert skipped == []
+
+    def test_all_four_amplification_profiles_survive(self) -> None:
+        profiles = [
+            make_profile("dns_amplification", _a_closed_port(), ProfileName.DNS_AMPLIFICATION),
+            make_profile("ntp_amplification", _a_closed_port(), ProfileName.NTP_AMPLIFICATION),
+            make_profile("cldap_amplification", _a_closed_port(), ProfileName.CLDAP_AMPLIFICATION),
+            make_profile("ssdp_amplification", _a_closed_port(), ProfileName.SSDP_AMPLIFICATION),
+        ]
+        keep, skipped = filter_available_profiles(profiles, "127.0.0.1")
+        assert len(keep) == 4
+        assert skipped == []
+
+    def test_udp_flood_survives_a_tcp_only_service_port(self) -> None:
+        """The datagrams still arrive even though nothing will ever answer."""
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+        try:
+            keep, skipped = filter_available_profiles(
+                [make_profile("udp_flood", port, ProfileName.UDP_FLOOD)], "127.0.0.1"
+            )
+        finally:
+            listener.close()
+        assert [p.name for p in keep] == ["udp_flood"]
+        assert skipped == []
+
+    def test_the_non_spoofed_variant_is_exempt_too(self) -> None:
+        """Declining the spoofing prompt selects UDP_FLOOD_NS, not UDP_FLOOD.
+
+        The exemption that only covered the spoofed name left the
+        non-elevated path - the one most operators run - still dropping its UDP
+        flood, which is the bug this whole change set was opened to fix.
+        """
+        keep, skipped = filter_available_profiles(
+            [make_profile("udp_flood", _a_closed_port(), ProfileName.UDP_FLOOD_NS)],
+            "127.0.0.1",
+        )
+        assert [p.name for p in keep] == ["udp_flood"]
+        assert skipped == []
+
+    def test_tcp_profiles_are_still_probed(self) -> None:
+        """The exemption is for datagrams only, not a general loosening."""
+        keep, skipped = filter_available_profiles(
+            [make_profile("http_flood", _a_closed_port(), ProfileName.HTTP_FLOOD)],
+            "127.0.0.1",
+        )
+        assert keep == []
+        assert len(skipped) == 1
+
+
+class TestPrivilegeDropIsNamed:
+    """The count alone left the operator unable to tell what had gone missing."""
+
+    @staticmethod
+    def _spoofing_profile(name: str) -> NuclearProfile:
+        return NuclearProfile(
+            name=name,
+            profile=ProfileName.DNS_AMPLIFICATION,
+            transport=TransportKind.SCAPY,
+            port=53,
+            spoof=True,
+            requires_admin=True,
+        )
+
+    def test_a_spoofing_profile_is_dropped(self) -> None:
+        profiles = [self._spoofing_profile("dns_amplification"), make_profile("http_flood")]
+        assert [p.name for p in _drop_privilege_profiles(profiles)] == ["http_flood"]
+
+    def test_the_dropped_profile_is_named_in_the_output(self) -> None:
+        """Naming them is the whole point; the old line said only how many."""
+        profiles = [self._spoofing_profile("dns_amplification"), make_profile("http_flood")]
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            _drop_privilege_profiles(profiles)
+        printed = buffer.getvalue()
+        assert "dns_amplification" in printed
+        assert "http_flood" not in printed
+
+    def test_nothing_is_dropped_when_every_profile_is_allowed(self) -> None:
+        profiles = [make_profile("http_flood", 8000)]
+        kept = _drop_privilege_profiles(profiles)
+        assert kept == profiles
+
+    def test_no_output_when_there_is_nothing_to_drop(self) -> None:
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            _drop_privilege_profiles([make_profile("http_flood")])
+        assert buffer.getvalue() == ""
+
+
 class TestPreflight:
+    """The probe is for profiles that need a live responder.
+
+    These use TCP profiles because that is where the drop still applies: a
+    closed port means nothing will ever serve the request. Datagram profiles
+    are covered separately, and are kept.
+    """
+
     def test_a_closed_port_is_dropped_with_a_reason(self) -> None:
         """An open port is kept, a closed one is dropped and explained.
 
@@ -535,13 +655,14 @@ class TestPreflight:
         so the test states its own premise instead of depending on whatever else
         happens to be listening when the suite runs.
         """
-        listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
         open_port = listener.getsockname()[1]
         try:
             profiles = [
-                make_profile("open", open_port),
-                make_profile("closed", _a_closed_port()),
+                make_profile("open", open_port, ProfileName.HTTP_FLOOD),
+                make_profile("closed", _a_closed_port(), ProfileName.HTTP_FLOOD),
             ]
             keep, skipped = filter_available_profiles(profiles, "127.0.0.1")
         finally:
@@ -556,7 +677,7 @@ class TestPreflight:
     def test_a_closed_port_is_reported_with_its_address(self) -> None:
         closed = _a_closed_port()
         keep, skipped = filter_available_profiles(
-            [make_profile("closed", closed)], "127.0.0.1"
+            [make_profile("closed", closed, ProfileName.HTTP_FLOOD)], "127.0.0.1"
         )
         assert keep == []
         assert skipped[0][0] == "closed"
@@ -573,7 +694,7 @@ class TestPreflight:
 
     def test_the_skip_is_reported_not_silent(self) -> None:
         keep, skipped = filter_available_profiles(
-            [make_profile("x", _a_closed_port())], "127.0.0.1"
+            [make_profile("x", _a_closed_port(), ProfileName.HTTP_FLOOD)], "127.0.0.1"
         )
         assert skipped, "a skipped profile must come with a reason"
         assert all(reason for _, reason in skipped)
