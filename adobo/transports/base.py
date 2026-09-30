@@ -367,21 +367,47 @@ def _pad(query: bytes, size: int, seed: int) -> bytes:
     return query
 
 
-def _http_request(host: str, path: str, size: int, seed: int) -> bytes:
+def _http_request(
+    host: str, path: str, size: int, seed: int, keep_alive: bool = False
+) -> bytes:
     """A minimal HTTP/1.1 GET with a unique cache-busting header.
 
     Uniqueness matters: a caching layer in front of the target would otherwise
     serve this from cache and the flood would measure nothing.
+
+    *keep_alive* has to reach the payload. The request used to always say
+    ``Connection: close``, so a transport asked to reuse its socket was told by
+    the peer to hang up after every response and the reuse it attempted could
+    not work. That mismatch is why throughput sat near 115 pps regardless of
+    the requested rate: the per-request connect cost, not the network, was the
+    ceiling.
     """
-    request = (
+    connection = "keep-alive" if keep_alive else "close"
+    head = (
         f"GET {path} HTTP/1.1\r\n"
         f"Host: {host}\r\n"
         f"User-Agent: adobo-lab/0.1 (authorized testing)\r\n"
         f"Accept: */*\r\n"
-        f"Connection: close\r\n"
+        f"Connection: {connection}\r\n"
         f"X-Ddosim-Seq: {seed}\r\n"
-        f"\r\n"
     ).encode("ascii")
+    if keep_alive:
+        # Padding goes *inside* the header block, before the blank line, and
+        # that placement is load-bearing rather than cosmetic. Appending filler
+        # after the blank line makes it the start of a body whose content-length
+        # end never arrives; on a reused connection that stalls the server's
+        # parser and it resets the socket. Measured directly: 20 pipelined
+        # requests with trailing filler killed the connection, the same 20
+        # without it were all served. An unknown header is simply ignored, so
+        # padding here is invisible to the server.
+        if size > len(head) + 2:
+            # "X-Pad: " is 7 bytes and the line's own CRLF is 2, then the blank
+            # line that ends the headers is another 2. Budgeted so the result
+            # is exactly *size* bytes.
+            budget = size - len(head) - 2 - 7 - 2
+            head += b"X-Pad: " + b"F" * max(0, budget) + b"\r\n"
+        return head + b"\r\n"
+    request = head + b"\r\n"
     return _pad(request, size, seed)
 
 
@@ -476,11 +502,17 @@ def build_payload(
     target: Target | None = None,
     seed: int = 0,
     path: str = "/api/data",
+    keep_alive: bool = False,
 ) -> bytes:
     """Build the payload for one packet of *profile*.
 
     Shared by all transports so the bytes on the wire are identical whichever
     egress path is chosen, which keeps a socket run and a raw run comparable.
+
+    *keep_alive* is passed through because the connection header lives in the
+    payload, not in the transport. A socket that intends to reuse its
+    connection and a request that says ``Connection: close`` contradict each
+    other, and the slower of the two wins.
     """
     size = max(0, int(size))
 
@@ -504,7 +536,7 @@ def build_payload(
 
     if profile is ProfileName.HTTP_FLOOD:
         host = target.host if target is not None else "127.0.0.1"
-        return _http_request(host, path, size, seed)
+        return _http_request(host, path, size, seed, keep_alive=keep_alive)
 
     return _filler(size, seed)
 

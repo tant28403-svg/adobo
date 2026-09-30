@@ -445,6 +445,7 @@ class RunEngine:
                         profile.payload_size,
                         target=self.config.target,
                         seed=sequence,
+                        keep_alive=profile.keep_alive,
                     )
                 )
             next_send += interval * self.batch
