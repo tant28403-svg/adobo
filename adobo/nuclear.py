@@ -1499,7 +1499,7 @@ def nuclear_wizard() -> int:
     if pps < 1:
         print("  must be at least 1")
         pps = _ask_int("PPS per profile", 500)
-    duration = _ask_float("Duration (s)", 60)
+    duration = _ask_float("Duration (s)", 1000)
     if duration > limits.max_duration_seconds:
         print(
             f"  {duration:g}s exceeds max_duration_seconds of "
