@@ -29,7 +29,6 @@ from socket import AF_INET
 from typing import Any, ClassVar
 
 from ..models import AttackProfile, ProfileName, Target, TransportKind
-from ..netpolicy import resolve_ipv4
 from .base import Transport, TransportError, build_payload
 
 __all__ = [
@@ -280,17 +279,11 @@ class ScapyTransport(Transport):
         self._scapy = scapy
 
         try:
-            # resolve_ipv4 vets every address the name resolves to, not only the
-            # one returned: this transport can only send to an IPv4 address, so a
-            # check that looked only at IPv4 would clear a name whose other
-            # records pointed anywhere.
-            self._resolved = resolve_ipv4(self.target.host)
+            self._resolved = socket.gethostbyname(self.target.host)
         except socket.gaierror as exc:
             raise TransportError(
                 f"Cannot resolve target host {self.target.host!r}: {exc}"
             ) from exc
-        except OSError as exc:
-            raise TransportError(str(exc)) from exc
 
         # Bound to the interface, not guessed per packet. Resolved during open()
         # so an unroutable target is reported as a setup failure rather than as

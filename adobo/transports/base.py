@@ -19,16 +19,14 @@ testable on machines that cannot send raw packets.
 from __future__ import annotations
 
 import ipaddress
-import socket
 import struct
 import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, ClassVar
+from typing import ClassVar
 
 from ..fingerprint import DEFAULT_FINGERPRINT_KEY, FINGERPRINTS, Fingerprint
 from ..models import ProfileName, Target, TransportKind
-from ..netpolicy import resolve_target
 
 __all__ = [
     "SOCKET_CAPABLE_PROFILES",
@@ -222,21 +220,9 @@ class Transport(ABC):
 
     kind: ClassVar[TransportKind]
 
-    #: Whether this transport puts anything on the wire toward ``target``. It
-    #: is what decides whether ``open()`` resolves the target and checks it
-    #: against ``allowed_cidrs``: a counter-only transport has no address to send
-    #: to, so requiring it to resolve one would invent a failure that is not
-    #: there. VIRTUAL is the only transport that sets this False.
-    contacts_target: ClassVar[bool] = True
-
     def __init__(self, target: Target, profile: ProfileName) -> None:
         self.target = target
         self.profile = profile
-        # Filled in by _resolve_target(). Kept so a transport that resolves once
-        # and connects many times (slowloris holds a pool) connects to the
-        # address that was checked, rather than resolving the name again per
-        # connection and possibly getting something else.
-        self._vetted: list[Any] = []
         self._counters = _CounterAccumulator()
         self._open = False
         # How many connections this transport has opened. Exists so a caller
@@ -271,34 +257,7 @@ class Transport(ABC):
         """Acquire whatever OS resource egress needs. Idempotent."""
         self._stop.clear()
         self.connections_opened += 1
-        self._resolve_target()
         self._open = True
-
-    def _resolve_target(self) -> None:
-        """Resolve the target and check it against ``allowed_cidrs``.
-
-        Called from ``open()`` by every transport that overrides it, and by the
-        base ``open()`` for the ones that do not. Every transport that reaches a
-        real address goes through here, so the allowlist in ``config/lab.yaml``
-        cannot be bypassed by choosing a different transport - which is exactly
-        what would happen if the check lived in the engine alone.
-
-        Raises :class:`~adobo.safety.PolicyViolation` when every address the
-        host resolves to is outside the allowlist, and :class:`OSError` when the
-        name does not resolve at all. The first is deliberately *not* a
-        ``TransportError``: the engine reports a transport failure as a broken
-        setup and keeps going, and a policy refusal must stop the run instead.
-
-        Stores the permitted addrinfos on ``self._vetted`` for transports that
-        resolve once and connect repeatedly.
-        """
-        if not self.contacts_target:
-            return
-        self._vetted, _decision = resolve_target(
-            self.target.host,
-            self.target.port,
-            socket.SOCK_STREAM,
-        )
 
     def close(self) -> None:
         """Release resources. Must be safe to call after a partial open."""

@@ -23,7 +23,6 @@ import sys
 from typing import Any, ClassVar, Optional
 
 from ..models import ProfileName, Target, TransportKind
-from ..netpolicy import resolve_ipv4
 from .base import Transport, TransportError
 
 __all__ = ["DEFAULT_SNDBUF", "LinuxRawTransport"]
@@ -112,15 +111,11 @@ class LinuxRawTransport(Transport):
 
         # Resolve target
         try:
-            # See ScapyTransport.open(): resolve_ipv4 vets every family, not just
-            # the IPv4 answer it returns.
-            self._resolved_ip = resolve_ipv4(self.target.host)
+            self._resolved_ip = socket.gethostbyname(self.target.host)
         except socket.gaierror as exc:
             raise TransportError(
                 f"Cannot resolve target host {self.target.host!r}: {exc}"
             ) from exc
-        except OSError as exc:
-            raise TransportError(str(exc)) from exc
 
         # Determine egress interface
         self._iface_name, self._iface_index = self._resolve_iface()

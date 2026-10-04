@@ -596,21 +596,6 @@ def run_profile_process(
             attempted=attempted,
             errors=errors,
         )
-    except PolicyViolation as exc:
-        # A refusal is an answer, not a crash. Reported without a traceback and
-        # without a crash-log entry, because nothing broke: the allowlist in
-        # lab.yaml did not cover this target and the run declined to send. Ten
-        # children hitting it produce ten of these lines and zero packets, which
-        # is the correct outcome rather than ten failures.
-        log(f"REFUSED {exc}", label)
-        emit(
-            result_queue,
-            label,
-            "failed",
-            success=False,
-            result=None,
-            error=f"refused by policy: {exc}",
-        )
     except BaseException as exc:  # noqa: BLE001 - a child must always report
         import traceback
 

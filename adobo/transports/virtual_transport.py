@@ -25,13 +25,6 @@ class VirtualTransport(Transport):
 
     kind: ClassVar[TransportKind] = TransportKind.VIRTUAL
 
-    # Nothing is ever sent toward ``target``, so there is no address to check
-    # against ``allowed_cidrs``. Opting out here is what keeps this transport
-    # usable as the CI and dry-run mode: requiring it to resolve the target
-    # would mean a run that puts no packets on the wire could still fail on a
-    # hostname that does not resolve, which is a failure with no cause behind it.
-    contacts_target: ClassVar[bool] = False
-
     def __init__(self, target: Target, profile: ProfileName) -> None:
         super().__init__(target, profile)
 

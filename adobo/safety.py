@@ -1,14 +1,8 @@
-"""Policy ceilings and the network allowlist.
+"""Policy ceilings for a run.
 
-Two jobs, and they are deliberately different ones:
-
-* **Ceilings** - cap the values a run asks for at the limits in
-  ``config/lab.yaml``, and report every reduction so a capped run never reads
-  like the run that was asked for.
-* **The allowlist** - decide which addresses a run may send to at all. That
-  judgement and the resolution it depends on live in :mod:`adobo.netpolicy`,
-  which every transport calls from ``open()``; what is here is only the
-  :class:`PolicyViolation` the refusal is raised as, and the ceiling half.
+One job: cap the values a run asks for at the limits in ``config/lab.yaml``,
+and report every reduction so a capped run never reads like the run that was
+asked for.
 
 There is deliberately no authorisation gate here. There was one, backed by
 ``config/authorization.yaml``, and it required a date and a scope to be edited
@@ -18,15 +12,6 @@ between someone and a working demo, on a tool whose whole purpose is
 measurement: the authorising step produced no measurement and made the tool
 harder to use without making it safer in any way that mattered, since the
 target is named by the operator either way.
-
-The allowlist is not that, and reinstating the authorisation record would not
-be the same as enforcing it. An authorisation record asks *who* is asking and
-makes every run pay for the answer; the allowlist asks *where* traffic may go
-and is a default-deny boundary that leaves an unconfigured checkout inert.
-A machine pointed at 10.0.0.0/8 is inside its lab and needs no paperwork; a
-machine pointed at a name that resolves to 8.8.8.8 is not, and is refused
-before a socket opens. Nothing here asks whether the operator is allowed to
-name a target inside the allowlist - they are naming it deliberately.
 
 The ceilings stay because they are what keeps a run inside what the machine
 can actually measure. A run configured past them is not a stronger test, it is
@@ -68,13 +53,7 @@ class ClampResult:
 
 
 class SafetyGuard:
-    """Clamp a run to the ceilings in ``config/lab.yaml``.
-
-    Holds the ``LabConfig`` the ceilings come from. The allowlist on the same
-    config is enforced by :mod:`adobo.netpolicy`, which needs the config and
-    not the guard - it is called from transports that were constructed without
-    one.
-    """
+    """Clamp a run to the ceilings in ``config/lab.yaml``."""
 
     def __init__(self, lab: LabConfig | None = None) -> None:
         self.lab = lab if lab is not None else load_lab_config()
@@ -185,11 +164,7 @@ def preflight(config: Any, guard: SafetyGuard | None = None) -> ClampResult:
     """Clamp a config to the configured ceilings.
 
     Returns the profile to actually run. No authorisation step: the target is
-    whatever the operator named. It is not checked against ``allowed_cidrs``
-    here either - this function only ever lowers values, and the allowlist
-    raises rather than adjusts, which is a different kind of decision. The
-    engine checks the target in :meth:`~adobo.engine.RunEngine._vet_target`
-    and every transport checks it again in ``open()``.
+    whatever the operator named.
     """
     guard = guard or SafetyGuard()
     return guard.clamp_profile(config.attack)

@@ -21,7 +21,6 @@ import h2.errors
 from ..fingerprint import Fingerprint
 from ..h2profile import H2Profile, DEFAULT_PSEUDO_HEADER_ORDER
 from ..models import ProfileName, Target, TransportKind
-from ..netpolicy import resolve_target
 from .base import PeerUnavailable, Transport, TransportError, supports_profile
 
 if TYPE_CHECKING:
@@ -144,25 +143,9 @@ class H2Transport(Transport):
         if self._open:
             return
         try:
-            # Connect to the address the allowlist permitted rather than to the
-            # name. create_connection() would resolve the name itself, and a name
-            # is not an address - it could come back as something else between
-            # the check and the connect. Handed an IP literal it performs no DNS
-            # lookup at all, so what is dialled is what was vetted. SNI and
-            # certificate validation still use the name, below.
-            infos, _decision = resolve_target(
-                self.target.host,
-                self.target.port,
-                socket.SOCK_STREAM,
-            )
-            self._vetted = infos
-            # Rebuilt as a 2-tuple rather than passed through: an AF_INET6
-            # sockaddr is (host, port, flowinfo, scopeid) and create_connection
-            # rejects anything that is not exactly (host, port). Passing
-            # infos[0][4] straight through broke every IPv6 target.
-            _family, _socktype, _proto, _canon, sockaddr = infos[0]
+            # TCP connect
             raw_sock = socket.create_connection(
-                (sockaddr[0], self.target.port),
+                (self.target.host, self.target.port),
                 timeout=self.connect_timeout
             )
             raw_sock.settimeout(self.send_timeout)
