@@ -55,8 +55,9 @@ from .models import (
     utcnow,
 )
 from .monitor import ResourceMonitor, process_for_pid
+from .netpolicy import inspect_target
 from .observation import TargetObserver, refused_connection
-from .safety import SafetyGuard
+from .safety import PolicyViolation, SafetyGuard
 from .transports import (
     PeerUnavailable,
     Transport,
@@ -257,8 +258,18 @@ class RunEngine:
         """
         # Ceilings, before anything is opened, so a run never goes out past
         # what the config permits.
+        #
+        # The target is vetted even for a dry run, which sends nothing. A dry run
+        # is the rehearsal for the run that does send, and a rehearsal that
+        # reports a target as acceptable while the real run refuses it is the
+        # tool disagreeing with itself about one command line. The cost is one
+        # name resolution, and the guarantee it buys is that "allowed" means the
+        # same thing in both runs.
+        guard = self._guard or SafetyGuard()
         if not self.config.dry_run:
-            self._apply_safety_gate()
+            self._apply_safety_gate(guard)
+        else:
+            self._vet_target(guard)
 
         # The opening /stats reading is the first thing that happens, ahead of
         # `started`, so it is setup rather than part of the run. It has to be
@@ -326,21 +337,65 @@ class RunEngine:
             raise fatal
         return outcome
 
-    def _apply_safety_gate(self) -> None:
-        """Clamp the run to the configured ceilings.
+    def _apply_safety_gate(self, guard: SafetyGuard) -> None:
+        """Clamp the run to the configured ceilings and vet the target.
 
         There is no authorisation step: the target is the one the operator
-        named. Clamps are applied to the config in place and recorded, so the
-        summary reports the values that were actually used rather than the ones
-        that were requested.
+        named, and nothing here asks whether they may name it. What the run must
+        not do is send outside ``allowed_cidrs``, and that is enforced - but it
+        is enforced in the transport, at the moment the address is used, because
+        a check here would only be checking a *name*. Every transport resolves
+        through ``adobo.netpolicy``, so this method is not the boundary; it is the
+        early, readable report of one.
+
+        Clamps are applied to the config in place and recorded, so the summary
+        reports the values that were actually used rather than the ones that were
+        requested.
         """
-        guard = self._guard or SafetyGuard()
         result = guard.clamp_profile(self.config.attack)
         if result.changed:
             self.config = self.config.model_copy(
                 update={"attack": result.applied}
             )
             self._policy_notes.extend(result.notes)
+        self._vet_target(guard)
+
+    def _vet_target(self, guard: SafetyGuard) -> None:
+        """Resolve the target name and record what the allowlist made of it.
+
+        Raises :class:`~adobo.safety.PolicyViolation` when every address the name
+        resolves to is outside ``allowed_cidrs``, which stops the run before a
+        single socket is opened.
+
+        A name that resolves to *some* permitted addresses is not refused. The
+        transport connects only to the permitted ones and the dropped ones are
+        named in the run notes, because refusing there would break a working
+        target over a DNS record it never sends to.
+
+        A name that does not resolve is left alone. That is a broken target, not
+        a policy question, and the transport reports it with the message it has
+        always used. Deciding it here would report a typo as a refusal.
+        """
+        decision = inspect_target(
+            self.config.target.host,
+            self.config.target.port,
+            guard.lab,
+        )
+        if decision is None:
+            # The name does not resolve. Left to the transport, which words it
+            # as a broken target rather than a policy decision.
+            return
+        # Refuse only when *nothing* permitted is left. A name with one bad
+        # address record is not a reason to refuse a target we can still reach
+        # inside the allowlist - that would break a working run over a record it
+        # never sends to. This mirrors netpolicy.checked_addresses(), which drops
+        # the bad addresses and connects to the rest; both layers have to agree,
+        # or the engine would refuse a target the transport was willing to use.
+        if decision.outside and not decision.permitted:
+            raise PolicyViolation(decision.refusal())
+        note = decision.note()
+        if note:
+            self._policy_notes.append(note)
 
     def _validate_transport(self) -> bool:
         """Open and immediately close one transport to fail fast.

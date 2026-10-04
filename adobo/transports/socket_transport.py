@@ -22,6 +22,7 @@ import ssl
 from typing import ClassVar
 
 from ..models import ProfileName, Target, TransportKind
+from ..netpolicy import resolve_target
 from .base import PeerUnavailable, Transport, TransportError, supports_profile
 
 __all__ = [
@@ -136,16 +137,20 @@ class SocketTransport(Transport):
     def open(self) -> None:
         if self._open:
             return
+        # The allowlist check and the resolution are the same call: the address
+        # that gets connected to below is the one resolve_target permitted, not
+        # a second lookup that might not agree with the first.
         try:
-            infos = socket.getaddrinfo(
+            infos, _decision = resolve_target(
                 self.target.host,
                 self.target.port,
-                type=socket.SOCK_STREAM if self._using_tcp else socket.SOCK_DGRAM,
+                socket.SOCK_STREAM if self._using_tcp else socket.SOCK_DGRAM,
             )
         except socket.gaierror as exc:
             raise TransportError(
                 f"Cannot resolve target host {self.target.host!r}: {exc}"
             ) from exc
+        self._vetted = infos
 
         if not infos:
             raise TransportError(

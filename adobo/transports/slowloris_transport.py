@@ -11,6 +11,7 @@ import time
 from typing import ClassVar
 
 from ..models import AttackProfile, ProfileName, Target, TransportKind
+from ..netpolicy import resolve_ipv4
 from .base import Transport, TransportError, build_payload
 
 __all__ = ["SlowlorisTransport"]
@@ -33,6 +34,25 @@ class SlowlorisTransport(Transport):
             raise TransportError("SlowlorisTransport only supports SLOWLORIS profile")
         self.header_interval = header_interval
         self._sockets: list[socket.socket] = []
+        # The address open() vetted, as an (ip, port) pair. See _resolve_target.
+        self._dial: tuple[str, int] | None = None
+
+    def _resolve_target(self) -> None:
+        """Resolve to a single IPv4 address, checked against ``allowed_cidrs``.
+
+        Overrides the base because worker_loop dials with a hardcoded
+        ``AF_INET`` socket. The base stores addrinfos, whose first entry may be
+        IPv6 on a dual-stack host, and connecting an AF_INET socket to ``::1``
+        fails - so the base's answer is not usable here even though it is
+        correctly vetted. ``resolve_ipv4`` still vets every address the name
+        resolves to, both families, before picking one.
+
+        Dialing the address rather than the name is the point: this transport
+        opens a socket per connection for the whole run, and resolving per
+        connection would both cost a lookup each time and allow the name to point
+        somewhere new after the check.
+        """
+        self._dial = (resolve_ipv4(self.target.host), self.target.port)
 
     def close(self) -> None:
         # Base close() sets the stop event and marks the transport closed.
@@ -73,8 +93,12 @@ class SlowlorisTransport(Transport):
         engine's join grace is shorter than that interval, so the worker never
         reported a result and the whole run looked like it had sent nothing.
         """
-        target_host = self.target.host
-        target_port = self.target.port
+        # open() resolved and vetted the target once; every socket in the pool below
+        # dials that address. A transport used without being opened has nothing
+        # vetted, so resolve here rather than failing obscurely per connection.
+        if self._dial is None:
+            self._resolve_target()
+        target_host, target_port = self._dial
 
         # Per-worker budget, so N workers hold N times this many connections.
         concurrent_connections = max(1, int(per_worker_pps) // 10)
