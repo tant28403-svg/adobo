@@ -24,6 +24,7 @@ from .base import (
     supports_profile,
 )
 from .proxy_transport import ProxyH2Transport, ProxyTransport
+from .http3_transport import Http3Transport, aioquic_available
 from .scapy_transport import (
     RawCapability,
     ScapyTransport,
@@ -37,6 +38,7 @@ from .slowloris_transport import SlowlorisTransport
 from .virtual_transport import VirtualTransport
 
 __all__ = [
+    "Http3Transport",
     "PeerUnavailable",
     "ProxyH2Transport",
     "ProxyListError",
@@ -52,6 +54,7 @@ __all__ = [
     "TransportError",
     "VirtualTransport",
     "H2Transport",
+    "aioquic_available",
     "available_transports",
     "build_payload",
     "get_transport",
@@ -161,6 +164,15 @@ def get_transport(config: RunConfig) -> Transport:
     # ``None`` means "send no impersonation", which each transport treats as its
     # own self-identifying default rather than as a request to invent one.
     persona = config.attack.persona()
+
+    if config.transport is TransportKind.H3:
+        attack = config.attack
+        return Http3Transport(
+            config.target,
+            profile,
+            tls_verify=getattr(attack, "tls_verify", True),
+            persona=persona,
+        )
 
     if config.transport is TransportKind.PROXY:
         # Loaded here rather than in the transport so a missing or empty list is
@@ -284,6 +296,11 @@ def available_transports() -> dict[str, str]:
         "h2": "available (HTTP/2 over TLS, requires h2 library)",
         TransportKind.PROXY.value: (
             "available (HTTP/1.1 and h2 through an HTTP proxy list)"
+        ),
+        TransportKind.H3.value: (
+            "available (HTTP/3 over QUIC, requires the aioquic package)"
+            if aioquic_available()
+            else "unavailable: install aioquic (pip install aioquic)"
         ),
         TransportKind.SCAPY.value: scapy_note,
         TransportKind.LINUX_RAW.value: linux_raw_note,

@@ -85,6 +85,10 @@ def supports_profile(kind: TransportKind, profile: ProfileName) -> bool:
         return True
     if kind is TransportKind.H2:
         return profile is ProfileName.HTTP_FLOOD
+    if kind is TransportKind.H3:
+        # HTTP only, and HTTP/3 only: this transport carries QUIC, which is a
+        # UDP protocol that has no raw L3/L4 form to spoof.
+        return profile is ProfileName.HTTP_FLOOD
     if kind is TransportKind.PROXY:
         # TCP only. See TransportKind.PROXY: a proxy tunnel is bound to a
         # connection, so a datagram profile has nothing to tunnel over and would

@@ -181,7 +181,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--profile", choices=ALL_PROFILES, default="udp_flood", help="attack profile (default: udp_flood)")
     parser.add_argument("--pps", type=int, default=5000, help="packets per second (default: 5000)")
     parser.add_argument("--duration", type=float, default=10.0, help="duration in seconds (default: 10)")
-    parser.add_argument("--transport", choices=["socket", "scapy", "linux_raw", "virtual", "h2", "proxy"], default="auto", help="transport type (default: auto)")
+    parser.add_argument("--transport", choices=["socket", "scapy", "linux_raw", "virtual", "h2", "h3", "proxy"], default="auto", help="transport type (default: auto)")
     parser.add_argument("--payload", type=int, default=512, help="payload size in bytes (default: 512)")
     parser.add_argument("--workers", type=int, default=4, help="worker threads (default: 4)")
     parser.add_argument("--spoof-sources", action="store_true", help="spoof source IP (requires --transport scapy + Admin)")
@@ -214,6 +214,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--http2",
         action="store_true",
         help="Use HTTP/2 for http_flood (auto-enabled on port 443; requires h2 library)",
+    )
+    parser.add_argument(
+        "--http3",
+        action="store_true",
+        help=(
+            "Use HTTP/3 over QUIC for http_flood (requires the aioquic package and "
+            "a target that speaks h3). Selects --transport h3, and reports no "
+            "received-bytes figure because UDP is not acknowledged."
+        ),
     )
     parser.add_argument(
         "--h2-concurrency",
@@ -360,6 +369,10 @@ def config_from_args(args: argparse.Namespace) -> RunConfig:
     # HTTP/2 must be explicitly requested; do not auto-enable based on port
     # because the socket transport doesn't support HTTP/2
     use_http2 = args.http2
+    # HTTP/3 is a different transport rather than a flag on the socket one: it
+    # cannot be reached by rewriting a request, and it needs its own package.
+    if getattr(args, "http3", False) and transport == "auto":
+        transport = "h3"
 
     # Clamp before the model sees the values. AttackProfile refuses anything
     # over 65,507 bytes, so a --payload of 1900000 raised a pydantic

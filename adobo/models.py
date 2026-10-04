@@ -60,6 +60,13 @@ class TransportKind(str, Enum):
     cannot be redirected through an HTTP proxy at all.
     """
 
+    H3 = "h3"
+    """HTTP/3 over QUIC. Requires the aioquic package.
+
+    Reports no received-bytes figure: QUIC runs over UDP, and a UDP datagram is
+    not acknowledged, so there is nothing to count.
+    """
+
 
 class ProfileName(str, Enum):
     """Traffic profiles the engine knows how to generate.

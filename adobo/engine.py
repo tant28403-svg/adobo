@@ -967,6 +967,42 @@ class RunEngine:
             f"target's behaviour from the identity it was shown."
         )
 
+    def _h3_note(self) -> str | None:
+        """Disclose that this run spoke HTTP/3, and what that costs in figures.
+
+        Returns the note, or ``None`` for any other transport.
+
+        Two things have to be said, and both are the kind of thing that reads as
+        a working number if it is left out.
+
+        The transport is QUIC over UDP, so a target's defenses ran on a different
+        code path than in a TCP run - per-connection state, protocol detection
+        and any QUIC-specific limit are all in play.
+
+        And there is no received-bytes figure. A UDP datagram is not
+        acknowledged, so nothing on this path can count what arrived; any such
+        number would be invented. It is absent rather than zero-as-in-nothing-was-
+        sent, and the delivery and amplification figures below are correspondingly
+        weaker than they would be for an HTTP/1.1 run against the same target.
+
+        The *sent* bytes are counted, and counted from the datagram endpoint, so
+        they include QUIC and QPACK framing where the HTTP/1.1 path counts payload
+        only. Each figure is honest about what it measures; they are not
+        interchangeable.
+        """
+        if self.config.transport is not TransportKind.H3:
+            return None
+        return (
+            "HTTP/3 over QUIC: requests were sent over UDP with no TCP handshake, "
+            "so the target's defenses ran on a different path than a TCP run and "
+            "the figures below are not directly comparable to one. No received-bytes "
+            "or amplification figure is reported, because UDP is not acknowledged "
+            "and nothing on this path can count what arrived - those values are "
+            "absent, not zero. Bytes sent are counted at the datagram endpoint and "
+            "so include QUIC and header framing, unlike the payload-only count an "
+            "HTTP/1.1 run reports."
+        )
+
     def _proxy_note(self) -> str | None:
         """Disclose that this run's egress was distributed across a proxy pool.
 
@@ -1098,6 +1134,9 @@ class RunEngine:
         preamble = self._h2_preamble_note()
         if preamble is not None:
             notes.append(preamble)
+        h3 = self._h3_note()
+        if h3 is not None:
+            notes.append(h3)
         proxy = self._proxy_note()
         if proxy is not None:
             notes.append(proxy)

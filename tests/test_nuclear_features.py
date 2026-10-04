@@ -320,31 +320,39 @@ class TestTheWizardIsDriven:
     #: tls, payload, spoof
     BASE = {
         "host": "127.0.0.1", "port": "8123", "pps": "100", "duration": "2",
-        "http2": "n", "concurrency": "100", "personas": "", "rotation": "",
-        "preamble": "", "proxy": "", "keep_alive": "n", "tls": "n",
-        "payload": "512", "spoof": "n",
+        "http3": "n", "http2": "n", "concurrency": "100", "personas": "",
+        "rotation": "", "preamble": "", "proxy": "", "keep_alive": "n",
+        "tls": "n", "payload": "512", "spoof": "n",
     }
 
     #: Order the wizard asks in. `concurrency` and `preamble` only appear when
-    #: http2 is on, and `rotation` only when a persona was given, so the script
-    #: is derived from the answers rather than being a fixed list - a fixed list
-    #: desynchronises the moment a question is skipped and then silently answers
-    #: the wrong prompt, which is how these tests failed three times before the
-    #: order was read off the wizard rather than guessed.
+    #: http2 is on, `rotation` only when a persona was given, and http2 is not
+    #: asked at all when http3 is - so the script is derived from the answers
+    #: rather than being a fixed list. A fixed list desynchronises the moment a
+    #: question is skipped and then silently answers the wrong prompt, which is
+    #: how these tests failed several times before the order was read off the
+    #: wizard rather than guessed.
     ORDER = [
-        "host", "port", "pps", "duration", "http2", "concurrency", "personas",
-        "rotation", "preamble", "proxy", "keep_alive", "tls", "payload", "spoof",
+        "host", "port", "pps", "duration", "http3", "http2", "concurrency",
+        "personas", "rotation", "preamble", "proxy", "keep_alive", "tls",
+        "payload", "spoof",
     ]
 
     def _with(self, *, omit: tuple = (), **replacements) -> list[str]:
         values = dict(self.BASE)
         values.update(replacements)
-        http2 = values["http2"] == "y"
+        http3 = values["http3"] == "y"
+        # Asked and enabled are different questions. HTTP/2 is offered whenever
+        # HTTP/3 was declined, but only *enabled* when the answer is yes - and
+        # only then are the concurrency and preamble follow-ups asked at all.
+        http2_asked = not http3
+        http2_on = values["http2"] == "y" and http2_asked
         asked = [
             key
             for key in self.ORDER
             if key not in omit
-            and not (key in ("concurrency", "preamble") and not http2)
+            and not (key == "http2" and not http2_asked)
+            and not (key in ("concurrency", "preamble") and not http2_on)
             and not (key == "rotation" and not values["personas"])
         ]
         return [str(values[key]) for key in asked]

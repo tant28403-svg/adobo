@@ -1535,6 +1535,69 @@ class TestFactory:
         if sys.platform == "linux":
             assert all(report.values())
 
+    def test_a_missing_optional_dependency_does_not_break_the_tool(
+        self, tmp_path
+    ) -> None:
+        """HTTP/3 is the only transport whose package is genuinely optional.
+
+        h2 is not: transports/__init__.py imports http2_transport unconditionally,
+        so a missing h2 takes `import adobo` down with it. aioquic is imported
+        lazily inside functions instead, so a machine without it must still get a
+        working tool and a doctor line that says what to install - not an
+        ImportError on startup.
+
+        Exercised in a subprocess with aioquic blocked at import. In-process
+        blocking would need ``importlib.reload`` of this package, which
+        re-executes it and left the rest of the suite comparing against
+        re-imported enum members - so the contamination was worse than the test.
+        The script goes in a file rather than ``-c`` because shell quoting of a
+        dozen lines of Python is easy to get wrong and hard to read.
+        """
+        import subprocess
+        import sys
+
+        script = tmp_path / "no_aioquic.py"
+        script.write_text(
+            "import sys\n"
+            "from importlib.abc import MetaPathFinder\n"
+            "\n"
+            "class Block(MetaPathFinder):\n"
+            "    def find_spec(self, name, path=None, target=None):\n"
+            "        if name.split('.')[0] == 'aioquic':\n"
+            "            raise ImportError('aioquic blocked for this test')\n"
+            "        return None\n"
+            "\n"
+            "sys.meta_path.insert(0, Block())\n"
+            "\n"
+            "from adobo.models import ProfileName, Target, TransportKind\n"
+            "from adobo.transports import available_transports, supports_profile\n"
+            "from adobo.transports.base import TransportError\n"
+            "from adobo.transports.http3_transport import (\n"
+            "    Http3Transport, aioquic_available,\n"
+            ")\n"
+            "\n"
+            "assert aioquic_available() is False\n"
+            "report = available_transports()[TransportKind.H3.value]\n"
+            "assert 'unavailable' in report, report\n"
+            "assert supports_profile(TransportKind.SOCKET, ProfileName.HTTP_FLOOD)\n"
+            "try:\n"
+            "    Http3Transport(Target(host='127.0.0.1', port=443),\n"
+            "                   ProfileName.HTTP_FLOOD)\n"
+            "except TransportError as exc:\n"
+            "    assert 'aioquic' in str(exc), exc\n"
+            "else:\n"
+            "    raise AssertionError('h3 constructed without aioquic')\n"
+            "print('ok')\n",
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            [sys.executable, str(script)],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        assert "ok" in result.stdout
+
 
 # ---------------------------------------------------------------------------
 # Packaging interaction

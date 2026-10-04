@@ -31,6 +31,11 @@ dependencies = [
 
 [project.optional-dependencies]
 raw = ["scapy>=2.6"]
+# HTTP/3 (--transport h3). Optional in a way h2 is not: every aioquic import in
+# adobo/transports/http3_transport.py is inside a function or a lazy builder, so
+# the tool starts and every other transport works without it. It is declared here
+# rather than left undeclared so a machine that wants h3 has something to install.
+http3 = ["aioquic>=1.0"]
 # The lab target (adobo.target) is a server, not part of the CLI. Kept optional
 # so an operator who only generates load does not pull in a web framework.
 lab = ["fastapi>=0.110", "uvicorn>=0.27"]

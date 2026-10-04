@@ -23,6 +23,7 @@ from .config import config_path, load_lab_config, LAB_CONFIG_NAME
 from .fingerprint import FINGERPRINTS
 from .h2profile import H2_PROFILES
 from .proxies import ProxyListError, load_proxies
+from .transports.http3_transport import aioquic_available
 
 H2_PROFILE_KEYS = tuple(H2_PROFILES)
 @dataclass(frozen=True, slots=True)
@@ -239,10 +240,18 @@ def filter_available_profiles(
         if profile.profile in _CONNECTIONLESS_PROFILES:
             keep.append(profile)
             continue
-        if profile.profile in _TCP_PROFILES:
-            reachable = probe_tcp_port(host, profile.port)
-        else:
+        # Probed by transport, not by profile alone. HTTP_FLOOD rides TCP on the socket
+        # and h2 transports but UDP on h3, so a profile-only lookup TCP-probes an
+        # h3 target, finds nothing listening on TCP, and skips the one profile
+        # the operator actually asked for - which reads as "h3 is unsupported"
+        # rather than as a bug.
+        if (
+            profile.transport is TransportKind.H3
+            or profile.profile not in _TCP_PROFILES
+        ):
             reachable = probe_udp_port(host, profile.port)
+        else:
+            reachable = probe_tcp_port(host, profile.port)
         if reachable:
             keep.append(profile)
         else:
@@ -346,6 +355,7 @@ def build_profiles(
     reflector_ports: dict[str, int] | int,
     enable_spoofing: bool = False,
     use_http2: bool = False,
+    use_http3: bool = False,
     proxy_file: str = "",
 ) -> list[NuclearProfile]:
     """Build the nuclear profiles from wizard input.
@@ -482,7 +492,11 @@ def build_profiles(
             transport=(
                 TransportKind.PROXY
                 if proxy_file
-                else TransportKind.H2 if use_http2 else TransportKind.SOCKET
+                else TransportKind.H3
+                if use_http3
+                else TransportKind.H2
+                if use_http2
+                else TransportKind.SOCKET
             ),
             port=wizard_port,
             spoof=False,
@@ -643,6 +657,7 @@ class NuclearAggregator:
         tls_verify: bool = True,
         use_http2: bool = False,
         h2_concurrency: int = 100,
+        use_http3: bool = False,
         fingerprint: str = "",
         fingerprint_rotation: str = "",
         h2_preamble: str = "",
@@ -664,6 +679,7 @@ class NuclearAggregator:
         self.tls_verify = tls_verify
         self.use_http2 = use_http2
         self.h2_concurrency = h2_concurrency
+        self.use_http3 = use_http3
         # Identity and egress options. Empty strings mean "not requested", which
         # is what keeps a strike that asks for none of these byte-identical to
         # one from before the features existed: the child's AttackProfile falls
@@ -1649,8 +1665,21 @@ def nuclear_wizard(
         )
         duration = float(limits.max_duration_seconds)
 
+    # HTTP/3 for http_flood. Asked before HTTP/2 because it is exclusive with it:
+    # one http_flood profile runs on one transport, and answering yes here means
+    # HTTP/2 is not offered rather than being silently overridden.
+    use_http3 = _ask_yes_no(
+        "Use HTTP/3 (QUIC) for http_flood? (needs the aioquic package and a "
+        "target that speaks h3; reports no received-bytes figure)",
+        default=False,
+    )
+    if use_http3 and not aioquic_available():
+        print("  [!] aioquic is not installed; running HTTP/1.1 instead.")
+        print("      Install it with: pip install aioquic")
+        use_http3 = False
+
     # HTTP/2 for http_flood (requires TLS)
-    use_http2 = _ask_yes_no(
+    use_http2 = False if use_http3 else _ask_yes_no(
         "Use HTTP/2 for http_flood? (requires TLS, enables multiplexing)",
         default=False,
     )
@@ -1738,7 +1767,11 @@ def nuclear_wizard(
         default=False,
     )
     tls_verify = True
-    if use_tls:
+    # Asked for h3 as well as for TLS. QUIC is encrypted unconditionally, so
+    # there is no "no TLS" answer to give - but the *verify* choice still exists,
+    # and leaving it unasked meant an h3 run against a self-signed target failed
+    # with a bare ConnectionError and no way to say so from the wizard.
+    if use_tls or use_http3:
         tls_verify = _ask_yes_no(
             "Verify TLS certificates? (disable for self-signed certs)",
             default=True,
@@ -1779,6 +1812,7 @@ def nuclear_wizard(
         host, port, reflector_ports,
         enable_spoofing=enable_spoofing,
         use_http2=use_http2,
+        use_http3=use_http3,
         proxy_file=chosen_proxy,
     )
 
@@ -1880,6 +1914,7 @@ def nuclear_wizard(
         tls_verify=tls_verify,
         use_http2=use_http2,
         h2_concurrency=h2_concurrency,
+        use_http3=use_http3,
         fingerprint=chosen_fingerprint,
         fingerprint_rotation=chosen_rotation,
         h2_preamble=chosen_preamble,
