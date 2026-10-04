@@ -1749,6 +1749,7 @@ class TestCLIConfigFromArgs:
             h2_concurrency = 100
             fingerprint = "lab_default"
             fingerprint_rotation = "per_connection"
+            h2_preamble = "auto"
             host = "127.0.0.1"
             port = 8000
             transport = "auto"
@@ -1774,6 +1775,7 @@ class TestCLIConfigFromArgs:
             h2_concurrency = 100
             fingerprint = "lab_default"
             fingerprint_rotation = "per_connection"
+            h2_preamble = "auto"
             host = "127.0.0.1"
             port = 443
             transport = "auto"
@@ -1800,6 +1802,7 @@ class TestCLIConfigFromArgs:
             h2_concurrency = 100
             fingerprint = "lab_default"
             fingerprint_rotation = "per_connection"
+            h2_preamble = "auto"
             host = "127.0.0.1"
             port = 8000
             transport = "auto"
@@ -1826,6 +1829,7 @@ class TestCLIConfigFromArgs:
             h2_concurrency = 100
             fingerprint = "lab_default"
             fingerprint_rotation = "per_connection"
+            h2_preamble = "auto"
             host = "127.0.0.1"
             port = 443
             transport = "auto"

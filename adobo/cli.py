@@ -227,6 +227,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--inspect-h2",
+        action="store_true",
+        help=(
+            "measure this run's HTTP/2 connection preamble and exit: sends it to a "
+            "loopback listener, decodes the frames back, and prints declared vs "
+            "observed side by side. Honours --fingerprint and --h2-preamble, and "
+            "sends nothing to the target"
+        ),
+    )
+    parser.add_argument(
         "--nuclear",
         action="store_true",
         help="run the interactive nuclear wizard instead of a single profile",
@@ -250,12 +260,49 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--h2-preamble",
+        default="auto",
+        help=(
+            "HTTP/2 connection preamble to send: auto (default, follow "
+            "--fingerprint), none (leave h2's defaults), or one of: "
+            "h2_library, chrome_131, firefox_133, safari_18. Sets the SETTINGS "
+            "frame, the connection window update and the pseudo-header order; only "
+            "affects --transport h2 and --http2. Changes how much of a browser's "
+            "connection layer is reproduced -- 'adobo --inspect-h2' measures it"
+        ),
+    )
+    parser.add_argument(
         "--work-ms",
         type=int,
         default=None,
         help="simulated database work per /api/data request, in ms (--serve-target)",
     )
     return parser
+
+
+def inspect_h2(args: argparse.Namespace) -> int:
+    """Measure the configured HTTP/2 preamble and print declared vs observed.
+
+    Reached from :func:`main` before any run machinery. Resolves the profile
+    through the same :meth:`AttackProfile.h2_profile` a real run uses, so what is
+    measured here is what a run would send - not a parallel path that could drift
+    from the shipping one.
+    """
+    from .h2inspect import inspect_profile, render_inspection
+
+    attack = AttackProfile(
+        profile=ProfileName(args.profile),
+        fingerprint=args.fingerprint,
+        fingerprint_rotation=args.fingerprint_rotation,
+        h2_preamble=args.h2_preamble,
+    )
+    _say()
+    _say(f"persona: {attack.fingerprint}   preamble: {attack.h2_preamble}")
+    _say()
+    for line in render_inspection(inspect_profile(attack.h2_profile())):
+        _say(line)
+    _say()
+    return EXIT_OK
 
 
 def config_from_args(args: argparse.Namespace) -> RunConfig:
@@ -322,6 +369,7 @@ def config_from_args(args: argparse.Namespace) -> RunConfig:
             h2_concurrency=fields["h2_concurrency"],
             fingerprint=args.fingerprint,
             fingerprint_rotation=args.fingerprint_rotation,
+            h2_preamble=args.h2_preamble,
         ),
         transport=TransportKind(transport),
         defenses=[],
@@ -355,6 +403,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     _print_banner()
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    # Inspecting the HTTP/2 preamble is a measurement, not an attack, so it runs
+    # before the target-serving and wizard branches and reaches neither the run
+    # engine nor the safety guard: it opens a socket to 127.0.0.1 and to nothing
+    # else. Requiring --host here would be wrong - the whole point is to check the
+    # preamble without needing, or wanting, a target.
+    if args.inspect_h2:
+        return inspect_h2(args)
 
     # Serving the target is the other half of the tool, and it is a different job
     # from attacking: nothing here is a flood, so the wizard and the run engine

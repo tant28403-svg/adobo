@@ -966,6 +966,33 @@ class RunEngine:
             f"target's behaviour from the identity it was shown."
         )
 
+    def _h2_preamble_note(self) -> str | None:
+        """Disclose what this run's HTTP/2 connection layer reproduced.
+
+        Returns the note, or ``None`` when no preamble was configured.
+
+        Separate from :meth:`_impersonation_note` because the two answer different
+        questions and have different reach. The impersonation note fires for HTTP
+        and HTTP/2 alike; this one can only fire for HTTP/2, and it has to be
+        candid about *how much* was reproduced rather than that something was.
+        Two of the three profiles cannot send the whole connection preamble -
+        h2 will not emit Firefox's priority tree, and it always adds settings a
+        browser omits - so a note that said only "preamble applied" would overstate
+        it. The profile's own ``incomplete_because`` carries the measured detail
+        and is reproduced here rather than summarised, so the report carries the
+        same words ``--inspect-h2`` shows.
+        """
+        profile = self.config.attack.h2_profile()
+        if profile is None:
+            return None
+        note = (
+            f"HTTP/2 connection preamble: {profile.label} "
+            f"({profile.fingerprint()})."
+        )
+        if profile.incomplete_because:
+            note += f" Incomplete: {profile.incomplete_because}"
+        return note
+
     def _notes(self, reason: CancelReason, cancelled: bool) -> list[str]:
         notes: list[str] = []
         if reason is CancelReason.DEADLINE:
@@ -1013,6 +1040,9 @@ class RunEngine:
         impersonation = self._impersonation_note()
         if impersonation is not None:
             notes.append(impersonation)
+        preamble = self._h2_preamble_note()
+        if preamble is not None:
+            notes.append(preamble)
         if self.config.attack.keep_alive:
             notes.append(
                 "Keep-alive enabled: delivery figures may overcount if the target "

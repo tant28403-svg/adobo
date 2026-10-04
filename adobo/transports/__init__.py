@@ -165,6 +165,7 @@ def get_transport(config: RunConfig) -> Transport:
             send_timeout=2.0,
             connect_timeout=1.0,
             fingerprint=persona,
+            h2_profile=attack.h2_profile(),
         )
 
     if config.transport is TransportKind.SOCKET:
@@ -181,6 +182,7 @@ def get_transport(config: RunConfig) -> Transport:
                 send_timeout=2.0,
                 connect_timeout=1.0,
                 fingerprint=persona,
+                h2_profile=attack.h2_profile(),
             )
         return SocketTransport(
             config.target,

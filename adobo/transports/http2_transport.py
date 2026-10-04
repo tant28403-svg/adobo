@@ -19,6 +19,7 @@ import h2.events
 import h2.errors
 
 from ..fingerprint import Fingerprint
+from ..h2profile import H2Profile, DEFAULT_PSEUDO_HEADER_ORDER
 from ..models import ProfileName, Target, TransportKind
 from .base import PeerUnavailable, Transport, TransportError, supports_profile
 
@@ -81,6 +82,7 @@ class H2Transport(Transport):
         tls_verify: bool = True,
         tcp_path: str = "/api/data",
         fingerprint: Fingerprint | None = None,
+        h2_profile: H2Profile | None = None,
     ) -> None:
         super().__init__(target, profile)
         if not supports_profile(TransportKind.H2, profile):
@@ -103,6 +105,16 @@ class H2Transport(Transport):
         multiplexed connection anyway: every stream on one connection shares one
         identity, which is the same reason ``per_request`` rotation cannot apply
         to HTTP/2.
+        """
+        self._h2_profile = h2_profile
+        """Connection preamble to present, or ``None`` to leave h2's defaults.
+
+        ``None`` is the default and is load-bearing: it means this transport
+        touches nothing about the connection preamble, so a run with no persona
+        configured emits byte-for-byte what it emitted before preambles existed.
+        Not ``H2_PROFILES["h2_library"]``, because naming a profile would make it
+        reachable by a typo and would imply the default is a chosen identity
+        rather than the absence of one.
         """
 
         self._sock: socket.socket | None = None
@@ -156,7 +168,26 @@ class H2Transport(Transport):
                 header_encoding='utf-8',
             )
             self._conn = h2.connection.H2Connection(config=config)
+
+            # Must precede initiate_connection(): that call is what serialises
+            # local_settings into the single SETTINGS frame, and it is the only
+            # point at which those values can be influenced. See the ordering
+            # constraints documented on H2Profile.apply - calling
+            # update_settings() here instead would emit frames ahead of the
+            # PRI * HTTP/2.0 magic and produce a preface the peer rejects.
+            if self._h2_profile is not None:
+                self._h2_profile.apply(self._conn)
+
             self._conn.initiate_connection()
+
+            # After initiating, for the same reason: increment_flow_control_window
+            # emits immediately, and anything emitted before the magic is a
+            # malformed preface.
+            if self._h2_profile is not None:
+                increment = self._h2_profile.window_increment()
+                if increment:
+                    self._conn.increment_flow_control_window(increment)
+
             self._sock.sendall(self._conn.data_to_send())
 
             # Wait for SETTINGS acknowledged
@@ -228,17 +259,30 @@ class H2Transport(Transport):
                 self._drain_responses()
 
         stream_id = self._conn.get_next_available_stream_id()
-        headers = [
-            (':method', 'GET'),
-            (':path', self.tcp_path),
-            (':authority', self.target.host),
-            (':scheme', 'https'),
+        # Pseudo-header order is a fingerprint signal in its own right, and it is
+        # the one component of the preamble that lives here rather than in
+        # open(): it is decided per stream, not per connection.
+        #
+        # RFC 9113 requires pseudo-headers to precede ordinary headers and every
+        # name to be lowercase, and the h2 library enforces both - but it fixes
+        # no order *among* the pseudo-headers, so this is where the choice is
+        # made. That is why this transport cannot reuse an HTTP/1.1 header block
+        # verbatim, and why a persona's canonical-case names are lowercased here
+        # rather than stored twice in both cases where the two copies could drift.
+        pseudo_values = {
+            ':method': 'GET',
+            ':path': self.tcp_path,
+            ':authority': self.target.host,
+            ':scheme': 'https',
+        }
+        order = (
+            self._h2_profile.pseudo_header_order
+            if self._h2_profile is not None
+            else DEFAULT_PSEUDO_HEADER_ORDER
+        )
+        headers: list[tuple[str, str]] = [
+            (name, pseudo_values[name]) for name in order
         ]
-        # Pseudo-headers must precede ordinary ones and every name must be
-        # lowercase: RFC 9113 requires it and the h2 library enforces it. That is
-        # why this transport cannot reuse an HTTP/1.1 header block verbatim, and
-        # why a persona's canonical-case names are lowercased here rather than
-        # stored twice in both cases where the two copies could drift.
         #
         # With no persona the identity stays the self-identifying
         # "adobo-h2-flood", which is unchanged from before personas existed. This
@@ -282,7 +326,14 @@ class H2Transport(Transport):
         except (ConnectionResetError, BrokenPipeError, ssl.SSLError):
             self._teardown()
         finally:
-            self._sock.settimeout(self.send_timeout)
+            # Guarded because both handlers above tear the connection down, which
+            # sets _sock to None - so a peer that closes mid-drain would otherwise
+            # turn a clean disconnect into an AttributeError raised from the
+            # finally block, replacing the teardown with a traceback. That masks
+            # the real cause and propagates out of send_one, where the engine counts
+            # it as a worker error rather than as the connection ending.
+            if self._sock is not None:
+                self._sock.settimeout(self.send_timeout)
 
         # Check for stream timeouts
         self._check_stream_timeouts()

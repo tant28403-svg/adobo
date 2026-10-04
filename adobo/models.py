@@ -21,6 +21,11 @@ from .fingerprint import (
     resolve_rotation,
     rotate as rotate_personas,
 )
+from .h2profile import (
+    H2Profile,
+    h2_profile as resolve_h2_profile,
+    h2_profile_for_persona,
+)
 
 # --------------------------------------------------------------------------
 # Enumerations
@@ -179,6 +184,35 @@ class AttackProfile(BaseModel):
         resolve_rotation(value)  # raises ValueError listing the valid modes
         return value
 
+    h2_preamble: str = Field(default="auto")
+    """Which HTTP/2 connection preamble to send, or ``auto`` to follow the persona.
+
+    A persona describes the request; this describes the connection the request
+    travels on. See :mod:`adobo.h2profile`.
+
+    ``auto`` is the default and resolves to the preamble matching
+    :attr:`fingerprint` when a persona is configured, and to *no change at all*
+    when it is not. The second half is the important one: a run with no persona
+    emits byte-for-byte what it emitted before preambles existed, and an
+    impersonating run does not accidentally pair a Chrome User-Agent with a
+    preamble no Chrome sends.
+
+    Set to ``none`` to force the untouched default even when impersonating, which
+    is occasionally useful for testing a detector that keys on the connection
+    layer alone.
+    """
+
+    @field_validator("h2_preamble")
+    @classmethod
+    def _h2_preamble_must_exist(cls, value: str) -> str:
+        # ``none`` is a key too, in the sense that it is a choice: "leave the
+        # preamble alone". Listed separately because it is not a profile name and
+        # must not appear in the "choose from" list, which lists profiles.
+        if value in ("auto", "none"):
+            return value
+        resolve_h2_profile(value)  # raises ValueError listing the valid keys
+        return value
+
     def persona_keys(self) -> list[str]:
         """The configured personas, in the order given."""
         return [part.strip() for part in self.fingerprint.split(",") if part.strip()]
@@ -214,6 +248,38 @@ class AttackProfile(BaseModel):
         if seed is None:
             return resolve_persona(keys[0])
         return rotate_personas(keys, seed)
+
+    def h2_profile(self) -> H2Profile | None:
+        """Resolve the HTTP/2 connection preamble, or ``None`` to leave it alone.
+
+        ``None`` is the meaningful answer, not a failure. It is what a run with no
+        persona gets, and it means the transport touches nothing about the
+        connection preamble so the bytes are unchanged.
+
+        Only meaningful for HTTP/2. Other transports have no SETTINGS frame to
+        change, so asking for a preamble with them is a configuration error
+        rather than a no-op - see ``--h2-preamble`` validation.
+        """
+        if self.h2_preamble == "auto":
+            persona = self.persona()
+            if persona is None:
+                return None
+            return h2_profile_for_persona(persona.key)
+        if self.h2_preamble == "none":
+            return None
+        return resolve_h2_profile(self.h2_preamble)
+
+    def h2_preamble_incomplete_because(self) -> str | None:
+        """Why this run's preamble is not a complete reproduction, if it is not.
+
+        Returns ``None`` when the resolved preamble reproduces everything it
+        claims. Surfaced by the report and by ``--inspect-h2`` so that a run which
+        reproduces a browser's settings and its window but not its priority tree
+        says which of the three it managed, rather than leaving the reader to
+        assume all three.
+        """
+        profile = self.h2_profile()
+        return profile.incomplete_because if profile else None
 
     def clamped(self, **overrides: Any) -> "AttackProfile":
         """Return a copy with fields replaced. Used by the safety layer."""
@@ -457,5 +523,39 @@ class RunResult(BaseModel):
     def duration_actual_s(self) -> float:
         return (self.finished_at - self.started_at).total_seconds()
 
+    def impersonation_summary(self) -> dict[str, Any] | None:
+        """What identity the run presented, or ``None`` for the honest lab client.
+
+        Recorded in the JSON report as data rather than only as prose in ``notes``,
+        so two saved runs can be compared without re-reading their text. ``None``
+        and an empty dict are different answers - "presented as itself" is not the
+        same claim as "presented as something else, and here is what".
+
+        Includes the HTTP/2 preamble, because impersonation here spans two layers:
+        a persona changes the request headers and, for HTTP/2, the connection
+        preamble as well. Reporting only the headers would understate what was
+        faked on exactly the runs where it matters most.
+        """
+        if not self.config.attack.impersonates():
+            return None
+        attack = self.config.attack
+        preamble = attack.h2_profile()
+        return {
+            "personas": [
+                key for key in attack.persona_keys()
+                if key != DEFAULT_FINGERPRINT_KEY
+            ],
+            "rotation": attack.fingerprint_rotation,
+            "h2_preamble": preamble.key if preamble else None,
+            "h2_fingerprint": preamble.fingerprint() if preamble else None,
+            "h2_incomplete_because": preamble.incomplete_because if preamble else None,
+        }
+
     def to_json_dict(self) -> dict[str, Any]:
-        return self.model_dump(mode="json")
+        data = self.model_dump(mode="json")
+        # The identity a run presented is a property of the result, not of the
+        # config it was asked for - a rotating run has many personas and the
+        # config only names the set. Computed here so a saved report records what
+        # was actually sent rather than what was requested.
+        data["impersonation"] = self.impersonation_summary()
+        return data
