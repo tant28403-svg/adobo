@@ -37,12 +37,14 @@ requires.
 from __future__ import annotations
 
 import asyncio
+import time
+from dataclasses import dataclass
 from typing import Any, ClassVar
 
 from ..models import AttackProfile, ProfileName, Target, TransportKind
 from .base import Transport, TransportError, supports_profile
 
-__all__ = ["Http3Transport", "aioquic_available"]
+__all__ = ["H3Probe", "Http3Transport", "aioquic_available", "h3_probe"]
 
 DEFAULT_CONNECT_TIMEOUT = 5.0
 """Seconds for the QUIC handshake, which includes several round trips.
@@ -94,6 +96,7 @@ def _client_protocol_class() -> Any:
 
     from aioquic.asyncio.protocol import QuicConnectionProtocol
     from aioquic.h3.connection import H3Connection
+    from aioquic.h3.events import HeadersReceived
     from aioquic.quic.events import ProtocolNegotiated
 
     class _H3ClientProtocol(QuicConnectionProtocol):
@@ -103,6 +106,10 @@ def _client_protocol_class() -> Any:
             super().__init__(*args, **kwargs)
             self.http: Any = None
             self.bytes_sent = 0
+            # Status per stream, for the prober. Without this the prober cannot
+            # tell a 200 from a 503, and an availability figure that cannot see
+            # the status code is not measuring availability.
+            self.status_by_stream: dict[int, int] = {}
 
         def connection_made(self, transport: Any) -> None:
             """Count the bytes that actually leave the process.
@@ -135,16 +142,153 @@ def _client_protocol_class() -> Any:
             if isinstance(event, ProtocolNegotiated):
                 self.http = H3Connection(self._quic)
             if self.http is not None:
-                # Consumed and discarded. The replies are deliberately not
-                # counted: a UDP datagram is not acknowledged, so a response
-                # tally would be a count of what this process happened to receive
-                # rather than anything the target confirmed. See the module
-                # docstring on why no received-bytes figure is reported.
-                for _event in self.http.handle_event(event):
-                    pass
+                # Status codes are recorded; the bodies and the event count are
+                # not. A UDP datagram is not acknowledged, so a tally of what
+                # this process happened to receive is not a count of anything the
+                # target confirmed. The status is different: it is the target
+                # stating how it is doing, which is the one thing availability
+                # actually means.
+                for h3_event in self.http.handle_event(event):
+                    if isinstance(h3_event, HeadersReceived):
+                        fields = dict(h3_event.headers)
+                        try:
+                            self.status_by_stream[h3_event.stream_id] = int(
+                                fields.get(b":status", b"0")
+                            )
+                        except (TypeError, ValueError):
+                            pass
 
     _CLIENT_PROTOCOL = _H3ClientProtocol
     return _CLIENT_PROTOCOL
+
+
+@dataclass(frozen=True)
+class H3Probe:
+    """The outcome of one HTTP/3 availability probe.
+
+    ``ok`` follows the same rule as the httpx prober: a status under 500 counts
+    as available. ``error`` is None for a status under 400, matching
+    :meth:`adobo.engine.RunEngine._single_probe`, so a 503 reads the same way
+    whichever protocol produced it.
+    """
+
+    ok: bool
+    status_code: int | None
+    latency_ms: float
+    error: str | None
+
+
+async def h3_probe(
+    host: str,
+    port: int,
+    path: str,
+    *,
+    timeout: float,
+    tls_verify: bool = True,
+) -> H3Probe:
+    """One HTTP/3 GET against *host*, for the availability prober.
+
+    Without this, an h3 run is probed over HTTP/1.1 on TCP against a target that
+    only speaks QUIC. Windows blackholes that connection rather than refusing it,
+    so the probe times out, the run reports 0% availability, and a target
+    serving perfectly scores 0/100. That is the tool making a confident false
+    claim about a live machine, which is worse than reporting nothing at all.
+
+    One connection per probe. Reusing one would be faster, but the prober exists
+    to answer "is it up right now", and a held connection keeps answering from a
+    state that may predate the load - it would report availability long after the
+    target stopped serving. An h2 connection's 100 streams do not buy much either
+    at a probe interval measured in hundreds of milliseconds.
+    """
+    import ssl
+
+    from aioquic.asyncio import connect
+    from aioquic.h3.connection import H3_ALPN
+    from aioquic.quic.configuration import QuicConfiguration
+
+    started = time.perf_counter()
+    config = QuicConfiguration(
+        is_client=True,
+        alpn_protocols=H3_ALPN,
+        verify_mode=ssl.CERT_REQUIRED if tls_verify else ssl.CERT_NONE,
+        server_name=host,
+    )
+    manager = connect(host, port, configuration=config,
+                      create_protocol=_client_protocol_class())
+    try:
+        protocol = await asyncio.wait_for(manager.__aenter__(), timeout=timeout)
+    except asyncio.TimeoutError:
+        await _close_probe(manager)
+        return H3Probe(False, None, _elapsed_ms(started),
+                       f"ConnectTimeout: no HTTP/3 handshake within {timeout:g}s")
+    except Exception as exc:  # noqa: BLE001 - aioquic raises broadly
+        await _close_probe(manager)
+        detail = str(exc).strip() or f"{type(exc).__name__} with no detail"
+        return H3Probe(False, None, _elapsed_ms(started),
+                       f"{type(exc).__name__}: {detail}")
+
+    try:
+        h3 = getattr(protocol, "http", None)
+        if h3 is None:
+            return H3Probe(False, None, _elapsed_ms(started),
+                           "no HTTP/3: the target negotiated QUIC but not h3")
+        stream_id = 0
+        h3.send_headers(
+            stream_id=stream_id,
+            headers=_probe_headers(host, port, path),
+            end_stream=True,
+        )
+        protocol.transmit()
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while stream_id not in protocol.status_by_stream:
+            if loop.time() >= deadline:
+                return H3Probe(
+                    False, None, _elapsed_ms(started),
+                    f"ReadTimeout: no HTTP/3 response within {timeout:g}s",
+                )
+            await asyncio.sleep(0.005)
+
+        status = protocol.status_by_stream[stream_id]
+        return H3Probe(
+            ok=status < 500,
+            status_code=status,
+            latency_ms=_elapsed_ms(started),
+            error=None if status < 400 else f"HTTP {status}",
+        )
+    finally:
+        await _close_probe(manager)
+
+
+def _probe_headers(host: str, port: int, path: str) -> list[tuple[bytes, bytes]]:
+    """The prober's request headers.
+
+    No persona and no accept header: this is the tool checking whether the target
+    is alive, not a request meant to look like anything. It uses the same
+    self-identifying agent as every other h3 request so a log that shows one
+    cannot be mistaken for the other.
+    """
+    authority = host if port == 443 else f"{host}:{port}"
+    return [
+        (b":method", b"GET"),
+        (b":authority", authority.encode("ascii", "ignore")),
+        (b":scheme", b"https"),
+        (b":path", path.encode("ascii", "ignore") or b"/"),
+        (b"user-agent", DEFAULT_USER_AGENT.encode("latin-1", "replace")),
+    ]
+
+
+async def _close_probe(manager: Any) -> None:
+    """Leave a half-open probe connection. Never raises."""
+    try:
+        await manager.__aexit__(None, None, None)
+    except Exception:  # noqa: BLE001 - teardown must not raise
+        pass
+
+
+def _elapsed_ms(started: float) -> float:
+    return round((time.perf_counter() - started) * 1000, 2)
 
 
 def aioquic_available() -> bool:

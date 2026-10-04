@@ -15,7 +15,11 @@ must stay absent rather than becoming a plausible-looking number.
 from __future__ import annotations
 
 import asyncio
+import subprocess
+import sys
+import tempfile
 import threading
+from pathlib import Path
 
 import pytest
 
@@ -392,6 +396,187 @@ class TestPersonasAndDefaults:
         )
         headers = {name: value for name, value in h3_server.requests[before]}
         assert headers[b"user-agent"] == persona.user_agent.encode()
+
+
+class TestProbing:
+    """The prober has to speak the protocol the load used.
+
+    An h3 run probed over HTTP/1.1 on TCP asks a question a QUIC-only target
+    cannot answer. Windows blackholes that connection rather than refusing it, so
+    the probe timed out, availability read 0%, and a target that had answered
+    1,200 requests was graded 0/100. These tests exist so that cannot come back.
+    """
+
+    def test_a_probe_reaches_an_h3_target(self, h3_server) -> None:
+        from adobo.transports.http3_transport import h3_probe
+
+        probe = asyncio.run(
+            h3_probe("127.0.0.1", h3_server.port, "/healthz",
+                     timeout=5.0, tls_verify=False)
+        )
+        assert probe.ok is True
+        assert probe.status_code == 200
+        assert probe.error is None
+        assert probe.latency_ms >= 0
+
+    def test_a_dead_port_is_a_failed_probe_not_a_crash(self) -> None:
+        from adobo.transports.http3_transport import h3_probe
+
+        probe = asyncio.run(
+            h3_probe("127.0.0.1", 9, "/healthz", timeout=1.0, tls_verify=False)
+        )
+        assert probe.ok is False
+        assert probe.error
+
+    def test_an_h3_run_reports_a_real_availability_figure(self, h3_server) -> None:
+        """The whole point: a healthy h3 target must not read as 0%."""
+        from adobo.engine import RunEngine
+
+        config = RunConfig(
+            target=Target(host="127.0.0.1", port=h3_server.port),
+            attack=AttackProfile(
+                profile=ProfileName.HTTP_FLOOD,
+                pps=20,
+                duration_seconds=1.0,
+                payload_size=128,
+                workers=1,
+                tls_verify=False,
+            ),
+            transport=TransportKind.H3,
+        )
+        outcome = RunEngine(config).run()
+        stats = outcome.result.probe
+        assert stats.total > 0, "no probes were recorded for an h3 run"
+        assert stats.succeeded > 0, (
+            f"an h3 target that answered had {stats.succeeded} of "
+            f"{stats.total} probes succeed"
+        )
+        assert stats.availability_pct > 0, (
+            f"an h3 target that answered was reported at "
+            f"{stats.availability_pct}% availability"
+        )
+
+    def test_the_note_cannot_claim_h3_probing_that_did_not_happen(self) -> None:
+        """The note must describe what ran, not what the transport implies.
+
+        The disclosure originally derived its wording from the transport kind, so
+        an h3 run probed over TCP still said "measured over HTTP/3" - a second
+        false claim, printed next to a 0% that came from the wrong protocol.
+        """
+        from adobo.engine import RunEngine
+
+        config = RunConfig(
+            target=Target(host="127.0.0.1", port=9),
+            attack=AttackProfile(
+                profile=ProfileName.HTTP_FLOOD,
+                pps=20,
+                duration_seconds=0.4,
+                payload_size=128,
+                workers=1,
+                tls_verify=False,
+            ),
+            transport=TransportKind.H3,
+        )
+        engine = RunEngine(config)
+        # Force the TCP prober without needing a live target for it.
+        engine._probe_protocol = "http/1.1"
+        note = engine._h3_note()
+        assert note is not None
+        assert "measured over HTTP/3" not in note, note
+        assert "No HTTP/3 probe was made" in note, note
+
+    def test_the_note_says_how_availability_was_measured(self, h3_server) -> None:
+        from adobo.engine import RunEngine
+
+        config = RunConfig(
+            target=Target(host="127.0.0.1", port=h3_server.port),
+            attack=AttackProfile(
+                profile=ProfileName.HTTP_FLOOD,
+                pps=20,
+                duration_seconds=0.6,
+                payload_size=128,
+                workers=1,
+                tls_verify=False,
+            ),
+            transport=TransportKind.H3,
+        )
+        notes = RunEngine(config).run().result.notes
+        assert any(
+            "measured over HTTP/3" in n for n in notes
+        ), notes
+
+    def test_a_tcp_prober_would_have_reported_zero_here(self, h3_server) -> None:
+        """Pins *why* this fix exists rather than just that it works.
+
+        Asserts the httpx prober cannot see the target, so a future change that
+        quietly routes h3 runs back through TCP fails here instead of silently
+        reintroducing the false 0%.
+        """
+        async def _tcp_probe() -> float | None:
+            import httpx
+
+            timeout = httpx.Timeout(1.0)
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                try:
+                    response = await client.get(
+                        f"http://127.0.0.1:{h3_server.port}/healthz"
+                    )
+                    return float(response.status_code)
+                except Exception:  # noqa: BLE001 - any failure is the point
+                    return None
+
+        assert asyncio.run(_tcp_probe()) is None, (
+            "the TCP prober can now reach the h3 target, so the h3 prober is "
+            "no longer the thing making this measurement"
+        )
+
+    def test_a_missing_aioquic_reports_unmeasured_not_zero(self) -> None:
+        """A missing package must never become a claim about the target.
+
+        Recording failing probes because the prober could not run would turn an
+        absent dependency into 0% availability and a 0/100 score for a machine
+        that may be perfectly healthy.
+        """
+        import subprocess
+        import sys
+
+        script = (
+            "import sys\n"
+            "from importlib.abc import MetaPathFinder\n"
+            "class Block(MetaPathFinder):\n"
+            "    def find_spec(self, name, path=None, target=None):\n"
+            "        if name.split('.')[0] == 'aioquic':\n"
+            "            raise ImportError('blocked')\n"
+            "        return None\n"
+            "sys.meta_path.insert(0, Block())\n"
+            "from adobo.engine import RunEngine\n"
+            "from adobo.models import (\n"
+            "    AttackProfile, ProfileName, RunConfig, Target, TransportKind,\n"
+            ")\n"
+            "config = RunConfig(\n"
+            "    target=Target(host='127.0.0.1', port=8443),\n"
+            "    attack=AttackProfile(\n"
+            "        profile=ProfileName.HTTP_FLOOD, pps=10,\n"
+            "        duration_seconds=0.3, payload_size=128, workers=1,\n"
+            "        tls_verify=False,\n"
+            "    ),\n"
+            "    transport=TransportKind.H3,\n"
+            ")\n"
+            "outcome = RunEngine(config).run()\n"
+            "stats = outcome.result.probe\n"
+            "notes = outcome.result.notes\n"
+            "assert stats.total == 0, stats.total\n"
+            "assert any('unmeasured' in n or 'aioquic' in n for n in notes), notes\n"
+            "print('ok')\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "no_aioquic_probe.py"
+            path.write_text(script, encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, str(path)], capture_output=True, text=True
+            )
+        assert result.returncode == 0, result.stderr
+        assert "ok" in result.stdout
 
 
 class TestDisclosure:

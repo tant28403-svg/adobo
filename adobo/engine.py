@@ -219,6 +219,14 @@ class RunEngine:
         self._worker_errors: list[BaseException] = []
         self._peer_unavailable: str | None = None
         self._setup_error: str | None = None
+        # Set when the prober could not run at all, as distinct from running and
+        # failing. The two produce different reports: one has no availability
+        # figure, the other has a figure that says the target was down.
+        self._probe_unavailable: str | None = None
+        # What actually probed, recorded rather than assumed. The disclosure note
+        # reads this, because deriving it from the transport kind is how the note
+        # came to claim HTTP/3 probing for a run that had used the TCP prober.
+        self._probe_protocol: str | None = None
         self._abandoned = False
         self._abandon_hook: Callable[[], None] | None = None
 
@@ -735,6 +743,10 @@ class RunEngine:
         means the prober can never be starved by a short deadline and leave the
         report claiming an unmeasured run scored well.
         """
+        if self.config.transport is TransportKind.H3:
+            await self._probe_availability_h3()
+            return
+        self._probe_protocol = "http/1.1"
         timeout = httpx.Timeout(self.probe_timeout_s)
         async with httpx.AsyncClient(timeout=timeout) as client:
             while not self.controller.should_stop():
@@ -743,6 +755,52 @@ class RunEngine:
                 self._emit_snapshot()
                 if await self._sleep_until_stop(self.probe_interval_s):
                     return
+
+    async def _probe_availability_h3(self) -> None:
+        """Probe over HTTP/3, in the same protocol the run is generating.
+
+        An h3 run probed over HTTP/1.1 on TCP asks a question the target cannot
+        answer. Windows blackholes that connection rather than refusing it, so the
+        probe times out, availability reads 0%, and a target that served every
+        request scores 0/100. Measured, not hypothesised: the h3 end-to-end run
+        reported `availability 0.0%` and `resilience 0.0 / 100` against a target
+        that had answered 1,200 requests.
+
+        Records nothing when aioquic is absent. An empty probe list already means
+        "unmeasured" in the report, and inventing failing probes would convert a
+        missing dependency into a claim about the target.
+        """
+        from .transports.http3_transport import aioquic_available, h3_probe
+
+        if not aioquic_available():
+            self._probe_unavailable = (
+                "aioquic is not installed, so no HTTP/3 probe could be made and "
+                "availability is unmeasured for this run."
+            )
+            return
+
+        self._probe_protocol = "h3"
+        tls_verify = getattr(self.config.attack, "tls_verify", True)
+        while not self.controller.should_stop():
+            probe = await h3_probe(
+                self.config.target.host,
+                self.config.target.port,
+                self.probe_path,
+                timeout=self.probe_timeout_s,
+                tls_verify=tls_verify,
+            )
+            self._probes.append(
+                ProbeResult(
+                    t=round(self.controller.elapsed, 3),
+                    ok=probe.ok,
+                    status_code=probe.status_code,
+                    latency_ms=probe.latency_ms,
+                    error=probe.error,
+                )
+            )
+            self._emit_snapshot()
+            if await self._sleep_until_stop(self.probe_interval_s):
+                return
 
     async def _single_probe(self, client: Any) -> ProbeResult:
         t = round(self.controller.elapsed, 3)
@@ -989,9 +1047,30 @@ class RunEngine:
         they include QUIC and QPACK framing where the HTTP/1.1 path counts payload
         only. Each figure is honest about what it measures; they are not
         interchangeable.
+
+        Availability *is* measured for an h3 run - the prober speaks HTTP/3, the
+        same protocol the load used - so the figure is meaningful where a TCP
+        probe against a QUIC-only target would have timed out and reported 0% for
+        a machine that was serving fine.
         """
         if self.config.transport is not TransportKind.H3:
             return None
+        if self._probe_protocol == "h3":
+            probed = (
+                "Availability was measured over HTTP/3, the same protocol as the "
+                "load, so the figure is meaningful here rather than the 0% a TCP "
+                "probe against a QUIC-only target produces."
+            )
+        elif self._probe_unavailable is not None:
+            probed = self._probe_unavailable
+        else:
+            # The transport is h3 but nothing recorded probing over it. Stating
+            # what actually happened is the only honest option; guessing would
+            # put "measured over HTTP/3" next to a figure that was not.
+            probed = (
+                "No HTTP/3 probe was made, so the availability figure below came "
+                "from another protocol and is not comparable to a QUIC target."
+            )
         return (
             "HTTP/3 over QUIC: requests were sent over UDP with no TCP handshake, "
             "so the target's defenses ran on a different path than a TCP run and "
@@ -999,8 +1078,8 @@ class RunEngine:
             "or amplification figure is reported, because UDP is not acknowledged "
             "and nothing on this path can count what arrived - those values are "
             "absent, not zero. Bytes sent are counted at the datagram endpoint and "
-            "so include QUIC and header framing, unlike the payload-only count an "
-            "HTTP/1.1 run reports."
+            f"so include QUIC and header framing, unlike the payload-only count an "
+            f"HTTP/1.1 run reports. {probed}"
         )
 
     def _proxy_note(self) -> str | None:
