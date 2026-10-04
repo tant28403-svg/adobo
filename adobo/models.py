@@ -52,6 +52,14 @@ class TransportKind(str, Enum):
     H2 = "h2"
     """HTTP/2 over TLS with multiplexed streams. Requires h2 library."""
 
+    PROXY = "proxy"
+    """HTTP flood tunnelled through a rotating pool of HTTP proxies.
+
+    Per connection, because a tunnel belongs to a connection. TCP profiles
+    only: a UDP datagram has no connection to carry a tunnel, and a raw packet
+    cannot be redirected through an HTTP proxy at all.
+    """
+
 
 class ProfileName(str, Enum):
     """Traffic profiles the engine knows how to generate.
@@ -299,6 +307,14 @@ class RunConfig(BaseModel):
     defenses: list[DefenseName] = Field(default_factory=list)
     dry_run: bool = False
     label: str = ""
+    proxy_file: str = ""
+    """Path to a proxy list, for TransportKind.PROXY.
+
+    Lives on the run config rather than the attack profile because it describes
+    where egress goes, alongside ``transport``, rather than how hard the run
+    pushes. Empty means no proxies, which keeps every existing call site that
+    builds a RunConfig unchanged.
+    """
 
 
 # --------------------------------------------------------------------------

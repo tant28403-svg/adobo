@@ -139,15 +139,26 @@ class H2Transport(Transport):
             ctx.verify_mode = ssl.CERT_NONE
         return ctx
 
+    def _open_tcp_socket(self) -> socket.socket:
+        """Connect to the target and return the raw, un-TLSed socket.
+
+        Split out of :meth:`open` so a transport that routes the connection
+        elsewhere can replace the connect without duplicating the twenty lines
+        of HTTP/2 setup that follow it. The proxy transport returns a socket
+        with its CONNECT tunnel already established; everything after this call
+        is unchanged, because after a tunnel is up the bytes are the same bytes.
+        """
+        return socket.create_connection(
+            (self.target.host, self.target.port),
+            timeout=self.connect_timeout
+        )
+
     def open(self) -> None:
         if self._open:
             return
         try:
             # TCP connect
-            raw_sock = socket.create_connection(
-                (self.target.host, self.target.port),
-                timeout=self.connect_timeout
-            )
+            raw_sock = self._open_tcp_socket()
             raw_sock.settimeout(self.send_timeout)
 
             # TLS with ALPN

@@ -133,13 +133,37 @@ class SocketTransport(Transport):
 
     # -- lifecycle ---------------------------------------------------------
 
+    def _connect_endpoint(self) -> tuple[str, int]:
+        """The address a new connection is actually opened to.
+
+        The target, unless a subclass routes it elsewhere. ProxyTransport
+        overrides this to return the next proxy from its pool, which is the
+        whole of what makes a connection proxied - everything after the connect
+        is unchanged, because once the tunnel is up the bytes are the same bytes.
+
+        Deliberately not :meth:`_address`, which is where payloads are *sent*.
+        For a UDP profile those are different sockets and the destination stays
+        the target; conflating them would send UDP at the proxy.
+        """
+        return (self.target.host, self.target.port)
+
+    def _after_connect(self) -> None:
+        """Negotiate anything the peer requires before the socket is usable.
+
+        A no-op for a direct connection. ProxyTransport uses it for the CONNECT
+        handshake, which must complete before the TLS wrap below it - so this
+        runs inside the same try, and a rejected tunnel is a setup failure
+        rather than a TLS error about the wrong peer.
+        """
+
     def open(self) -> None:
         if self._open:
             return
+        host, port = self._connect_endpoint()
         try:
             infos = socket.getaddrinfo(
-                self.target.host,
-                self.target.port,
+                host,
+                port,
                 type=socket.SOCK_STREAM if self._using_tcp else socket.SOCK_DGRAM,
             )
         except socket.gaierror as exc:
@@ -165,6 +189,11 @@ class SocketTransport(Transport):
                 pass
             if self._using_tcp:
                 self._connect(sockaddr)
+                # Between the TCP connect and the TLS wrap, because a tunnel has
+                # to exist before either can happen: wrapping a proxy socket
+                # would present the target's certificate to the proxy and
+                # complete a TLS session with the wrong peer entirely.
+                self._after_connect()
                 # Wrap with TLS after successful TCP connect
                 if self.use_tls:
                     self._tls_context = self._build_tls_context()

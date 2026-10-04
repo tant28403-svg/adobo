@@ -13,6 +13,7 @@ from __future__ import annotations
 import sys
 
 from ..models import ProfileName, RunConfig, TransportKind
+from ..proxies import ProxyListError, ProxyPool, require_proxies, shared_pool
 from .base import (
     SOCKET_CAPABLE_PROFILES,
     PeerUnavailable,
@@ -22,6 +23,7 @@ from .base import (
     build_payload,
     supports_profile,
 )
+from .proxy_transport import ProxyH2Transport, ProxyTransport
 from .scapy_transport import (
     RawCapability,
     ScapyTransport,
@@ -36,6 +38,10 @@ from .virtual_transport import VirtualTransport
 
 __all__ = [
     "PeerUnavailable",
+    "ProxyH2Transport",
+    "ProxyListError",
+    "ProxyPool",
+    "ProxyTransport",
     "RawCapability",
     "SOCKET_CAPABLE_PROFILES",
     "ScapyTransport",
@@ -52,6 +58,7 @@ __all__ = [
     "import_scapy",
     "linux_raw_capability",
     "raw_capability",
+    "require_proxies",
     "scapy_available",
     "supports_profile",
 ]
@@ -155,6 +162,38 @@ def get_transport(config: RunConfig) -> Transport:
     # own self-identifying default rather than as a request to invent one.
     persona = config.attack.persona()
 
+    if config.transport is TransportKind.PROXY:
+        # Loaded here rather than in the transport so a missing or empty list is
+        # a setup failure before any worker exists, rather than N identical
+        # errors from N workers a moment later. shared_pool() so every worker
+        # draws from one rotation - see its docstring for why that matters.
+        pool = shared_pool(config.proxy_file or None)
+        attack = config.attack
+        if getattr(attack, "use_http2", False):
+            return ProxyH2Transport(
+                config.target,
+                profile,
+                pool=pool,
+                concurrency=getattr(attack, "h2_concurrency", 100),
+                tls_verify=getattr(attack, "tls_verify", True),
+                send_timeout=2.0,
+                connect_timeout=1.0,
+                fingerprint=persona,
+                h2_profile=attack.h2_profile(),
+            )
+        # No `fingerprint` here: SocketTransport builds its persona per request
+        # from the attack profile rather than being handed one, so passing it
+        # would be a TypeError rather than a default.
+        return ProxyTransport(
+            config.target,
+            profile,
+            pool=pool,
+            keep_alive=attack.keep_alive,
+            use_tls=attack.use_tls,
+            tls_verify=getattr(attack, "tls_verify", True),
+            sndbuf=65536,
+        )
+
     if config.transport is TransportKind.H2:
         attack = config.attack
         return H2Transport(
@@ -243,6 +282,9 @@ def available_transports() -> dict[str, str]:
         TransportKind.VIRTUAL.value: "always available (no sockets opened)",
         TransportKind.SOCKET.value: "available (standard UDP/TCP sockets)",
         "h2": "available (HTTP/2 over TLS, requires h2 library)",
+        TransportKind.PROXY.value: (
+            "available (HTTP/1.1 and h2 through an HTTP proxy list)"
+        ),
         TransportKind.SCAPY.value: scapy_note,
         TransportKind.LINUX_RAW.value: linux_raw_note,
     }

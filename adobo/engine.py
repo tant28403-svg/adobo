@@ -56,6 +56,7 @@ from .models import (
 )
 from .monitor import ResourceMonitor, process_for_pid
 from .observation import TargetObserver, refused_connection
+from .proxies import ProxyListError, shared_pool
 from .safety import SafetyGuard
 from .transports import (
     PeerUnavailable,
@@ -966,6 +967,60 @@ class RunEngine:
             f"target's behaviour from the identity it was shown."
         )
 
+    def _proxy_note(self) -> str | None:
+        """Disclose that this run's egress was distributed across a proxy pool.
+
+        Returns the note, or ``None`` when the run did not use proxies.
+
+        For the same reason as :meth:`_impersonation_note`: a run through a
+        thousand proxies and a run from one address exercise entirely different
+        target code, because per-IP rate limits, connection caps and reputation
+        blocking only exist in the second case. A resilience score that does not
+        say which one produced it invites the reader to compare them directly,
+        and the comparison is meaningless.
+
+        Silence is the signal. A direct run produces no note at all, so "this run
+        did not rotate" is distinguishable from "this run rotated and the tool did
+        not say".
+
+        Reports the *distinct* proxies reached rather than the hand-outs. A pool
+        of one handed out 10,000 times also reports 10,000 hand-outs and would
+        read as a working rotation while being the exact single-source run this
+        feature exists to avoid.
+        """
+        if self.config.transport is not TransportKind.PROXY:
+            return None
+        try:
+            pool = shared_pool(self.config.proxy_file or None)
+        except ProxyListError as exc:
+            # Setup failed before any transport existed, so this is only
+            # reachable if the list disappeared between construction and here.
+            return f"Proxy list could not be read: {exc}"
+
+        size = len(pool)
+        reached = pool.distinct_used
+        scope = (
+            "one proxy per connection"
+            if self.config.attack.keep_alive
+            else "one proxy per request"
+        )
+        coverage = (
+            f"every proxy in the pool was used ({reached} of {size})"
+            if reached >= size
+            else (
+                f"only {reached} of {size} proxies were reached - the run ended "
+                f"before rotating through the list, so this measures a smaller "
+                f"set of source addresses than the pool holds"
+            )
+        )
+        return (
+            f"Proxy rotation: {scope}, {coverage} ({pool.used:,} connections "
+            f"tunnelled). Traffic arrived from those source addresses rather "
+            f"than this machine's, so per-IP rate limiting and connection caps "
+            f"were in play. Compare against a --transport socket run to separate "
+            f"the target's behaviour from the number of distinct sources."
+        )
+
     def _h2_preamble_note(self) -> str | None:
         """Disclose what this run's HTTP/2 connection layer reproduced.
 
@@ -1043,6 +1098,9 @@ class RunEngine:
         preamble = self._h2_preamble_note()
         if preamble is not None:
             notes.append(preamble)
+        proxy = self._proxy_note()
+        if proxy is not None:
+            notes.append(proxy)
         if self.config.attack.keep_alive:
             notes.append(
                 "Keep-alive enabled: delivery figures may overcount if the target "

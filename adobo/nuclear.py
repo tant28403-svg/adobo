@@ -20,6 +20,11 @@ from .observation import TargetObserver, refused_connection
 from .safety import PolicyViolation, SafetyGuard
 from .transports import raw_capability
 from .config import config_path, load_lab_config, LAB_CONFIG_NAME
+from .fingerprint import FINGERPRINTS
+from .h2profile import H2_PROFILES
+from .proxies import ProxyListError, load_proxies
+
+H2_PROFILE_KEYS = tuple(H2_PROFILES)
 @dataclass(frozen=True, slots=True)
 class NuclearProfile:
     """Configuration for one profile in the nuclear strike."""
@@ -341,6 +346,7 @@ def build_profiles(
     reflector_ports: dict[str, int] | int,
     enable_spoofing: bool = False,
     use_http2: bool = False,
+    proxy_file: str = "",
 ) -> list[NuclearProfile]:
     """Build the nuclear profiles from wizard input.
 
@@ -364,6 +370,12 @@ def build_profiles(
     These must be reflectors the operator controls. Without a valid reflector
     on the correct port, amplification profiles will only send requests at
     low rate with no amplification.
+
+    *proxy_file*, when set, routes the http_flood profile through that list.
+    Every other profile keeps its own transport: they are UDP floods,
+    amplification queries or raw L3/L4 packets, and an HTTP CONNECT tunnel can
+    carry none of them. The wizard says which profiles are affected so a
+    partially-distributed strike is not read as a wholly distributed one.
     """
     # Normalize reflector_ports to a dict
     if isinstance(reflector_ports, int):
@@ -461,7 +473,17 @@ def build_profiles(
         NuclearProfile(
             name="http_flood",
             profile=ProfileName.HTTP_FLOOD,
-            transport=TransportKind.H2 if use_http2 else TransportKind.SOCKET,
+            # PROXY selects ProxyH2Transport or ProxyTransport in the factory
+            # based on use_http2, which rides on the AttackProfile rather than
+            # here. Only this profile is proxied: every other one below is UDP or
+            # a raw packet, and neither can be carried by an HTTP tunnel. Saying
+            # so in the wizard is better than quietly leaving nine profiles
+            # unproxied in a run the operator believes is entirely distributed.
+            transport=(
+                TransportKind.PROXY
+                if proxy_file
+                else TransportKind.H2 if use_http2 else TransportKind.SOCKET
+            ),
             port=wizard_port,
             spoof=False,
             requires_admin=False,
@@ -621,6 +643,10 @@ class NuclearAggregator:
         tls_verify: bool = True,
         use_http2: bool = False,
         h2_concurrency: int = 100,
+        fingerprint: str = "",
+        fingerprint_rotation: str = "",
+        h2_preamble: str = "",
+        proxy_file: str = "",
     ):
         self.profiles = profiles
         self.target_ip = target_ip
@@ -638,6 +664,14 @@ class NuclearAggregator:
         self.tls_verify = tls_verify
         self.use_http2 = use_http2
         self.h2_concurrency = h2_concurrency
+        # Identity and egress options. Empty strings mean "not requested", which
+        # is what keeps a strike that asks for none of these byte-identical to
+        # one from before the features existed: the child's AttackProfile falls
+        # back to its own defaults, and RunConfig treats "" as no proxy list.
+        self.fingerprint = fingerprint
+        self.fingerprint_rotation = fingerprint_rotation
+        self.h2_preamble = h2_preamble
+        self.proxy_file = proxy_file
 
         # Use spawn context for Windows compatibility
         self._ctx = mp.get_context('spawn')
@@ -1281,13 +1315,36 @@ class NuclearAggregator:
                     tls_verify=self.tls_verify,
                     use_http2=self.use_http2,
                     h2_concurrency=self.h2_concurrency,
+                    # Spread with the model defaults so a strike that asked for
+                    # none of them builds exactly the AttackProfile it built
+                    # before these options existed. Passing "" here would fail
+                    # the persona validator instead.
+                    **self._identity_options(),
                 ),
                 transport=profile.transport,
                 defenses=[],
                 label=self._label(profile),
+                proxy_file=self.proxy_file if profile.transport is TransportKind.PROXY else "",
             )
             configs.append(config)
         return configs
+
+    def _identity_options(self) -> dict[str, str]:
+        """Only the identity options that were actually requested.
+
+        A wizard that does not ask about personas must produce a run that
+        impersonates nothing, and the way to guarantee that is to leave the
+        field out entirely rather than to pass an empty string and hope the
+        default wins.
+        """
+        options: dict[str, str] = {}
+        if self.fingerprint:
+            options["fingerprint"] = self.fingerprint
+        if self.fingerprint_rotation:
+            options["fingerprint_rotation"] = self.fingerprint_rotation
+        if self.h2_preamble:
+            options["h2_preamble"] = self.h2_preamble
+        return options
 
     def run(self) -> int:
         """Execute the nuclear strike."""
@@ -1395,6 +1452,78 @@ def _read_stats(
     return asyncio.run(observer.read(timeout=timeout))
 
 
+def _ask_choice(
+    prompt: str,
+    choices: list[str],
+    *,
+    default: str,
+    preset: str | None = None,
+    choices_label: str = "choices",
+) -> str:
+    """Ask for one of *choices*, re-asking until the answer is one of them.
+
+    A preset - the value a command-line flag already supplied - is stated and
+    used without prompting, but is still validated: a flag carrying a bad value
+    should fail here where the operator can see it, not silently fall back to the
+    default and produce a run that differs from the one they asked for.
+
+    An empty preset means "no preset". Tested explicitly, because `is not None`
+    was the original test and it turned an unset value into a preset of "",
+    which is not in any choice list and so aborted the wizard before it asked
+    anything.
+    """
+    if preset:
+        if preset not in choices:
+            raise ValueError(
+                f"{preset!r} is not a valid choice; pick one of: "
+                + ", ".join(choices)
+            )
+        print(f"{prompt}: {preset} (from the command line)")
+        return preset
+    print(f"  {choices_label}: {', '.join(choices)}")
+    while True:
+        answer = _ask(prompt, default)
+        if answer in choices:
+            return answer
+        print(f"  {answer!r} is not one of the {choices_label}")
+
+
+def _ask_optional_str(
+    prompt: str,
+    *,
+    preset: str | None = None,
+    choices: list[str] | None = None,
+    choices_label: str = "choices",
+) -> str:
+    """Ask for a free-text value where blank means "no".
+
+    *choices*, when given, validates the answer against a fixed set the same way
+    :func:`_ask_choice` does. Blank is always allowed and always means "no",
+    because every caller uses this for an optional feature and a wizard that
+    forces an answer to an optional question is a wizard that cannot be answered
+    "no" without typing something meaningless.
+    """
+    if preset:
+        print(f"{prompt}: {preset} (from the command line)")
+        return preset
+    if choices:
+        print(f"  {choices_label}: {', '.join(choices)}")
+    while True:
+        # _ask is given "" rather than None on purpose: its signature treats None
+        # as "this question has no default, so keep asking", which made a blank
+        # answer loop forever with 'a value is required' and made an optional
+        # question impossible to decline. "" is a real default, so a blank answer
+        # returns "" and the caller sees "no".
+        answer = _ask(prompt, "")
+        if not answer:
+            return ""
+        if not choices or answer in choices:
+            return answer
+        if "," in answer and all(part.strip() in choices for part in answer.split(",")):
+            return answer
+        print(f"  {answer!r} is not one of the {choices_label}; blank to skip")
+
+
 def _ask(prompt: str, default: str | None = None) -> str:
     suffix = f" [{default}]" if default else ""
     while True:
@@ -1472,8 +1601,21 @@ def _ask_yes_no(prompt: str, default: bool) -> bool:
         print("  Please answer 'y' or 'n'")
 
 
-def nuclear_wizard() -> int:
-    """Interactive wizard for nuclear mode."""
+def nuclear_wizard(
+    *,
+    fingerprint: str | None = None,
+    fingerprint_rotation: str | None = None,
+    h2_preamble: str | None = None,
+    proxy_file: str | None = None,
+) -> int:
+    """Interactive wizard for nuclear mode.
+
+    The four keyword arguments are values the caller already has - the matching
+    command-line flags. Passing one skips the matching question and states what
+    was chosen, because a flag the wizard silently ignores is worse than a flag
+    the wizard does not have: the operator typed it, saw the wizard ask about
+    something else, and reasonably concluded the two are unrelated.
+    """
     print("\n=== Nuclear Strike ===")
     host = _ask("Target IP")
     port = _ask_int("Port (for TCP/UDP profiles)", 80)
@@ -1517,6 +1659,72 @@ def nuclear_wizard() -> int:
         h2_concurrency = _ask_int_bounded(
             "HTTP/2 concurrent streams per connection", 100, 1, 1000, "model limit"
         )
+
+    # Identity and egress. Each is a single question with a "no" default, so a
+    # strike that answers no to all four is byte-identical to one from before
+    # these features existed - which is the point of asking rather than
+    # defaulting them on.
+    # Named distinctly from the parameters on purpose. Assigning to the parameter
+    # names before reading them as presets silently discards whatever the caller
+    # passed, and the wizard then announces a value the operator never chose.
+    chosen_fingerprint = _ask_optional_str(
+        "Client personas for http_flood (comma-separated, blank = none)",
+        preset=fingerprint,
+        choices=list(FINGERPRINTS),
+        choices_label="personas",
+    )
+    chosen_rotation = ""
+    if chosen_fingerprint:
+        chosen_rotation = _ask_choice(
+            "  Rotate personas",
+            ["per_connection", "per_request", "none"],
+            default="per_connection",
+            preset=fingerprint_rotation,
+        )
+
+    chosen_preamble = ""
+    if use_http2:
+        # Only meaningful on the connection layer, so only asked when http_flood
+        # is actually speaking h2. `auto` follows the persona, which is what
+        # keeps an impersonating strike from pairing a Chrome User-Agent with a
+        # preamble no Chrome sends.
+        chosen_preamble = _ask_choice(
+            "  HTTP/2 connection preamble",
+            ["auto", "none", *H2_PROFILE_KEYS],
+            default="auto",
+            preset=h2_preamble,
+            choices_label="preambles",
+        )
+
+    chosen_proxy = _ask_optional_str(
+        "Proxy list for http_flood (path, blank = none)",
+        preset=proxy_file,
+    )
+    if chosen_proxy:
+        # Load it here rather than letting ten children each discover it is
+        # missing, and so the operator learns the list is empty before a strike
+        # rather than during one. Note chosen_proxy, not the proxy_file
+        # parameter: reading the parameter here loaded None whenever the answer
+        # came from the prompt rather than from a flag, which is the only way
+        # most operators will ever supply it.
+        try:
+            found = load_proxies(chosen_proxy)
+        except ProxyListError as exc:
+            print(f"  [!] {exc}")
+            found = []
+        if found:
+            authenticated = sum(1 for p in found if p.needs_auth)
+            detail = f", {authenticated} authenticated" if authenticated else ""
+            print(
+                f"  Loaded {len(found)} prox{'y' if len(found) == 1 else 'ies'}{detail}."
+            )
+            print(
+                "  Only http_flood is proxied: the other profiles are UDP floods, "
+                "amplification queries or raw packets, which no HTTP tunnel can carry."
+            )
+        else:
+            print("  [!] That list has no usable entries; http_flood will run direct.")
+            chosen_proxy = ""
 
     # HTTP/1.1 keep-alive
     keep_alive = _ask_yes_no(
@@ -1571,6 +1779,7 @@ def nuclear_wizard() -> int:
         host, port, reflector_ports,
         enable_spoofing=enable_spoofing,
         use_http2=use_http2,
+        proxy_file=chosen_proxy,
     )
 
     if not (is_admin and parent_raw):
@@ -1671,6 +1880,10 @@ def nuclear_wizard() -> int:
         tls_verify=tls_verify,
         use_http2=use_http2,
         h2_concurrency=h2_concurrency,
+        fingerprint=chosen_fingerprint,
+        fingerprint_rotation=chosen_rotation,
+        h2_preamble=chosen_preamble,
+        proxy_file=chosen_proxy,
     )
 
     return aggregator.run()

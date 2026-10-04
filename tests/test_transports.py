@@ -1505,7 +1505,12 @@ class TestFactory:
         assert isinstance(transport, Transport)
         assert transport.is_open is False
 
-    def test_every_transport_reports_its_kind(self) -> None:
+    def test_every_transport_reports_its_kind(self, tmp_path) -> None:
+        # PROXY is the one kind that cannot be constructed from nothing: the
+        # factory refuses an absent or empty list at setup, so that a missing
+        # file is one clear error rather than N identical worker errors.
+        proxies = tmp_path / "proxies.txt"
+        proxies.write_text("127.0.0.1:8888\n", encoding="utf-8")
         for kind in TransportKind:
             # LINUX_RAW is Linux-only; skip on Windows
             if kind is TransportKind.LINUX_RAW and sys.platform != "linux":
@@ -1515,7 +1520,8 @@ class TestFactory:
                 if supports_profile(kind, ProfileName.UDP_FLOOD)
                 else next(p for p in ProfileName if supports_profile(kind, p))
             )
-            transport = get_transport(make_config(kind, profile))
+            extra = {"proxy_file": str(proxies)} if kind is TransportKind.PROXY else {}
+            transport = get_transport(make_config(kind, profile, **extra))
             assert transport.kind is kind
             assert transport.describe()["transport"] == kind.value
 

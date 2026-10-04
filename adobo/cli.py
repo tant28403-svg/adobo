@@ -11,7 +11,12 @@ from typing import Sequence
 from pyfiglet import Figlet
 
 from .engine import EngineHooks, RunEngine, RunOutcome
+from .fingerprint import DEFAULT_FINGERPRINT_KEY
 from .models import AttackProfile, ProfileName, RunConfig, Target, TransportKind
+
+DEFAULT_ROTATION = "per_connection"
+"""Parser default for --fingerprint-rotation, named so nuclear mode can tell an
+unset flag from a deliberate ``--fingerprint-rotation per_connection``."""
 from .nuclear import nuclear_wizard
 from .safety import PolicyViolation, SafetyGuard
 from .wizard import wizard
@@ -176,10 +181,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--profile", choices=ALL_PROFILES, default="udp_flood", help="attack profile (default: udp_flood)")
     parser.add_argument("--pps", type=int, default=5000, help="packets per second (default: 5000)")
     parser.add_argument("--duration", type=float, default=10.0, help="duration in seconds (default: 10)")
-    parser.add_argument("--transport", choices=["socket", "scapy", "linux_raw", "virtual", "h2"], default="auto", help="transport type (default: auto)")
+    parser.add_argument("--transport", choices=["socket", "scapy", "linux_raw", "virtual", "h2", "proxy"], default="auto", help="transport type (default: auto)")
     parser.add_argument("--payload", type=int, default=512, help="payload size in bytes (default: 512)")
     parser.add_argument("--workers", type=int, default=4, help="worker threads (default: 4)")
     parser.add_argument("--spoof-sources", action="store_true", help="spoof source IP (requires --transport scapy + Admin)")
+    parser.add_argument(
+        "--proxy-file",
+        metavar="PATH",
+        default="",
+        help=(
+            "Proxy list for --transport proxy: one per line as host:port or "
+            "user:pass@host:port. Rotates per connection, so without "
+            "--keep-alive that is one proxy per request. TCP profiles only."
+        ),
+    )
     parser.add_argument(
         "--keep-alive",
         action="store_true",
@@ -208,7 +223,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--fingerprint",
-        default="lab_default",
+        default=DEFAULT_FINGERPRINT_KEY,
         help=(
             "client identity to present for http_flood/slowloris; comma-separated "
             "to rotate through several. One of: lab_default (self-identifying, "
@@ -219,7 +234,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--fingerprint-rotation",
         choices=["none", "per_request", "per_connection"],
-        default="per_connection",
+        default=DEFAULT_ROTATION,
         help=(
             "when to change persona (default: per_connection). A persona belongs "
             "to a connection, so per_connection is the realistic default; "
@@ -308,10 +323,21 @@ def inspect_h2(args: argparse.Namespace) -> int:
 def config_from_args(args: argparse.Namespace) -> RunConfig:
     profile = ProfileName(args.profile)
 
+    # Read once with a default, because callers that build a Namespace by hand
+    # (and several tests do) predate this flag and have no such attribute.
+    proxy_file = getattr(args, "proxy_file", "") or ""
+
     # Auto-select transport
     transport = args.transport
     if transport == "auto":
-        if args.profile in SCAPY_REQUIRED_PROFILES:
+        # A proxy list is an explicit request to distribute, so it wins over the
+        # profile-driven choice below. Otherwise `udp_flood --proxy-file` would
+        # silently pick scapy - which cannot be proxied at all - and the operator
+        # would get a raw-socket flood from their own address while believing it
+        # was routed through their list.
+        if proxy_file:
+            transport = "proxy"
+        elif args.profile in SCAPY_REQUIRED_PROFILES:
             transport = "scapy"
         elif args.profile in LINUX_RAW_PROFILES:
             transport = "linux_raw"
@@ -374,6 +400,7 @@ def config_from_args(args: argparse.Namespace) -> RunConfig:
         transport=TransportKind(transport),
         defenses=[],
         label="cli run",
+        proxy_file=proxy_file,
     )
 
 
@@ -433,9 +460,33 @@ def main(argv: Sequence[str] | None = None) -> int:
     # Nuclear mode with no --host, or when asked for explicitly. The wizard is
     # interactive, so it reads stdin; a Ctrl-C inside it is a normal way to back
     # out and is handled here rather than left to escape as a traceback.
+    #
+    # The identity and egress flags are forwarded rather than dropped. Nuclear
+    # mode spawns a child per profile and rebuilds its own AttackProfile, so a
+    # flag that is only read in config_from_args would be silently discarded
+    # here - the operator would type --fingerprint chrome_131, watch the wizard
+    # run ten profiles, and have no reason to suspect the persona never applied.
     if args.nuclear or not args.host:
         try:
-            exit_code = nuclear_wizard()
+            exit_code = nuclear_wizard(
+                # argparse defaults are non-empty, so passing them through
+                # unchanged would make every `--nuclear` run announce
+                # "lab_default (from the command line)" and skip the question
+                # the operator actually came to answer. Only a value that
+                # differs from the parser default counts as deliberate.
+                fingerprint=(
+                    None
+                    if args.fingerprint == DEFAULT_FINGERPRINT_KEY
+                    else args.fingerprint
+                ),
+                fingerprint_rotation=(
+                    None
+                    if args.fingerprint_rotation == DEFAULT_ROTATION
+                    else args.fingerprint_rotation
+                ),
+                h2_preamble=None if args.h2_preamble == "auto" else args.h2_preamble,
+                proxy_file=args.proxy_file or None,
+            )
         except KeyboardInterrupt:
             # Same code as an interrupted run, so a caller can treat "the
             # operator stopped this" as one condition however it was stopped.

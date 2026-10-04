@@ -85,6 +85,11 @@ def supports_profile(kind: TransportKind, profile: ProfileName) -> bool:
         return True
     if kind is TransportKind.H2:
         return profile is ProfileName.HTTP_FLOOD
+    if kind is TransportKind.PROXY:
+        # TCP only. See TransportKind.PROXY: a proxy tunnel is bound to a
+        # connection, so a datagram profile has nothing to tunnel over and would
+        # silently send from the local address instead.
+        return profile is ProfileName.HTTP_FLOOD
     return profile in SOCKET_CAPABLE_PROFILES
 
 
