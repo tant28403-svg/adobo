@@ -153,6 +153,7 @@ _TCP_PROFILES = frozenset(
         ProfileName.ACK_FLOOD_NS,
         ProfileName.HTTP_FLOOD,
         ProfileName.SLOWLORIS,
+        ProfileName.RAPID_RESET,
     }
 )
 
@@ -479,6 +480,19 @@ def build_profiles(
             port=wizard_port,
             spoof=raw_spoof,
             requires_admin=raw_requires_admin,
+        ),
+        NuclearProfile(
+            name="rapid_reset",
+            profile=ProfileName.RAPID_RESET,
+            # Same HTTP/2 connection as http_flood and the same conditions: it
+            # needs TLS and an h2-capable target, and it is refused outright by
+            # supports_profile on any transport that cannot speak h2. Added as
+            # its own profile rather than a flag on http_flood so a strike that
+            # runs it can be told apart from one that did not.
+            transport=TransportKind.H2,
+            port=wizard_port,
+            spoof=False,
+            requires_admin=False,
         ),
         NuclearProfile(
             name="http_flood",
@@ -1767,11 +1781,26 @@ def nuclear_wizard(
         default=False,
     )
     tls_verify = True
-    # Asked for h3 as well as for TLS. QUIC is encrypted unconditionally, so
-    # there is no "no TLS" answer to give - but the *verify* choice still exists,
-    # and leaving it unasked meant an h3 run against a self-signed target failed
-    # with a bare ConnectionError and no way to say so from the wizard.
-    if use_tls or use_http3:
+    # Asked for h3 and h2 as well as for TLS. Both speak TLS unconditionally -
+    # QUIC is encrypted by definition and HTTP/2 here always goes through a TLS
+    # wrap - so there is no "no TLS" answer to give, but the *verify* choice still
+    # exists. Leaving it unasked meant a strike against a self-signed target
+    # failed with a bare handshake error and no way to say so from the wizard.
+    # rapid_reset speaks h2 whether or not HTTP/2 was chosen for http_flood, so
+    # this is asked whenever the strike will use TLS at all - not unconditionally,
+    # because a prompt whose answer never changes is a step to skip.
+    # Asked on every strike, because every strike now speaks TLS: rapid_reset is part
+    # of the profile list unconditionally and rides HTTP/2 over TLS whether or
+    # not HTTP/2 was chosen for http_flood. Gating the question on use_tls or
+    # use_http2 meant the tool decided "verify" for a profile the operator was
+    # never asked about, and a strike against a self-signed target failed at the
+    # handshake with no way to say otherwise from the wizard.
+    #
+    # This is one extra prompt on every nuclear run, which is a change to the
+    # flow. The default is Yes, so pressing Enter keeps the previous behaviour
+    # exactly, and it is asked last among the HTTP questions so it does not
+    # disturb the shape of the ones before it.
+    if True:
         tls_verify = _ask_yes_no(
             "Verify TLS certificates? (disable for self-signed certs)",
             default=True,

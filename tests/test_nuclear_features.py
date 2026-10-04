@@ -322,20 +322,20 @@ class TestTheWizardIsDriven:
         "host": "127.0.0.1", "port": "8123", "pps": "100", "duration": "2",
         "http3": "n", "http2": "n", "concurrency": "100", "personas": "",
         "rotation": "", "preamble": "", "proxy": "", "keep_alive": "n",
-        "tls": "n", "payload": "512", "spoof": "n",
+        "tls": "n", "verify": "y", "payload": "512", "spoof": "n",
     }
 
     #: Order the wizard asks in. `concurrency` and `preamble` only appear when
-    #: http2 is on, `rotation` only when a persona was given, and http2 is not
-    #: asked at all when http3 is - so the script is derived from the answers
-    #: rather than being a fixed list. A fixed list desynchronises the moment a
-    #: question is skipped and then silently answers the wrong prompt, which is
-    #: how these tests failed several times before the order was read off the
-    #: wizard rather than guessed.
+    #: http2 is on, `rotation` only when a persona was given, http2 is not asked
+    #: at all when http3 is, and `verify` appears whenever the strike will speak
+    #: TLS at all - so the script is derived from the answers rather than being a
+    #: fixed list. A fixed list desynchronises the moment a question is skipped and
+    #: then silently answers the wrong prompt, which is how these tests failed
+    #: several times before the order was read off the wizard rather than guessed.
     ORDER = [
         "host", "port", "pps", "duration", "http3", "http2", "concurrency",
         "personas", "rotation", "preamble", "proxy", "keep_alive", "tls",
-        "payload", "spoof",
+        "verify", "payload", "spoof",
     ]
 
     def _with(self, *, omit: tuple = (), **replacements) -> list[str]:
@@ -412,6 +412,50 @@ class TestTheWizardIsDriven:
         )
         assert captured["use_http2"] is True
         assert captured["h2_preamble"] == "safari_18"
+
+    def test_http2_asks_about_certificate_verification(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """HTTP/2 here always goes through TLS, so the verify choice applies.
+
+        rapid_reset rides HTTP/2 whether or not HTTP/2 was chosen for http_flood,
+        so a strike can speak TLS without having answered yes to anything. The
+        verify question is what lets that operator say no to verification.
+        """
+        captured = _scripted_wizard(
+            monkeypatch, self._with(http2="y", verify="n"), tmp_path
+        )
+        assert captured["tls_verify"] is False
+
+    def test_a_plain_strike_is_still_asked_about_verification(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """Because every strike now speaks TLS, via rapid_reset.
+
+        Gating this question on use_tls or use_http2 left the tool silently
+        choosing "verify" for a profile the operator was never asked about, and a
+        strike against a self-signed target failed at the handshake with nothing
+        to change. The default stays Yes, so pressing Enter keeps the old
+        behaviour.
+        """
+        captured = _scripted_wizard(monkeypatch, self._with(), tmp_path)
+        assert captured["tls_verify"] is True
+
+    def test_the_verify_answer_reaches_the_children(self, monkeypatch, tmp_path) -> None:
+        """Declining it has to actually reach each child's AttackProfile."""
+        captured = _scripted_wizard(
+            monkeypatch, self._with(verify="n"), tmp_path
+        )
+        assert captured["tls_verify"] is False
+        aggregator = NuclearAggregator(
+            profiles=captured["profiles"],
+            target_ip="127.0.0.1",
+            pps=100,
+            duration=1.0,
+            tls_verify=captured["tls_verify"],
+        )
+        configs = aggregator._build_configs()
+        assert all(c.attack.tls_verify is False for c in configs)
 
 
 # ---------------------------------------------------------------------------

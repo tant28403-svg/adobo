@@ -87,7 +87,8 @@ class H2Transport(Transport):
         super().__init__(target, profile)
         if not supports_profile(TransportKind.H2, profile):
             raise TransportError(
-                f"HTTP/2 transport only supports http_flood profile, got {profile.value!r}"
+                f"HTTP/2 transport only supports http_flood and rapid_reset "
+                f"profiles, got {profile.value!r}"
             )
         self.send_timeout = send_timeout
         self.connect_timeout = connect_timeout
@@ -270,16 +271,42 @@ class H2Transport(Transport):
                 self._drain_responses()
 
         stream_id = self._conn.get_next_available_stream_id()
-        # Pseudo-header order is a fingerprint signal in its own right, and it is
-        # the one component of the preamble that lives here rather than in
-        # open(): it is decided per stream, not per connection.
-        #
-        # RFC 9113 requires pseudo-headers to precede ordinary headers and every
-        # name to be lowercase, and the h2 library enforces both - but it fixes
-        # no order *among* the pseudo-headers, so this is where the choice is
-        # made. That is why this transport cannot reuse an HTTP/1.1 header block
-        # verbatim, and why a persona's canonical-case names are lowercased here
-        # rather than stored twice in both cases where the two copies could drift.
+        self._conn.send_headers(
+            stream_id, self._build_stream_headers(), end_stream=True
+        )
+        self._streams[stream_id] = StreamState(
+            stream_id=stream_id,
+            state="headers_sent",
+            started_at=time.monotonic()
+        )
+        self._count_attempt()
+        self._sock.sendall(self._conn.data_to_send())
+
+        # Try to get response immediately
+        self._drain_responses()
+
+    def _build_stream_headers(self) -> list[tuple[str, str]]:
+        """The header block for one request stream.
+
+        Extracted from :meth:`send_one` so a subclass can reuse it verbatim. The
+        contents are unchanged and the order is unchanged - the http_flood wire
+        output is byte-identical to before this method existed, which is what
+        lets the existing preamble tests stand as the regression guard for it.
+
+        Pseudo-header order is a fingerprint signal in its own right, and it is
+        the one component of the preamble that lives here rather than in
+        open(): it is decided per stream, not per connection.
+
+        RFC 9113 requires pseudo-headers to precede ordinary headers and every
+        name to be lowercase, and the h2 library enforces both - but it fixes no
+        order *among* the pseudo-headers, so this is where the choice is made.
+        That is why this transport cannot reuse an HTTP/1.1 header block
+        verbatim, and why a persona's canonical-case names are lowercased here
+        rather than stored twice in both cases where the two copies could drift.
+
+        With no persona the identity stays the self-identifying
+        "adobo-h2-flood", which is unchanged from before personas existed.
+        """
         pseudo_values = {
             ':method': 'GET',
             ':path': self.tcp_path,
@@ -294,29 +321,13 @@ class H2Transport(Transport):
         headers: list[tuple[str, str]] = [
             (name, pseudo_values[name]) for name in order
         ]
-        #
-        # With no persona the identity stays the self-identifying
-        # "adobo-h2-flood", which is unchanged from before personas existed. This
-        # transport builds its own headers and ignores the payload the engine
-        # hands it, so the persona arrives at construction instead.
         if self._persona is not None:
             headers.extend(
                 (name.lower(), value) for name, value in self._persona.headers
             )
         else:
             headers.append(('user-agent', 'adobo-h2-flood'))
-
-        self._conn.send_headers(stream_id, headers, end_stream=True)
-        self._streams[stream_id] = StreamState(
-            stream_id=stream_id,
-            state="headers_sent",
-            started_at=time.monotonic()
-        )
-        self._count_attempt()
-        self._sock.sendall(self._conn.data_to_send())
-
-        # Try to get response immediately
-        self._drain_responses()
+        return headers
 
     def _drain_responses(self) -> None:
         """Read and process incoming frames."""

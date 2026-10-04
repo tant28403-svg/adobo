@@ -84,7 +84,10 @@ def supports_profile(kind: TransportKind, profile: ProfileName) -> bool:
     if kind is TransportKind.VIRTUAL or kind is TransportKind.SCAPY or kind is TransportKind.LINUX_RAW:
         return True
     if kind is TransportKind.H2:
-        return profile is ProfileName.HTTP_FLOOD
+        # http_flood and rapid_reset both speak HTTP/2 over the same connection;
+        # they differ only in what happens after the HEADERS frame. Both are HTTP
+        # profiles, so both are refused here rather than half-supported.
+        return profile in (ProfileName.HTTP_FLOOD, ProfileName.RAPID_RESET)
     if kind is TransportKind.H3:
         # HTTP only, and HTTP/3 only: this transport carries QUIC, which is a
         # UDP protocol that has no raw L3/L4 form to spoof.
@@ -586,6 +589,14 @@ def build_payload(
         return _http_request(
             host, path, size, seed, keep_alive=keep_alive, fingerprint=fingerprint
         )
+
+    if profile is ProfileName.RAPID_RESET:
+        # Unreachable in practice: this transport builds its own header block,
+        # exactly as H2Transport does for http_flood, and ignores the payload
+        # entirely. A filler rather than an HTTP/1.1 request so that anything
+        # reading the payload for this profile learns there is no such thing
+        # rather than being handed a byte string that is never sent.
+        return _filler(size, seed)
 
     return _filler(size, seed)
 

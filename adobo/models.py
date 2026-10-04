@@ -90,6 +90,14 @@ class ProfileName(str, Enum):
     SSDP_AMPLIFICATION = "ssdp_amplification"
     HTTP_FLOOD = "http_flood"
     SLOWLORIS = "slowloris"
+    RAPID_RESET = "rapid_reset"
+    """CVE-2023-44487: open an HTTP/2 stream, cancel it immediately, repeat.
+
+    A regression test rather than a load test. A patched server absorbs it and
+    the run's job is to confirm that; an unpatched one degrades under a load the
+    sender barely pays for. Delivery is not measurable here - the requests are
+    cancelled, so the target's served-request count stays near zero by design.
+    """
 
 
 class DefenseName(str, Enum):

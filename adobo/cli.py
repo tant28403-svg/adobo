@@ -149,6 +149,13 @@ LINUX_RAW_PROFILES = {
     "syn_flood_ns", "icmp_flood_ns", "ack_flood_ns", "udp_flood_ns",
 }
 
+# Profiles that require an HTTP/2 transport. rapid_reset is here because it is
+# the same protocol as http_flood - only the frame after HEADERS differs - so it
+# needs the h2 transport rather than a socket one.
+H2_REQUIRED_PROFILES = {
+    "rapid_reset",
+}
+
 # Profiles that use amplification and should auto-enable spoofing
 AMPLIFICATION_PROFILES = {
     "dns_amplification", "ntp_amplification", "cldap_amplification", "ssdp_amplification",
@@ -158,7 +165,7 @@ ALL_PROFILES = sorted({
     "udp_flood", "udp_flood_ns", "syn_flood", "syn_flood_ns",
     "icmp_flood", "icmp_flood_ns", "ack_flood", "ack_flood_ns",
     "dns_amplification", "ntp_amplification", "cldap_amplification", "ssdp_amplification",
-    "http_flood", "slowloris",
+    "http_flood", "slowloris", "rapid_reset",
 })
 
 
@@ -346,6 +353,11 @@ def config_from_args(args: argparse.Namespace) -> RunConfig:
         # was routed through their list.
         if proxy_file:
             transport = "proxy"
+        elif args.profile in H2_REQUIRED_PROFILES:
+            # rapid_reset is HTTP/2-only, so falling through to "socket" would
+            # hand it to a transport that cannot speak h2 and fail at the profile
+            # check with a message about the wrong thing.
+            transport = "h2"
         elif args.profile in SCAPY_REQUIRED_PROFILES:
             transport = "scapy"
         elif args.profile in LINUX_RAW_PROFILES:

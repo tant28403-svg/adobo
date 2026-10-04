@@ -24,6 +24,7 @@ from .base import (
     supports_profile,
 )
 from .proxy_transport import ProxyH2Transport, ProxyTransport
+from .rapid_reset_transport import RapidResetTransport
 from .http3_transport import Http3Transport, aioquic_available
 from .scapy_transport import (
     RawCapability,
@@ -45,6 +46,7 @@ __all__ = [
     "ProxyPool",
     "ProxyTransport",
     "RawCapability",
+    "RapidResetTransport",
     "SOCKET_CAPABLE_PROFILES",
     "ScapyTransport",
     "SlowlorisTransport",
@@ -208,7 +210,17 @@ def get_transport(config: RunConfig) -> Transport:
 
     if config.transport is TransportKind.H2:
         attack = config.attack
-        return H2Transport(
+        # rapid_reset shares the HTTP/2 connection and differs only in the frame
+        # after HEADERS, so it is the same factory call with a different class.
+        # Routed here rather than behind a flag so that http_flood's behaviour
+        # cannot drift: the two profiles never share a code path that either
+        # could change.
+        transport_cls = (
+            RapidResetTransport
+            if profile is ProfileName.RAPID_RESET
+            else H2Transport
+        )
+        return transport_cls(
             config.target,
             profile,
             concurrency=getattr(attack, 'h2_concurrency', 100),

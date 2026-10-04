@@ -1025,6 +1025,46 @@ class RunEngine:
             f"target's behaviour from the identity it was shown."
         )
 
+    def _rapid_reset_note(self) -> str | None:
+        """Disclose what a Rapid Reset run was testing, and which figures to read.
+
+        Returns the note, or ``None`` for any other profile.
+
+        Three things have to be said, and each is a figure that would otherwise
+        be read as a failure:
+
+        * The target's served-request count stays near zero *by design*. Being
+          cancelled before the handler runs is what the profile does, so "392
+          requests sent, 0 served" is the correct result and not a broken run.
+        * Delivery percentage and any amplification factor are therefore not
+          measurable, rather than measured and found to be zero.
+        * pps here means open-and-cancel pairs per second, not completed
+          requests, and each pair is only a few tens of bytes of framing. 5,000
+          pps of this is a much heavier load on the target than 5,000 pps of
+          http_flood, so the number is not comparable across profiles.
+
+        Also states the expected outcome, because "nothing happened" is the
+        success case here and reads as a failed test otherwise. This is a
+        regression test for a published CVE, and a patched server absorbing it
+        is the answer the operator wants.
+        """
+        if self.config.attack.profile is not ProfileName.RAPID_RESET:
+            return None
+        return (
+            "HTTP/2 Rapid Reset (CVE-2023-44487): each request was cancelled "
+            "immediately after its headers were sent, so this tested whether the "
+            "target applies the stream-reset limits that patch introduced. The "
+            "target's served-request count staying near zero is expected - being "
+            "cancelled is what the profile does - and delivery and amplification "
+            "are unmeasurable here rather than zero. Read the reset count above as "
+            "what was sent, and the target's CPU and memory plus the probe "
+            "results as what it cost. A patched target absorbs this and nothing "
+            "happens, which is the passing result; a target that slows, drops "
+            "probes or answers GOAWAY has shown the gap. This profile always "
+            "speaks HTTP/2 over TLS, so certificate verification applies and a "
+            "self-signed target needs --tls-no-verify."
+        )
+
     def _h3_note(self) -> str | None:
         """Disclose that this run spoke HTTP/3, and what that costs in figures.
 
@@ -1219,6 +1259,9 @@ class RunEngine:
         proxy = self._proxy_note()
         if proxy is not None:
             notes.append(proxy)
+        rapid = self._rapid_reset_note()
+        if rapid is not None:
+            notes.append(rapid)
         if self.config.attack.keep_alive:
             notes.append(
                 "Keep-alive enabled: delivery figures may overcount if the target "
