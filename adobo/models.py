@@ -12,7 +12,15 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from .fingerprint import (
+    DEFAULT_FINGERPRINT_KEY,
+    FINGERPRINTS,
+    fingerprint as resolve_persona,
+    resolve_rotation,
+    rotate as rotate_personas,
+)
 
 # --------------------------------------------------------------------------
 # Enumerations
@@ -125,6 +133,87 @@ class AttackProfile(BaseModel):
     tls_verify: bool = True
     use_http2: bool = False
     h2_concurrency: int = Field(default=100, ge=1, le=1000)
+
+    fingerprint: str = Field(default=DEFAULT_FINGERPRINT_KEY)
+    """Which declared client identity to send. See :mod:`adobo.fingerprint`.
+
+    A comma-separated list, following the convention ``--defenses`` already uses
+    on this CLI. One key means one identity; several means the run rotates
+    through them according to :attr:`fingerprint_rotation`.
+
+    Defaults to the self-identifying lab client, and validated below so a typo
+    fails here - with the list of valid keys - rather than silently falling back
+    to the honest identity and producing a run that does not impersonate
+    anything while appearing to.
+    """
+
+    fingerprint_rotation: str = Field(default="per_connection")
+    """When to change persona: ``none``, ``per_request`` or ``per_connection``.
+
+    ``per_connection`` is the default because a persona belongs to a connection.
+    A real browser does not change its User-Agent partway through a keep-alive
+    session, and one that did would be trivially wrong in a way that costs
+    delivery without buying realism.
+    """
+
+    @field_validator("fingerprint")
+    @classmethod
+    def _fingerprint_must_exist(cls, value: str) -> str:
+        keys = [part.strip() for part in value.split(",") if part.strip()]
+        if not keys:
+            raise ValueError(
+                "fingerprint must name at least one persona; "
+                f"valid keys are: {', '.join(FINGERPRINTS)}"
+            )
+        unknown = [key for key in keys if key not in FINGERPRINTS]
+        if unknown:
+            raise ValueError(
+                f"unknown fingerprint {unknown[0]!r}; choose from: "
+                + ", ".join(FINGERPRINTS)
+            )
+        return ",".join(keys)
+
+    @field_validator("fingerprint_rotation")
+    @classmethod
+    def _rotation_mode_must_exist(cls, value: str) -> str:
+        resolve_rotation(value)  # raises ValueError listing the valid modes
+        return value
+
+    def persona_keys(self) -> list[str]:
+        """The configured personas, in the order given."""
+        return [part.strip() for part in self.fingerprint.split(",") if part.strip()]
+
+    def impersonates(self) -> bool:
+        """Whether this run presents traffic as something it is not."""
+        return any(key != DEFAULT_FINGERPRINT_KEY for key in self.persona_keys())
+
+    def persona(self, *, seed: int | None = None):
+        """Resolve the persona to use, or ``None`` for the honest lab client.
+
+        ``None`` means "send no impersonation", which is what
+        ``build_payload`` expects: it reproduces the original header block byte
+        for byte rather than approximating it.
+
+        *seed* selects among the configured personas and must be supplied for
+        the rotating modes. With one persona configured, every mode resolves to
+        that persona - a single-entry rotation is not a rotation, and treating
+        it as one would make a run nondeterministic for no benefit.
+
+        Args:
+            seed: What to vary on. ``per_request`` varies on the packet
+                sequence; ``per_connection`` varies on the connection count,
+                because a persona is a property of a connection.
+        """
+        keys = self.persona_keys()
+        if not keys or keys == [DEFAULT_FINGERPRINT_KEY]:
+            return None
+        if len(keys) == 1 or self.fingerprint_rotation == "none":
+            return resolve_persona(keys[0])
+        # No seed means the caller wants the stable persona, which is what the
+        # report and the transport's connection setup ask for.
+        if seed is None:
+            return resolve_persona(keys[0])
+        return rotate_personas(keys, seed)
 
     def clamped(self, **overrides: Any) -> "AttackProfile":
         """Return a copy with fields replaced. Used by the safety layer."""

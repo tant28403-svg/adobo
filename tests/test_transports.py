@@ -1553,6 +1553,41 @@ class TestFrozenImportSafety:
 # ---------------------------------------------------------------------------
 
 
+class _StubSocket:
+    """Just enough socket for SocketTransport.open() to succeed offline."""
+
+    def settimeout(self, value):  # pragma: no cover - trivial
+        self.timeout = value
+
+    def setsockopt(self, *args):  # pragma: no cover - trivial
+        return None
+
+    def connect(self, addr):  # pragma: no cover - trivial
+        self.addr = addr
+
+    def close(self):  # pragma: no cover - trivial
+        return None
+
+
+class _StubSocketModule:
+    """A stand-in for the socket module's two functions open() touches."""
+
+    AF_INET = 2
+    SOCK_STREAM = 1
+    SOCK_DGRAM = 2
+    SOCK_NONBLOCK = 2048
+    SOL_SOCKET = 1
+    SO_SNDBUF = 7
+
+    @staticmethod
+    def getaddrinfo(host, port, type=0):
+        return [(2, 1, 6, "", ("127.0.0.1", port))]
+
+    @staticmethod
+    def socket(family, socktype, proto=0):
+        return _StubSocket()
+
+
 class TestSocketTransportKeepAlive:
     """Tests for HTTP keep-alive mode.
 
@@ -1562,6 +1597,45 @@ class TestSocketTransportKeepAlive:
     sender's counter may overcount. These tests verify the behaviour and that
     the trade-off is correctly implemented.
     """
+
+    def test_reopening_mid_run_does_not_undo_a_stop(self, monkeypatch) -> None:
+        """open() must NOT clear the stop event, unlike the base class.
+
+        The exact inverse of ``test_reopening_clears_a_previous_stop`` on the
+        scapy transport, and it is deliberate. SocketTransport recycles mid-run:
+        the send path calls ``_teardown()`` then ``open()`` when a connection
+        drops or reaches RECYCLE_EVERY. So a stop request that arrived just
+        before a recycle would be cleared by that recycle, and the transport
+        would go on sending after the engine had already given up on it.
+
+        H2Transport's open() *does* clear, and that is correct there because it
+        is only ever called once at startup. The two are not interchangeable.
+
+        The sequence is _teardown() then open(), not open() alone, because
+        _teardown() is what clears ``_open`` - and with the transport still
+        marked open, open() returns immediately and the test would pass without
+        ever reaching the line it is meant to police.
+        """
+        transport = SocketTransport(
+            Target(host="127.0.0.1", port=8000), ProfileName.HTTP_FLOOD
+        )
+        transport.request_stop()
+        assert transport.stopping, "precondition: the transport is stopped"
+
+        from adobo.transports import socket_transport as socket_transport_module
+
+        # Stub the real socket work so open() runs its body rather than bailing
+        # out on getaddrinfo or connect against a closed port.
+        monkeypatch.setattr(socket_transport_module, "socket", _StubSocketModule())
+
+        # Exactly what the recycle paths do.
+        transport._teardown()
+        transport.open()
+
+        assert transport.is_open, "the recycle should have reopened the transport"
+        assert transport.stopping, (
+            "a mid-run reopen must not resurrect a transport the engine stopped"
+        )
 
     def test_keep_alive_disables_per_request_close(self) -> None:
         """In keep-alive mode, _close_per_request must be False."""
@@ -1673,6 +1747,8 @@ class TestCLIConfigFromArgs:
             tls_no_verify = False
             http2 = False
             h2_concurrency = 100
+            fingerprint = "lab_default"
+            fingerprint_rotation = "per_connection"
             host = "127.0.0.1"
             port = 8000
             transport = "auto"
@@ -1696,6 +1772,8 @@ class TestCLIConfigFromArgs:
             tls_no_verify = False
             http2 = False
             h2_concurrency = 100
+            fingerprint = "lab_default"
+            fingerprint_rotation = "per_connection"
             host = "127.0.0.1"
             port = 443
             transport = "auto"
@@ -1720,6 +1798,8 @@ class TestCLIConfigFromArgs:
             tls_no_verify = True
             http2 = False
             h2_concurrency = 100
+            fingerprint = "lab_default"
+            fingerprint_rotation = "per_connection"
             host = "127.0.0.1"
             port = 8000
             transport = "auto"
@@ -1744,6 +1824,8 @@ class TestCLIConfigFromArgs:
             tls_no_verify = False
             http2 = False
             h2_concurrency = 100
+            fingerprint = "lab_default"
+            fingerprint_rotation = "per_connection"
             host = "127.0.0.1"
             port = 443
             transport = "auto"
@@ -1816,15 +1898,40 @@ class TestH2Transport:
         assert desc["tls_verify"] is True
 
     def test_h2_request_stop_sets_flag(self) -> None:
-        """request_stop() sets the external stop flag."""
+        """request_stop() must reach the base class's stop event.
+
+        This previously asserted a private ``_external_stop`` boolean, which was
+        the defect rather than the contract. H2Transport overrode request_stop
+        without calling the base, so the event that ``Transport.stopping`` reads
+        was never set - meaning the engine's stop path and the base class could
+        disagree about whether this transport was stopping. The scapy transport
+        had the same bug, was fixed, and is covered by
+        ``test_reopening_clears_a_previous_stop``; this asserts the same property
+        here through the public interface instead of a private attribute.
+        """
         target = Target(host="example.com", port=443)
         transport = H2Transport(
             target,
             ProfileName.HTTP_FLOOD,
         )
-        assert transport._external_stop is False
+        assert transport.stopping is False
         transport.request_stop()
-        assert transport._external_stop is True
+        assert transport.stopping is True
+        assert transport._should_stop_external() is True
+
+    def test_h2_reports_the_same_stop_state_as_the_base_class(self) -> None:
+        """The engine stops transports through the base event; H2 must agree.
+
+        A transport that consults its own flag would miss the engine's stop
+        entirely and keep sending until the join grace expired, which is the
+        failure the whole cancellation funnel exists to prevent.
+        """
+        transport = H2Transport(
+            Target(host="example.com", port=443),
+            ProfileName.HTTP_FLOOD,
+        )
+        # Set the event the way the base class and the engine do.
+        transport._stop.set()
         assert transport._should_stop_external() is True
 
     def test_h2_concurrency_validation(self) -> None:

@@ -25,6 +25,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import ClassVar
 
+from ..fingerprint import DEFAULT_FINGERPRINT_KEY, FINGERPRINTS, Fingerprint
 from ..models import ProfileName, Target, TransportKind
 
 __all__ = [
@@ -224,6 +225,14 @@ class Transport(ABC):
         self.profile = profile
         self._counters = _CounterAccumulator()
         self._open = False
+        # How many connections this transport has opened. Exists so a caller
+        # that varies something per connection has a truthful thing to vary on:
+        # the persona a request presents is a property of the connection it
+        # travels on, so per-connection rotation needs the engine to know when
+        # a new connection began. Counting it here rather than inferring it from
+        # the request count is what keeps the two honest, because a keep-alive
+        # run opens far fewer connections than it sends requests.
+        self.connections_opened = 0
         # Set by the engine the moment the run is asked to stop. A transport
         # that owns its own pacing loop must wait on this rather than on
         # close(), because close() is only called once that loop has already
@@ -247,6 +256,7 @@ class Transport(ABC):
     def open(self) -> None:
         """Acquire whatever OS resource egress needs. Idempotent."""
         self._stop.clear()
+        self.connections_opened += 1
         self._open = True
 
     def close(self) -> None:
@@ -368,7 +378,12 @@ def _pad(query: bytes, size: int, seed: int) -> bytes:
 
 
 def _http_request(
-    host: str, path: str, size: int, seed: int, keep_alive: bool = False
+    host: str,
+    path: str,
+    size: int,
+    seed: int,
+    keep_alive: bool = False,
+    fingerprint: Fingerprint | None = None,
 ) -> bytes:
     """A minimal HTTP/1.1 GET with a unique cache-busting header.
 
@@ -381,16 +396,31 @@ def _http_request(
     not work. That mismatch is why throughput sat near 115 pps regardless of
     the requested rate: the per-request connect cost, not the network, was the
     ceiling.
+
+    *fingerprint* selects the declared client identity. It defaults to the
+    self-identifying lab client, which reproduces the header block that existed
+    before personas were introduced - same headers, same order, same bytes - so
+    a caller that passes nothing gets exactly what it always got. That is why
+    the identity is composed here rather than templated: ``Host``,
+    ``Connection`` and the cache-buster are transport-level and vary per
+    request, while the persona block is identity-level and varies per run. Mixing
+    the two would put ``Connection: close`` under persona control, where it
+    could contradict the connection the transport is actually reusing.
     """
+    persona = (
+        fingerprint
+        if fingerprint is not None
+        else FINGERPRINTS[DEFAULT_FINGERPRINT_KEY]
+    )
     connection = "keep-alive" if keep_alive else "close"
-    head = (
-        f"GET {path} HTTP/1.1\r\n"
-        f"Host: {host}\r\n"
-        f"User-Agent: adobo-lab/0.1 (authorized testing)\r\n"
-        f"Accept: */*\r\n"
-        f"Connection: {connection}\r\n"
-        f"X-Ddosim-Seq: {seed}\r\n"
-    ).encode("ascii")
+    lines = [
+        f"GET {path} HTTP/1.1",
+        f"Host: {host}",
+    ]
+    lines.extend(f"{name}: {value}" for name, value in persona.headers)
+    lines.append(f"Connection: {connection}")
+    lines.append(f"X-Ddosim-Seq: {seed}")
+    head = ("\r\n".join(lines) + "\r\n").encode("ascii")
     if keep_alive:
         # Padding goes *inside* the header block, before the blank line, and
         # that placement is load-bearing rather than cosmetic. Appending filler
@@ -503,6 +533,7 @@ def build_payload(
     seed: int = 0,
     path: str = "/api/data",
     keep_alive: bool = False,
+    fingerprint: Fingerprint | None = None,
 ) -> bytes:
     """Build the payload for one packet of *profile*.
 
@@ -513,6 +544,13 @@ def build_payload(
     payload, not in the transport. A socket that intends to reuse its
     connection and a request that says ``Connection: close`` contradict each
     other, and the slower of the two wins.
+
+    *fingerprint* declares who the sender claims to be. Keyword-only and
+    defaulting to ``None``, so every existing call site is unaffected and the
+    output is unchanged when it is omitted. It applies to ``HTTP_FLOOD`` only:
+    the other profiles are binary protocol messages with no header block to
+    impersonate, and slowloris in particular must stay deliberately truncated,
+    so completing its headers would remove the attack entirely.
     """
     size = max(0, int(size))
 
@@ -536,7 +574,9 @@ def build_payload(
 
     if profile is ProfileName.HTTP_FLOOD:
         host = target.host if target is not None else "127.0.0.1"
-        return _http_request(host, path, size, seed, keep_alive=keep_alive)
+        return _http_request(
+            host, path, size, seed, keep_alive=keep_alive, fingerprint=fingerprint
+        )
 
     return _filler(size, seed)
 

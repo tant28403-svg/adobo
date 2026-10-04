@@ -444,11 +444,33 @@ class RunEngine:
         next_send = time.monotonic()
         sequence = index * 1_000_000
 
+        # Whether a persona actually varies is decided once per worker, not per
+        # packet. Asking it per packet would split a string and walk a list for
+        # every packet of a run that may issue hundreds of thousands of them -
+        # the same class of mistake commit 0ca8c1d removed from the raw path.
+        # With a single persona configured, which is the common case, this is
+        # one comparison per run and the send path below never rotates.
+        rotates = (
+            len(profile.persona_keys()) > 1 and profile.fingerprint_rotation != "none"
+        )
+        # per_connection varies on the transport's connection count and
+        # per_request on the packet sequence. The distinction is not cosmetic: a
+        # persona is a property of a connection, so rotating it mid-keep-alive
+        # would claim an identity the connection was never established with.
+        per_connection = profile.fingerprint_rotation == "per_connection"
+
         while not self.controller.should_stop():
             for _ in range(self.batch):
                 if self.controller.should_stop():
                     return
                 sequence += 1
+                persona = (
+                    profile.persona(
+                        seed=transport.connections_opened if per_connection else sequence
+                    )
+                    if rotates
+                    else profile.persona()
+                )
                 transport.send_one(
                     build_payload(
                         profile.profile,
@@ -456,6 +478,7 @@ class RunEngine:
                         target=self.config.target,
                         seed=sequence,
                         keep_alive=profile.keep_alive,
+                        fingerprint=persona,
                     )
                 )
             next_send += interval * self.batch
@@ -903,6 +926,46 @@ class RunEngine:
                 return False
         return True
 
+    def _impersonation_note(self) -> str | None:
+        """Disclose that this run presented traffic as a browser.
+
+        Returns the note, or ``None`` when nothing was impersonated.
+
+        This is not decoration. The tool's whole result is a claim about how a
+        target behaved under load, and a run that presents itself as Chrome
+        produces a different number than one that presents itself as the lab
+        client - against a WAF, dramatically so, since the WAF may admit one and
+        challenge the other. A resilience score printed without saying which
+        identity was used would let two runs that exercised different code paths
+        be read as comparable, which is the same class of defect this codebase
+        has repeatedly fixed elsewhere: an amplification ratio reported as a
+        measurement when it was a published constant, an availability figure
+        rendered as 0% when it was never measured.
+
+        Silence is the signal. ``lab_default`` produces no note at all, so a
+        reader can tell "this run impersonated nothing" from "this run
+        impersonated something and the tool did not say".
+        """
+        attack = self.config.attack
+        if not attack.impersonates():
+            return None
+        keys = [key for key in attack.persona_keys() if key != "lab_default"]
+        names = ", ".join(keys)
+        plural = "s were" if len(keys) > 1 else " was"
+        mode = attack.fingerprint_rotation
+        scope = (
+            "one per connection"
+            if mode == "per_connection"
+            else "one per request" if mode == "per_request" else "fixed for the run"
+        )
+        return (
+            f"Client impersonation: {len(keys)} persona{plural} used ({names}), "
+            f"{scope}. Traffic was presented as those browsers, so delivery and "
+            f"availability figures describe a client the target was not actually "
+            f"dealing with. Compare against a lab_default run to separate the "
+            f"target's behaviour from the identity it was shown."
+        )
+
     def _notes(self, reason: CancelReason, cancelled: bool) -> list[str]:
         notes: list[str] = []
         if reason is CancelReason.DEADLINE:
@@ -944,6 +1007,12 @@ class RunEngine:
             )
         if self.config.dry_run:
             notes.append("Dry run: no packets were sent.")
+        # Placed next to the keep-alive note because both qualify how the
+        # figures below should be read, and both are absent when they do not
+        # apply - the report stays as quiet as it was before personas existed.
+        impersonation = self._impersonation_note()
+        if impersonation is not None:
+            notes.append(impersonation)
         if self.config.attack.keep_alive:
             notes.append(
                 "Keep-alive enabled: delivery figures may overcount if the target "

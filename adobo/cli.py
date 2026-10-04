@@ -207,6 +207,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="Number of concurrent HTTP/2 streams per connection (default: 100)",
     )
     parser.add_argument(
+        "--fingerprint",
+        default="lab_default",
+        help=(
+            "client identity to present for http_flood/slowloris; comma-separated "
+            "to rotate through several. One of: lab_default (self-identifying, "
+            "the default), chrome_131_win, chrome_131_mac, firefox_133_win, "
+            "firefox_133_linux, safari_18_mac"
+        ),
+    )
+    parser.add_argument(
+        "--fingerprint-rotation",
+        choices=["none", "per_request", "per_connection"],
+        default="per_connection",
+        help=(
+            "when to change persona (default: per_connection). A persona belongs "
+            "to a connection, so per_connection is the realistic default; "
+            "per_request requires per-request connections to be meaningful"
+        ),
+    )
+    parser.add_argument(
         "--nuclear",
         action="store_true",
         help="run the interactive nuclear wizard instead of a single profile",
@@ -300,6 +320,8 @@ def config_from_args(args: argparse.Namespace) -> RunConfig:
             tls_verify=not args.tls_no_verify,
             use_http2=use_http2,
             h2_concurrency=fields["h2_concurrency"],
+            fingerprint=args.fingerprint,
+            fingerprint_rotation=args.fingerprint_rotation,
         ),
         transport=TransportKind(transport),
         defenses=[],

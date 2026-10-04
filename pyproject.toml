@@ -18,6 +18,13 @@ dependencies = [
     "psutil>=5.9",
     # adobo.engine imports httpx for target health probing.
     "httpx>=0.28",
+    # adobo.transports.http2_transport imports h2 at module level, and
+    # adobo.transports/__init__.py imports that module unconditionally, which
+    # adobo.engine imports in turn. So this is not optional in practice: without
+    # it `import adobo` fails outright rather than degrading. It was undeclared,
+    # which meant the tool only worked on machines that happened to have it
+    # installed already.
+    "h2>=4.1",
     # Banner rendering
     "pyfiglet>=1.0",
 ]

@@ -179,6 +179,20 @@ class SocketTransport(Transport):
                 f"Cannot open a socket to {self.target}: {exc}"
             ) from exc
 
+        # Counted here rather than in the base open(), which this overrides.
+        # Per-connection persona rotation reads this, and getting it wrong would
+        # mean a run claiming to rotate identities while reusing one connection
+        # and therefore sending one identity throughout.
+        #
+        # Note what this open() deliberately does NOT do, unlike the base class:
+        # it does not clear self._stop. It has to, because the recycle paths
+        # above call _teardown() then open() *mid-run*. Clearing here would undo
+        # an engine stop request that arrived just before the recycle - the
+        # transport would come back believing it was still meant to send, after
+        # the engine had already given up on it. H2Transport's open() does clear,
+        # and that is correct there because it is only ever called once, at
+        # startup. Do not copy one into the other.
+        self.connections_opened += 1
         self._open = True
 
     def _connect(self, sockaddr: object) -> None:

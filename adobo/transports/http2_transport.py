@@ -18,6 +18,7 @@ import h2.connection
 import h2.events
 import h2.errors
 
+from ..fingerprint import Fingerprint
 from ..models import ProfileName, Target, TransportKind
 from .base import PeerUnavailable, Transport, TransportError, supports_profile
 
@@ -79,6 +80,7 @@ class H2Transport(Transport):
         concurrency: int = DEFAULT_H2_CONCURRENCY,
         tls_verify: bool = True,
         tcp_path: str = "/api/data",
+        fingerprint: Fingerprint | None = None,
     ) -> None:
         super().__init__(target, profile)
         if not supports_profile(TransportKind.H2, profile):
@@ -92,6 +94,16 @@ class H2Transport(Transport):
         self.tcp_path = tcp_path
         self.stream_timeout = DEFAULT_STREAM_TIMEOUT
         self.drain_timeout = DEFAULT_DRAIN_TIMEOUT
+        self._persona = fingerprint
+        """Persona to present, or ``None`` for the self-identifying default.
+
+        Held here rather than read from the payload because this transport
+        builds its own HTTP/2 header block and ignores the bytes the engine hands
+        to ``send_one``. A persona set per request could not be honoured by a
+        multiplexed connection anyway: every stream on one connection shares one
+        identity, which is the same reason ``per_request`` rotation cannot apply
+        to HTTP/2.
+        """
 
         self._sock: socket.socket | None = None
         self._conn: h2.connection.H2Connection | None = None
@@ -100,7 +112,6 @@ class H2Transport(Transport):
         self._window = 65535  # Initial flow control window
         self._local_window = 65535  # Local flow control window
         self._remote_window = 65535  # Remote flow control window (what we can send)
-        self._external_stop = False  # Engine cancellation flag
         self._goaway_received = False
         self._goaway_error_code: int | None = None
         self._goaway_last_stream_id: int | None = None
@@ -155,6 +166,14 @@ class H2Transport(Transport):
             self._teardown()
             raise TransportError(f"Cannot open HTTP/2 connection to {self.target}: {exc}") from exc
 
+        # This open() overrides the base method, so it must do what the base
+        # does. Without the clear, a transport closed after one run and opened
+        # for the next would come back already flagged as stopping and exit its
+        # send loop immediately - reporting a clean zero, which is
+        # indistinguishable from a run that worked. The scapy transport had this
+        # exact defect and it is covered by a test there; this is the same fix.
+        self._stop.clear()
+        self.connections_opened += 1
         self._open = True
 
     def _await_settings_ack(self) -> None:
@@ -214,8 +233,23 @@ class H2Transport(Transport):
             (':path', self.tcp_path),
             (':authority', self.target.host),
             (':scheme', 'https'),
-            ('user-agent', 'adobo-h2-flood'),
         ]
+        # Pseudo-headers must precede ordinary ones and every name must be
+        # lowercase: RFC 9113 requires it and the h2 library enforces it. That is
+        # why this transport cannot reuse an HTTP/1.1 header block verbatim, and
+        # why a persona's canonical-case names are lowercased here rather than
+        # stored twice in both cases where the two copies could drift.
+        #
+        # With no persona the identity stays the self-identifying
+        # "adobo-h2-flood", which is unchanged from before personas existed. This
+        # transport builds its own headers and ignores the payload the engine
+        # hands it, so the persona arrives at construction instead.
+        if self._persona is not None:
+            headers.extend(
+                (name.lower(), value) for name, value in self._persona.headers
+            )
+        else:
+            headers.append(('user-agent', 'adobo-h2-flood'))
 
         self._conn.send_headers(stream_id, headers, end_stream=True)
         self._streams[stream_id] = StreamState(
@@ -345,34 +379,6 @@ class H2Transport(Transport):
                 pass
             self._streams.pop(stream_id, None)
 
-    def _drain_responses(self) -> None:
-        """Read and process incoming frames."""
-        if not self._sock or not self._conn:
-            return
-        try:
-            self._sock.settimeout(0.01)  # Non-blocking poll
-            data = self._sock.recv(65535)
-            if not data:
-                # Connection closed by peer
-                self._teardown()
-                return
-            events = self._conn.receive_data(data)
-            for event in events:
-                self._handle_event(event)
-        except socket.timeout:
-            pass
-        except (ConnectionResetError, BrokenPipeError, ssl.SSLError):
-            self._teardown()
-        finally:
-            self._sock.settimeout(self.send_timeout)
-
-        # Check for stream timeouts
-        self._check_stream_timeouts()
-
-        # Send any pending frames (WINDOW_UPDATE, etc.)
-        if self._conn:
-            self._sock.sendall(self._conn.data_to_send())
-
     def _drain_all(self) -> None:
         """Wait for all in-flight streams to complete."""
         deadline = time.monotonic() + self.drain_timeout
@@ -398,12 +404,24 @@ class H2Transport(Transport):
                 break
 
     def _should_stop_external(self) -> bool:
-        """Check if engine requested stop."""
-        return self._external_stop
+        """Whether the engine has asked this transport to wind down.
+
+        Reads the base class's stop event rather than a private flag. It used to
+        keep its own ``_external_stop`` boolean, which meant ``request_stop``
+        overrode the base method without setting the event the base class's
+        ``stopping`` property reads - so any base-class code added later would
+        have seen a transport that was not stopping. The scapy transport had the
+        same defect and it was fixed there; this is the same fix.
+        """
+        return self.stopping
 
     def request_stop(self) -> None:
-        """Called by engine to request graceful stop."""
-        self._external_stop = True
+        """Called by engine to request graceful stop.
+
+        Now delegates to the base implementation instead of replacing it, so
+        ``stopping`` and the event stay in agreement.
+        """
+        super().request_stop()
 
     def describe(self) -> dict[str, object]:
         info = super().describe()

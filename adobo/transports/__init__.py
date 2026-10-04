@@ -150,6 +150,11 @@ def get_transport(config: RunConfig) -> Transport:
     if config.transport is TransportKind.VIRTUAL:
         return VirtualTransport(config.target, profile)
 
+    # Resolved once here so every transport receives the same persona for a run.
+    # ``None`` means "send no impersonation", which each transport treats as its
+    # own self-identifying default rather than as a request to invent one.
+    persona = config.attack.persona()
+
     if config.transport is TransportKind.H2:
         attack = config.attack
         return H2Transport(
@@ -159,6 +164,7 @@ def get_transport(config: RunConfig) -> Transport:
             tls_verify=getattr(attack, 'tls_verify', True),
             send_timeout=2.0,
             connect_timeout=1.0,
+            fingerprint=persona,
         )
 
     if config.transport is TransportKind.SOCKET:
@@ -174,6 +180,7 @@ def get_transport(config: RunConfig) -> Transport:
                 tls_verify=getattr(attack, 'tls_verify', True),
                 send_timeout=2.0,
                 connect_timeout=1.0,
+                fingerprint=persona,
             )
         return SocketTransport(
             config.target,
