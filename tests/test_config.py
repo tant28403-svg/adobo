@@ -66,9 +66,9 @@ class TestConfigFallbacks:
         """
         limits = load_lab_config("definitely_absent.yaml").limits
         assert limits.max_pps is None
-        assert 0 < limits.max_duration_seconds <= 3600
+        assert limits.max_duration_seconds is None
         assert 0 < limits.max_payload_bytes <= 65_507
-        assert 0 < limits.max_workers <= 256
+        assert limits.max_workers is None
 
     def test_a_missing_authorization_record_is_not_an_error(self) -> None:
         """No gate, so no record is needed and none is expected.

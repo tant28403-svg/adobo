@@ -124,7 +124,7 @@ class SafetyGuard:
                 f"(max_pps in lab.yaml)"
             )
 
-        if profile.duration_seconds > limits.max_duration_seconds:
+        if limits.max_duration_seconds is not None and profile.duration_seconds > limits.max_duration_seconds:
             updates["duration_seconds"] = limits.max_duration_seconds
             notes.append(
                 f"duration clamped from {profile.duration_seconds:g}s to "
@@ -140,7 +140,7 @@ class SafetyGuard:
                 f"(max_payload_bytes in lab.yaml)"
             )
 
-        if profile.workers > limits.max_workers:
+        if limits.max_workers is not None and profile.workers > limits.max_workers:
             updates["workers"] = limits.max_workers
             notes.append(
                 f"workers clamped from {profile.workers:,} to "
@@ -154,10 +154,9 @@ class SafetyGuard:
         """A one-line summary, for prompts and refusal messages."""
         limits = self.lab.limits
         pps = "uncapped" if limits.max_pps is None else f"pps<={limits.max_pps:,}"
-        return (
-            f"{pps} duration<={limits.max_duration_seconds:g}s "
-            f"payload<={limits.max_payload_bytes:,}B workers<={limits.max_workers:,}"
-        )
+        duration = "uncapped" if limits.max_duration_seconds is None else f"duration<={limits.max_duration_seconds:g}s"
+        workers = "uncapped" if limits.max_workers is None else f"workers<={limits.max_workers:,}"
+        return f"{pps} {duration} payload<={limits.max_payload_bytes:,}B {workers}"
 
 
 def preflight(config: Any, guard: SafetyGuard | None = None) -> ClampResult:

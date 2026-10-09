@@ -69,9 +69,9 @@ class LimitsConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     max_pps: int | None = Field(default=None, gt=0)
-    max_duration_seconds: float = Field(default=1000.0, gt=0)
+    max_duration_seconds: float | None = Field(default=None, gt=0)
     max_payload_bytes: int = Field(default=1400, gt=0)
-    max_workers: int = Field(default=8, gt=0)
+    max_workers: int | None = Field(default=None, gt=0)
 
 
 class MeasurementConfig(BaseModel):
