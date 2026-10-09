@@ -25,9 +25,13 @@ dist/
 *.key
 *.crt
 
-# Local lab policy. These hold per-machine settings rather than defaults, so
-# they stay out of the shared repository.
-config/
+# Local lab policy used to be ignored entirely, which meant config/lab.yaml
+# could never be committed and a fresh clone silently fell back to the
+# built-in ceilings (max_workers 8) rather than the ones in this file.
+# lab.yaml is now tracked so the ceilings a run is clamped to travel with the
+# code. Anything else placed in config/ stays ignored.
+config/*
+!config/lab.yaml
 
 # Personal working notes, not part of the project.
 CHECKPOINT.md
