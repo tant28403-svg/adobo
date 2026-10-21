@@ -248,8 +248,8 @@ def load_proxies(path: str | Path | None = None) -> list[Proxy]:
         if path is None:
             import sys
             print(
-                "No proxies.txt found. Copy proxies.example.txt to proxies.txt "
-                "and add your proxies, or set ADOBO_PROXY_FILE / ADOBO_PROXIES.",
+                "No proxies.txt found. Create proxies.txt with one proxy per line "
+                "(see format: [user:pass@]host:port), or set ADOBO_PROXY_FILE / ADOBO_PROXIES.",
                 file=sys.stderr,
             )
         return []

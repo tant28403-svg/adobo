@@ -1,6 +1,0 @@
-# Copy this file to proxies.txt and fill in your own proxies.
-# Format: [user:pass@]host:port
-# Lines starting with # are comments.
-# Never commit proxies.txt or proxies.enc to version control.
-1.2.3.4:8080
-user:pass@5.6.7.8:3128
