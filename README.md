@@ -26,7 +26,7 @@ An authorised DDoS resilience lab: measures how your services behave under load.
 
 Python 3.11+ required. **Linux only.**
 
-> **Windows support:** Planning to fix the issues preventing the tool from running properly on Windows soon.
+> **Windows support:** The tool currently has some problems on Windows; planning to fix them soon.
 
 ```bash
 git clone https://github.com/tant28403-svg/adobo.git
