@@ -1,5 +1,11 @@
 # ADOBO
 
+> **Open Source Notice:** This project is open source. The source code, documentation,
+> tests, and README fully document how every profile, transport, and attack mechanism
+> works. Anyone who clones this repository can read and understand the complete
+> implementation. Use responsibly and only against systems you own or have explicit
+> written permission to test.
+
 ## ⚠️  FOR EDUCATIONAL AND AUTHORISED RESILIENCE TESTING ONLY  ⚠️
 
 **Only use against systems you own or have explicit written permission to test. Unauthorised testing is illegal in most jurisdictions.**
