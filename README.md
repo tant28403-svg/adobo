@@ -44,6 +44,20 @@ Optional (for raw profiles and HTTP/3):
 pip install scapy aioquic
 ```
 
+## Proxies
+
+If you have your own proxies, create a `proxies.txt` file (one proxy per line) and point the tool at it:
+
+```
+# proxies.txt
+# Format: [user:pass@]host:port
+# Lines starting with # are comments.
+1.2.3.4:8080
+user:pass@5.6.7.8:3128
+```
+
+Then run with `--transport proxy --proxy-file proxies.txt` (HTTP profiles only). You can also set `ADOBO_PROXY_FILE` / `ADOBO_PROXIES`, or encrypt the list with `--encrypt-proxies` for safe storage.
+
 ## Use
 
 Nothing to configure. Clone it and run it.
