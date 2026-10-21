@@ -29,3 +29,4 @@ proxies.txt
 proxy_list.txt
 proxies.enc
 adobo/proxies.py
+tests/
