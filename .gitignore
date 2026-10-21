@@ -28,3 +28,4 @@ proxies.txt
 *.proxies
 proxy_list.txt
 proxies.enc
+adobo/proxies.py
