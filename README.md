@@ -58,6 +58,8 @@ user:pass@5.6.7.8:3128
 
 Then run with `--transport proxy --proxy-file proxies.txt` (HTTP profiles only). You can also set `ADOBO_PROXY_FILE` / `ADOBO_PROXIES`, or encrypt the list with `--encrypt-proxies` for safe storage.
 
+In nuclear mode, when the wizard asks for the proxy list path, type the path to the file you created (or leave it blank for none).
+
 ## Use
 
 Nothing to configure. Clone it and run it.
