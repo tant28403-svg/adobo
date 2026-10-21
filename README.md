@@ -64,7 +64,7 @@ In nuclear mode, when the wizard asks for the proxy list path, type the path to 
 
 ### How the tool uses your proxies
 
-Please note that this is not proxy chaining. Every request is sent directly through one of the proxies you provide, so the target sees that proxy's address as the source, just as it would see a regular client. The list is rotated round-robin, meaning consecutive requests are sent from different addresses. Only HTTP traffic (`http_flood`) can be proxied; UDP, amplification and raw packets are still sent from your own machine.
+Please note that this is not proxy chaining. In online proxy chaining, a request passes through every proxy in the chain before it reaches the target. This tool works differently: it uses each of the proxies you provide to send the request, one proxy per request, so the target sees that proxy's address as the source, just as it would see a regular client. The list is rotated round-robin, meaning consecutive requests are sent from different addresses. Only HTTP traffic (`http_flood`) can be proxied; UDP, amplification and raw packets are still sent from your own machine.
 
 ## Use
 
