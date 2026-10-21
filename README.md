@@ -5,6 +5,12 @@
 > works. Anyone who clones this repository can read and understand the complete
 > implementation. Use responsibly and only against systems you own or have explicit
 > written permission to test.
+>
+> **Capability Notice:** This is a moderate to low intensity DDoS testing tool.
+> It is designed for authorised resilience testing and educational purposes.
+> It does not represent advanced or sophisticated attack capabilities. The tool
+> measures how services behave under controlled load and is intended for lab
+> and authorised testing environments only.
 
 ## ⚠️  FOR EDUCATIONAL AND AUTHORISED RESILIENCE TESTING ONLY  ⚠️
 
