@@ -56,9 +56,11 @@ If you have your own proxies, create a `proxies.txt` file (one proxy per line) a
 user:pass@5.6.7.8:3128
 ```
 
-Then run with `--transport proxy --proxy-file proxies.txt` (HTTP profiles only). You can also set `ADOBO_PROXY_FILE` / `ADOBO_PROXIES`, or encrypt the list with `--encrypt-proxies` for safe storage.
+Then run with `--transport proxy --proxy-file proxies.txt` (HTTP profiles only). You can also set `ADOBO_PROXY_FILE` / `ADOBO_PROXIES`.
 
-In nuclear mode, when the wizard asks for the proxy list path, type the path to the file you created (or leave it blank for none).
+A plain `proxies.txt` needs no password. If you want the list encrypted, run `python -m adobo --encrypt-proxies` and set a password when prompted (it is asked twice, and cannot be empty). That writes `proxies.enc`, which is the file you then point the tool at - it asks for the same password when it decrypts the list.
+
+In nuclear mode, when the wizard asks for the proxy list path, type the path to the file you created (or leave it blank for none). If the file is encrypted, the wizard asks for the password next.
 
 ## Use
 
