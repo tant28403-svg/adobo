@@ -164,7 +164,7 @@ One question uses a default that isn't prompted (no decision needed):
 | Question | What it does |
 |---|---|
 | PPS / Duration | Applied to **each** profile, not divided across them |
-| Workers | Per profile. Default from lab.yaml or 4 if no ceiling. Max is `max_workers` (200) |
+| Workers | Per profile. The default is 4. The maximum is `max_workers` (200) |
 | Payload | Bytes per packet. Ceiling is 1,400 |
 | IP spoofing | Adds the spoofed variants. Needs root |
 
@@ -202,25 +202,6 @@ python -m adobo.target --port 8001 --defenses all
 | `--proxy-health-check` | on | test proxies before run (only when proxies are used) |
 
 Run `python -m adobo --help` to see all remaining options.
-
-## Limits
-
-Throughput is not capped. You can request the rate you need and the run will send at that rate — what the machine can actually achieve appears in the achieved figure rather than being trimmed in advance. If you would prefer a limit, add `max_pps` to `config/lab.yaml`.
-
-The other three are capped, and every reduction is reported rather than applied silently:
-
-```
-Ceiling adjustments from lab.yaml:
-  payload_size clamped from 1,900,000 to 1,400 bytes (max_payload_bytes in lab.yaml)
-  workers clamped from 99,999 to 200 (max_workers in lab.yaml)
-```
-
-| Ceiling | Value |
-|---|---|
-| Throughput | none (configurable via max_pps) |
-| Duration | none (configurable via max_duration_seconds) |
-| Payload | 1,400 bytes |
-| Workers | none (configurable via max_workers) |
 
 ## Tests
 
