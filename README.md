@@ -91,6 +91,10 @@ python -m adobo --host 127.0.0.1 --port 8001 --profile <name> --pps 2000 --durat
 > systems, nuclear mode may cause high CPU usage, slow response times, or
 > system instability. **Consider running individual profiles first to gauge
 > your system's capacity.**
+>
+> **Minimum recommended specs for full potential:**
+> - **CPU:** 8 cores or above
+> - **RAM:** 16 GB or more
 
 Every applicable profile in parallel.
 
