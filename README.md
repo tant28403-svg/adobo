@@ -14,7 +14,9 @@
 
 ## ⚠️ FOR EDUCATIONAL USE AND AUTHORISED RESILIENCE TESTING ONLY
 
-Please use this tool only against systems you own or have explicit written permission to test. Unauthorised testing is illegal in most jurisdictions, and the author cannot be held responsible for any misuse.
+**Please use this tool only against systems you own or have explicit written permission to test. Unauthorised testing is illegal in most jurisdictions.**
+
+The author cannot be held responsible for any misuse.
 
 ---
 
