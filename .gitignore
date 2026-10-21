@@ -29,4 +29,4 @@ proxies.txt
 proxy_list.txt
 proxies.enc
 tests/
-adobo/target/
+adobo/proxies.py
