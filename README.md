@@ -100,6 +100,13 @@ python -m adobo --host 127.0.0.1 --port 8001 --profile <name> --pps 2000 --durat
 > **Minimum recommended specs for full potential:**
 > - **CPU:** 8 cores or above
 > - **RAM:** 16 GB or more
+>
+> **⚠️ Network saturation warning:** Nuclear mode runs every applicable profile
+> in parallel and can saturate your own network bandwidth. Make sure your network
+> connection and infrastructure can handle the combined load of all profiles
+> running simultaneously. On limited or shared networks, this may cause
+> congestion, packet loss, or connectivity issues for other devices and services
+> on the same network.
 
 Every applicable profile in parallel.
 
