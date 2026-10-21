@@ -1,5 +1,12 @@
 # ADOBO
 
+> [!IMPORTANT]
+> **Please read this whole README before running the tool.** It explains the
+> required setup, the profiles, nuclear mode and the proxy options, and it
+> points out a few things that commonly cause confusion or problems (for
+> example the port to use and when "errors" in the output are expected). Taking
+> a couple of minutes to read it will save you a lot of guesswork.
+
 > **Open Source Notice:** This project is open source. The source code, documentation
 > and README fully describe how every profile, transport and attack mechanism
 > works. Anyone who clones this repository can read and understand the complete
