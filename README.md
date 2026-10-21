@@ -105,6 +105,10 @@ The sender counted 1,220, while the target counted 1,218. A small difference bet
 
 `udp_flood` · `udp_flood_ns` · `syn_flood` · `syn_flood_ns` · `icmp_flood` · `icmp_flood_ns` · `ack_flood` · `ack_flood_ns` · `dns_amplification` · `ntp_amplification` · `cldap_amplification` · `ssdp_amplification` · `http_flood` · `slowloris` · `rapid_reset`
 
+> **What `_ns` means:** it stands for **non-spoofed**. Those profiles send from your
+> real IP address, so they need no special privileges. The plain names (`udp_flood`,
+> `syn_flood`, and so on) are the spoofing versions, which need root or Administrator.
+
 > **Note on errors:** When running `http_flood` or `rapid_reset` you may notice
 > "errors" reported in the output. This is **normal and expected** — it means the
 > tool is working and the target is responding (for example with HTTP errors or
