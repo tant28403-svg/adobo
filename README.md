@@ -37,6 +37,11 @@ If dependencies are missing:
 pip install pydantic pyyaml psutil pyfiglet httpx h2 cryptography
 ```
 
+Optional (for raw profiles and HTTP/3):
+```bash
+pip install scapy aioquic
+```
+
 ## Use
 
 Nothing to configure. Clone it and run it.
@@ -67,7 +72,7 @@ The sender counted 1,220. The target counted 1,218. They are allowed to differ �
 
 ### Profiles
 
-`udp_flood` · `syn_flood` · `icmp_flood` · `ack_flood` · `http_flood` · `slowloris` · `dns_amplification` · `ntp_amplification` · `cldap_amplification` · `ssdp_amplification`
+`udp_flood` · `udp_flood_ns` · `syn_flood` · `syn_flood_ns` · `icmp_flood` · `icmp_flood_ns` · `ack_flood` · `ack_flood_ns` · `dns_amplification` · `ntp_amplification` · `cldap_amplification` · `ssdp_amplification` · `http_flood` · `slowloris` · `rapid_reset`
 
 > **Note on errors:** When running `http_flood` or `rapid_reset`, you may see
 > "errors" reported in the output. This is **normal and expected** — it means
@@ -102,7 +107,7 @@ Every applicable profile in parallel.
 python -m adobo --nuclear
 ```
 
-It asks 12 questions:
+It asks up to 17 questions (some are conditional on previous answers):
 
 ```
 === Nuclear Strike ===
@@ -117,21 +122,20 @@ Payload size (bytes) (max 1,400 - max_payload_bytes) [512]:
 Enable IP spoofing for raw profiles? (requires root/CAP_NET_RAW) [y/N]:
 ```
 
-Two questions aren't asked, because there was no decision to make:
+One question uses a default that isn't prompted (no decision needed):
 
 **Reflector ports** use the well-known service ports (53 / 123 / 389 / 1900).
 
-**Worker threads** use the `max_workers` ceiling, so every profile runs with
-200 by default.
+**Worker threads** are capped by `max_workers` (default ceiling: 200). The nuclear wizard asks how many workers to use per profile.
 
 | Question | What it does |
 |---|---|
 | PPS / Duration | Applied to **each** profile, not divided across them |
-| Workers | Per profile. Ceiling is `max_workers` (200) |
+| Workers | Per profile. Default from lab.yaml or 4 if no ceiling. Max is `max_workers` (200) |
 | Payload | Bytes per packet. Ceiling is 1,400 |
 | IP spoofing | Adds the spoofed variants. Needs root |
 
-Profiles that can't run are reported with the reason, never dropped silently. On Windows the four raw profiles always fail:
+Profiles that can't run are reported with the reason, never dropped silently. On Windows, raw socket profiles (scapy and linux_raw) fail unless Npcap and Administrator privileges are available:
 
 ```
 icmp_flood: never attempted a packet
@@ -156,9 +160,11 @@ python -m adobo.target --port 8001 --defenses all
 | `--duration` | 10 | seconds |
 | `--workers` | 4 | worker threads |
 | `--payload` | 512 | bytes per packet |
-| `--transport` | auto | `socket` · `scapy` · `linux_raw` · `virtual` · `h2` |
+| `--transport` | auto | `socket` · `scapy` · `linux_raw` · `virtual` · `h2` · `h3` · `proxy` |
 | `--tls` | auto on HTTPS ports | `--tls-no-verify` for self-signed certs |
 | `--http2` | off | also `--h2-concurrency N` |
+| `--proxy-file` | (none) | path to proxy list for `--transport proxy` (HTTP profiles only) |
+| `--proxy-health-check` | on | test proxies before run (only when proxies are used) |
 
 Run `python -m adobo --help` for everything else.
 
@@ -176,10 +182,10 @@ Ceiling adjustments from lab.yaml:
 
 | Ceiling | Value |
 |---|---|
-| Throughput | none |
-| Duration | 60 seconds |
+| Throughput | none (configurable via max_pps) |
+| Duration | none (configurable via max_duration_seconds) |
 | Payload | 1,400 bytes |
-| Workers | 200 |
+| Workers | none (configurable via max_workers) |
 
 ## Tests
 
