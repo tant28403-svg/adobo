@@ -1,10 +1,10 @@
 # ADOBO
 
-> **Open Source Notice:** This project is open source. The source code, documentation,
-> tests, and README fully document how every profile, transport, and attack mechanism
+> **Open Source Notice:** This project is open source. The source code, documentation
+> and README fully describe how every profile, transport and attack mechanism
 > works. Anyone who clones this repository can read and understand the complete
-> implementation. Use responsibly and only against systems you own or have explicit
-> written permission to test.
+> implementation. Please use it responsibly, and only against systems you own or
+> have explicit written permission to test.
 >
 > **Capability Notice:** This is a moderate to low intensity DDoS testing tool.
 > It is designed for authorised resilience testing and educational purposes.
@@ -12,41 +12,41 @@
 > measures how services behave under controlled load and is intended for lab
 > and authorised testing environments only.
 
-## ⚠️  FOR EDUCATIONAL AND AUTHORISED RESILIENCE TESTING ONLY  ⚠️
+## ⚠️  FOR EDUCATIONAL USE AND AUTHORISED RESILIENCE TESTING ONLY  ⚠️
 
-**Only use against systems you own or have explicit written permission to test. Unauthorised testing is illegal in most jurisdictions.**
+**Please use this tool only against systems you own or have explicit written permission to test. Unauthorised testing is illegal in most jurisdictions.**
 
-The author accepts **no responsibility** for misuse.
+The author cannot be held responsible for any misuse.
 
 ---
 
-An authorised DDoS resilience lab: measures how your services behave under load.
+A DDoS resilience lab for authorised testing: it measures how your services behave under load.
 
 ## Download
 
-Python 3.11+ required. **Linux only.**
+Python 3.11 or later is required. **Linux only.**
 
-> **Windows support:** The tool currently has some problems on Windows; planning to fix them soon.
+> **Windows support:** The tool currently has some known issues on Windows, and work to resolve them is planned for a future update.
 
 ```bash
 git clone https://github.com/tant28403-svg/adobo.git
 cd adobo
 ```
 
-If dependencies are missing:
+If any dependencies are missing:
 
 ```bash
 pip install pydantic pyyaml psutil pyfiglet httpx h2 cryptography
 ```
 
-Optional (for raw profiles and HTTP/3):
+Optional dependencies (for the raw profiles and HTTP/3):
 ```bash
 pip install scapy aioquic
 ```
 
 ## Proxies
 
-If you have your own proxies, create a `proxies.txt` file (one proxy per line) and point the tool at it:
+If you have your own proxies, you can create a `proxies.txt` file (one proxy per line) and point the tool at it:
 
 ```
 # proxies.txt
@@ -56,11 +56,11 @@ If you have your own proxies, create a `proxies.txt` file (one proxy per line) a
 user:pass@5.6.7.8:3128
 ```
 
-Then run with `--transport proxy --proxy-file proxies.txt` (HTTP profiles only). You can also set `ADOBO_PROXY_FILE` / `ADOBO_PROXIES`.
+You can then run the tool with `--transport proxy --proxy-file proxies.txt` (for HTTP profiles). The `ADOBO_PROXY_FILE` and `ADOBO_PROXIES` environment variables work as well.
 
-A plain `proxies.txt` needs no password. If you want the list encrypted, run `python -m adobo --encrypt-proxies` and set a password when prompted (it is asked twice, and cannot be empty). That writes `proxies.enc`, which is the file you then point the tool at - it asks for the same password when it decrypts the list.
+A plain `proxies.txt` does not require a password. If you would prefer to keep the list encrypted, run `python -m adobo --encrypt-proxies` and choose a password when prompted (it is requested twice and cannot be empty). This produces `proxies.enc`, which is the file you then point the tool at, and the same password is requested when the list is decrypted.
 
-In nuclear mode, when the wizard asks for the proxy list path, type the path to the file you created (or leave it blank for none). If the file is encrypted, the wizard asks for the password next.
+In nuclear mode, when the wizard asks for the proxy list path, you can type the path to the file you created, or leave it blank if you do not want to use proxies. If the file is encrypted, the wizard asks for the password next.
 
 ### How the tool uses your proxies
 
@@ -68,15 +68,15 @@ Please note that this is not proxy chaining. In online proxy chaining, a request
 
 ## Use
 
-Nothing to configure. Clone it and run it.
+There is nothing to configure - clone the repository and you are ready to run.
 
-**1. Start the lab target.** It counts what it served, so you can check the result against a number that isn't the sender's own claim:
+**1. Start the lab target.** It keeps a count of what it served, so you can compare the result against a figure that does not come from the sender's own claim:
 
 ```bash
 python -m adobo.target --port 8001
 ```
 
-**2. Attack it:**
+**2. Send the traffic to it:**
 
 ```bash
 python -m adobo --host 127.0.0.1 --port 8001 \
@@ -90,21 +90,21 @@ python -m adobo --host 127.0.0.1 --port 8001 \
   delivery     99.8% of packets sent reached the target
 ```
 
-The sender counted 1,220. The target counted 1,218. They are allowed to differ — the second number is the one you can trust. (Exact counts vary run to run; the shape is what matters.)
+The sender counted 1,220, while the target counted 1,218. A small difference between the two is expected, and the second figure is the one you can rely on. (Exact counts vary from run to run; the overall shape is what matters.)
 
-> Use port **8001**, not 8000. TLS turns on automatically on `443, 8443, 8080, 9443, 8000, 8888`, and a TLS client against a plaintext target fails.
+> Please use port **8001** rather than 8000. TLS is enabled automatically on `443, 8443, 8080, 9443, 8000, 8888`, and a TLS client talking to a plaintext target will fail.
 
 ### Profiles
 
 `udp_flood` · `udp_flood_ns` · `syn_flood` · `syn_flood_ns` · `icmp_flood` · `icmp_flood_ns` · `ack_flood` · `ack_flood_ns` · `dns_amplification` · `ntp_amplification` · `cldap_amplification` · `ssdp_amplification` · `http_flood` · `slowloris` · `rapid_reset`
 
-> **Note on errors:** When running `http_flood` or `rapid_reset`, you may see
-> "errors" reported in the output. This is **normal and expected** — it means
-> the tool is working and the target is responding (e.g. with HTTP errors or
-> connection resets). If the tool is **not** working, you won't see any error
-> messages at all; the run will simply show zero activity. Errors in these
-> profiles indicate the target is actively handling (and rejecting) your
-> requests, which is the intended behavior.
+> **Note on errors:** When running `http_flood` or `rapid_reset` you may notice
+> "errors" reported in the output. This is **normal and expected** — it means the
+> tool is working and the target is responding (for example with HTTP errors or
+> connection resets). If the tool were **not** working, no error messages would
+> appear at all and the run would simply show zero activity. Errors in these
+> profiles mean the target is actively handling (and rejecting) the requests,
+> which is the intended behaviour.
 
 ```bash
 python -m adobo --host 127.0.0.1 --port 8001 --profile <name> --pps 2000 --duration 10
@@ -134,13 +134,13 @@ python -m adobo --host 127.0.0.1 --port 8001 --profile <name> --pps 2000 --durat
 > applied per profile, not divided across them, so 10 profiles at 500 PPS
 > means 5,000+ PPS combined. Start low and increase gradually.
 
-Every applicable profile in parallel.
+This runs every applicable profile in parallel.
 
 ```bash
 python -m adobo --nuclear
 ```
 
-It asks up to 17 questions (some are conditional on previous answers):
+It asks up to 17 questions, some of which depend on earlier answers:
 
 ```
 === Nuclear Strike ===
@@ -168,16 +168,18 @@ One question uses a default that isn't prompted (no decision needed):
 | Payload | Bytes per packet. Ceiling is 1,400 |
 | IP spoofing | Adds the spoofed variants. Needs root |
 
-Profiles that can't run are reported with the reason, never dropped silently. On Windows, raw socket profiles (scapy and linux_raw) fail unless Npcap and Administrator privileges are available:
+Any profile that cannot run is reported together with the reason, rather than being skipped silently. On Windows, the raw socket profiles (scapy and linux_raw) will fail unless Npcap and Administrator privileges are available:
 
 ```
 icmp_flood: never attempted a packet
   - TransportError('Linux raw sockets unavailable: ...')
 ```
 
-The results table reports **"Handed to OS"**, not "sent". That column counts packets given to the operating system, which is not confirmation of delivery.
+The results table reports **"Handed to OS"** rather than "sent". This column counts the packets passed to the operating system, which should not be read as confirmation of delivery.
 
 ### Hardened target
+
+The target can also be started with its defenses enabled:
 
 ```bash
 python -m adobo.target --port 8001 --defenses all
@@ -199,11 +201,11 @@ python -m adobo.target --port 8001 --defenses all
 | `--proxy-file` | (none) | path to proxy list for `--transport proxy` (HTTP profiles only) |
 | `--proxy-health-check` | on | test proxies before run (only when proxies are used) |
 
-Run `python -m adobo --help` for everything else.
+Run `python -m adobo --help` to see all remaining options.
 
 ## Limits
 
-Throughput is not capped. Ask for the rate you want and the run sends it — what the machine can actually achieve shows up in the achieved figure rather than being trimmed in advance. Add `max_pps` to `config/lab.yaml` if you want a limit.
+Throughput is not capped. You can request the rate you need and the run will send at that rate — what the machine can actually achieve appears in the achieved figure rather than being trimmed in advance. If you would prefer a limit, add `max_pps` to `config/lab.yaml`.
 
 The other three are capped, and every reduction is reported rather than applied silently:
 
@@ -222,6 +224,8 @@ Ceiling adjustments from lab.yaml:
 
 ## Tests
 
+The test suite is maintained privately and is not included in this public repository. If you have a copy that includes it, the suite runs with:
+
 ```bash
 python -m pytest tests/ -q
 ```
@@ -232,4 +236,4 @@ MIT — see `LICENSE`.
 
 ---
 
-**Only send traffic to hosts you control or have written permission to test.**
+**Please only send traffic to hosts you own or have written permission to test.**
