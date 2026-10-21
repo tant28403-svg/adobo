@@ -230,6 +230,14 @@ The test suite is maintained privately and is not included in this public reposi
 python -m pytest tests/ -q
 ```
 
+## Reporting issues
+
+If you run into a bug, or something in the tool does not behave the way this README describes, please feel free to report it. Issues are welcome at:
+
+https://github.com/tant28403-svg/adobo/issues
+
+A short description of what you ran, what you expected and what happened instead is usually enough to get started. Bug reports, feature requests and general feedback are all appreciated.
+
 ## License
 
 MIT — see `LICENSE`.
