@@ -63,6 +63,13 @@ python -m adobo --host 127.0.0.1 --port 8001 --profile <name> --pps 2000 --durat
 
 ### Nuclear mode
 
+> **⚠️ Disclaimer:** Nuclear mode runs every applicable profile in parallel and
+> can consume significant CPU and system resources. Make sure you have a capable
+> machine (multi-core CPU, sufficient RAM) before running it. On low-end or
+> shared systems, nuclear mode may cause high CPU usage, slow response times, or
+> system instability. Consider running individual profiles first to gauge your
+> system's capacity.
+
 Every applicable profile in parallel.
 
 ```bash

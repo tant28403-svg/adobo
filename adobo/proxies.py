@@ -210,6 +210,32 @@ def load_proxies(path: str | Path | None = None) -> list[Proxy]:
     :func:`require_proxies` does.
     """
     if path is None:
+        import os
+        env_path = os.environ.get("ADOBO_PROXY_FILE")
+        if env_path:
+            path = env_path
+
+    # Inline proxies from env var
+    if path is None:
+        import os
+        inline = os.environ.get("ADOBO_PROXIES")
+        if inline:
+            entries = [e.strip() for e in inline.replace(",", "\n").split("\n") if e.strip()]
+            proxies: list[Proxy] = []
+            seen: set[tuple[str, int, str | None]] = set()
+            for entry in entries:
+                try:
+                    proxy = parse_proxy(entry)
+                except ProxyListError:
+                    continue
+                key = (proxy.host, proxy.port, proxy.username)
+                if key in seen:
+                    continue
+                seen.add(key)
+                proxies.append(proxy)
+            return proxies
+
+    if path is None:
         from . import paths
 
         target = paths.home() / DEFAULT_PROXY_FILE
@@ -219,7 +245,21 @@ def load_proxies(path: str | Path | None = None) -> list[Proxy]:
         target = project_path(path)
 
     if not target.exists():
+        if path is None:
+            import sys
+            print(
+                "No proxies.txt found. Copy proxies.example.txt to proxies.txt "
+                "and add your proxies, or set ADOBO_PROXY_FILE / ADOBO_PROXIES.",
+                file=sys.stderr,
+            )
         return []
+
+    # Check if file is encrypted (nuclear mode only supports decryption)
+    if is_encrypted_proxy_file(str(target)):
+        raise ProxyListError(
+            f"{target} appears to be encrypted. Use nuclear mode to decrypt, "
+            "or provide a plaintext proxy file."
+        )
 
     proxies: list[Proxy] = []
     seen: set[tuple[str, int, str | None]] = set()
@@ -311,6 +351,7 @@ class ProxyPool:
             raise ProxyListError("a proxy pool needs at least one proxy")
         self._index = 0
         self._lock = threading.Lock()
+        self._dead: set[int] = set()
 
     def __len__(self) -> int:
         return len(self._proxies)
@@ -318,12 +359,34 @@ class ProxyPool:
     def __iter__(self) -> Iterator[Proxy]:
         return iter(self._proxies)
 
-    def next(self) -> Proxy:
-        """The next proxy in rotation."""
+    def mark_dead(self, proxy: Proxy) -> None:
+        """Mark a proxy as dead so it is skipped in future rotations."""
         with self._lock:
-            proxy = self._proxies[self._index % len(self._proxies)]
-            self._index += 1
-        return proxy
+            for i, p in enumerate(self._proxies):
+                if p is proxy or (p.host == proxy.host and p.port == proxy.port):
+                    self._dead.add(i)
+                    break
+
+    @property
+    def alive_count(self) -> int:
+        """Number of proxies not yet marked dead."""
+        with self._lock:
+            return len(self._proxies) - len(self._dead)
+
+    def next(self) -> Proxy:
+        """The next alive proxy in rotation."""
+        with self._lock:
+            if len(self._dead) >= len(self._proxies):
+                raise ProxyListError("all proxies are dead")
+            attempts = 0
+            while attempts < len(self._proxies):
+                idx = self._index % len(self._proxies)
+                self._index += 1
+                if idx not in self._dead:
+                    return self._proxies[idx]
+                attempts += 1
+            raise ProxyListError("all proxies are dead")
+
 
     @property
     def used(self) -> int:
@@ -347,9 +410,117 @@ class ProxyPool:
         with self._lock:
             return min(self._index, len(self._proxies))
 
+    def health_check(
+        self, target_host: str, target_port: int, timeout: float = 5.0
+    ) -> tuple[list[Proxy], list[tuple[Proxy, str]]]:
+        """Test each proxy by attempting a CONNECT tunnel to the target.
+
+        Returns (alive_proxies, dead_proxies_with_reasons).
+        """
+        import socket
+
+        from .transports.proxy_transport import connect_tunnel
+
+        import concurrent.futures
+
+        alive: list[Proxy] = []
+        dead: list[tuple[Proxy, str]] = []
+
+        def _check(proxy: Proxy) -> tuple[Proxy, bool, str]:
+            try:
+                sock = socket.create_connection(
+                    (proxy.host, proxy.port), timeout=timeout
+                )
+                connect_tunnel(sock, proxy, target_host, target_port, timeout)
+                sock.close()
+                return proxy, True, ""
+            except Exception as exc:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+                return proxy, False, str(exc)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(self._proxies)) as executor:
+            futures = [executor.submit(_check, p) for p in self._proxies]
+            for future in concurrent.futures.as_completed(futures):
+                proxy, is_alive, reason = future.result()
+                if is_alive:
+                    alive.append(proxy)
+                else:
+                    dead.append((proxy, reason))
+
+        return alive, dead
+
     def describe(self) -> dict[str, object]:
         return {
             "proxies": len(self._proxies),
             "authenticated": sum(1 for p in self._proxies if p.needs_auth),
             "handed_out": self.used,
         }
+
+
+# --------------------------------------------------------------------------
+# Encryption / decryption for password-protected proxy files
+# --------------------------------------------------------------------------
+
+import os as _os
+import base64 as _base64
+
+_SALT_SIZE = 16
+_PBKDF2_ITERATIONS = 480_000
+
+
+def _derive_key(password, salt):
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    from cryptography.hazmat.primitives import hashes
+
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt,
+        iterations=_PBKDF2_ITERATIONS,
+    )
+    return _base64.urlsafe_b64encode(kdf.derive(password.encode("utf-8")))
+
+
+def encrypt_proxies(plaintext, password):
+    from cryptography.fernet import Fernet
+
+    salt = _os.urandom(_SALT_SIZE)
+    key = _derive_key(password, salt)
+    fernet = Fernet(key)
+    encrypted = fernet.encrypt(plaintext.encode("utf-8"))
+    return salt + encrypted
+
+
+def decrypt_proxies(data, password):
+    from cryptography.fernet import Fernet, InvalidToken
+
+    if len(data) < _SALT_SIZE + 1:
+        raise ProxyListError("encrypted proxy file is too short or corrupted")
+
+    salt = data[:_SALT_SIZE]
+    encrypted = data[_SALT_SIZE:]
+
+    key = _derive_key(password, salt)
+    fernet = Fernet(key)
+
+    try:
+        decrypted = fernet.decrypt(encrypted)
+    except InvalidToken:
+        raise ProxyListError("wrong password or corrupted proxy file")
+
+    return decrypted.decode("utf-8")
+
+
+def is_encrypted_proxy_file(path):
+    try:
+        with open(path, "rb") as f:
+            data = f.read(_SALT_SIZE + 1)
+        if len(data) < _SALT_SIZE + 1:
+            return False
+        data.decode("utf-8")
+        return False
+    except (UnicodeDecodeError, OSError):
+        return True

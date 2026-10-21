@@ -32,3 +32,9 @@ config/
 # Personal working notes, not part of the project.
 CHECKPOINT.md
 PROGRESS.md
+
+# Proxy credentials - NEVER commit these.
+proxies.txt
+*.proxies
+proxy_list.txt
+proxies.enc

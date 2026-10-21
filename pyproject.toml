@@ -27,6 +27,8 @@ dependencies = [
     "h2>=4.1",
     # Banner rendering
     "pyfiglet>=1.0",
+    # Proxy encryption (--encrypt-proxies). Used for password-protected proxy files.
+    "cryptography>=42.0",
 ]
 
 [project.optional-dependencies]

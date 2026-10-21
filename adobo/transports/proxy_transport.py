@@ -29,7 +29,7 @@ import socket
 from typing import ClassVar
 
 from ..models import ProfileName, Target, TransportKind
-from ..proxies import Proxy, ProxyPool
+from ..proxies import Proxy, ProxyListError, ProxyPool
 from .base import TransportError, supports_profile
 from .http2_transport import H2Transport
 from .socket_transport import SocketTransport
@@ -205,6 +205,43 @@ class _ProxyRouting:
             self.target.port,
             self.connect_timeout,
         )
+
+    def _open_tcp_socket(self):
+        import socket as _socket
+
+        proxy = self.pool.next()
+        self.proxy_in_use = proxy
+        sock = _socket.create_connection(
+            (proxy.host, proxy.port), timeout=self.connect_timeout
+        )
+        connect_tunnel(sock, proxy, self.target.host, self.target.port, self.connect_timeout)
+        return sock
+
+    _MAX_PROXY_RETRIES = 3
+
+    def open(self) -> None:
+        last_exc = None
+        for attempt in range(self._MAX_PROXY_RETRIES):
+            self._teardown()
+            try:
+                super().open()
+                return
+            except (ProxyConnectionError, TransportError, OSError, ProxyListError) as exc:
+                if not isinstance(exc, ProxyListError):
+                    last_exc = exc
+                if self.proxy_in_use is not None:
+                    try:
+                        self.pool.mark_dead(self.proxy_in_use)
+                    except Exception:
+                        pass
+                if isinstance(exc, ProxyListError):
+                    if last_exc is not None:
+                        raise last_exc
+                    raise
+                if attempt < self._MAX_PROXY_RETRIES - 1:
+                    continue
+        if last_exc is not None:
+            raise last_exc
 
     def describe(self) -> dict[str, object]:
         info = super().describe()  # type: ignore[misc]

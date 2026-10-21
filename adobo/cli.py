@@ -203,6 +203,24 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--encrypt-proxies",
+        action="store_true",
+        help=(
+            "Encrypt proxies.txt into proxies.enc using a password. "
+            "The encrypted file can be stored safely; the original proxies.txt "
+            "is not deleted."
+        ),
+    )
+    parser.add_argument(
+        "--proxy-password",
+        default="",
+        help=(
+            "Password for decrypting an encrypted proxy file. "
+            "If not provided and the file is encrypted, you will be prompted. "
+            "Passing on the command line is visible in process lists."
+        ),
+    )
+    parser.add_argument(
         "--keep-alive",
         action="store_true",
         help="Reuse HTTP connections for http_flood (higher throughput; delivery may overcount if target closes connections)",
@@ -432,6 +450,27 @@ def config_from_args(args: argparse.Namespace) -> RunConfig:
 def run_once(config: RunConfig, quiet: bool = False) -> int:
     report, finish = make_progress(quiet=quiet)
     hooks = EngineHooks(on_tick=report)
+
+    # Health check proxies before the run starts
+    if config.transport is TransportKind.PROXY:
+        from .proxies import shared_pool
+        pool = shared_pool(config.proxy_file or None)
+        alive, dead = pool.health_check(
+            config.target.host, config.target.port, timeout=5.0
+        )
+        if dead:
+            _say(f"  Proxy health check: {len(alive)}/{len(pool)} alive, "
+                 f"{len(dead)} dead (skipped)")
+            for proxy, reason in dead:
+                _say(f"    - {proxy.label()}: {reason}")
+        if not alive:
+            _say("\n[!] All proxies are dead. Aborting run.")
+            finish()
+            return EXIT_ERROR
+        # Filter pool to only alive proxies
+        pool._proxies = tuple(alive)
+        pool._dead = set()
+
     engine = RunEngine(config, hooks=hooks)
 
     try:
@@ -463,6 +502,34 @@ def main(argv: Sequence[str] | None = None) -> int:
     # preamble without needing, or wanting, a target.
     if args.inspect_h2:
         return inspect_h2(args)
+
+    # Encrypt proxies: read proxies.txt, encrypt with password, write proxies.enc
+    if args.encrypt_proxies:
+        from .proxies import encrypt_proxies
+        import getpass
+        from pathlib import Path
+
+        src = Path(args.proxy_file) if args.proxy_file else Path("proxies.txt")
+        if not src.exists():
+            _say(f"[!] {src} not found. Create it first with your proxy list.")
+            return EXIT_ERROR
+
+        plaintext = src.read_text(encoding="utf-8")
+        password = getpass.getpass("Enter encryption password: ")
+        confirm = getpass.getpass("Confirm password: ")
+        if password != confirm:
+            _say("[!] Passwords do not match.")
+            return EXIT_ERROR
+        if not password:
+            _say("[!] Password cannot be empty.")
+            return EXIT_ERROR
+
+        encrypted = encrypt_proxies(plaintext, password)
+        dst = src.with_suffix(".enc") if src.suffix == ".txt" else Path("proxies.enc")
+        dst.write_bytes(encrypted)
+        _say(f"Encrypted {src} -> {dst}")
+        _say("Add proxies.enc to .gitignore (already done) and delete proxies.txt if desired.")
+        return EXIT_OK
 
     # Serving the target is the other half of the tool, and it is a different job
     # from attacking: nothing here is a flood, so the wizard and the run engine

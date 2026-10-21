@@ -1739,35 +1739,64 @@ def nuclear_wizard(
             choices_label="preambles",
         )
 
+    _proxy_temp_file = None
     chosen_proxy = _ask_optional_str(
         "Proxy list for http_flood (path, blank = none)",
         preset=proxy_file,
     )
     if chosen_proxy:
-        # Load it here rather than letting ten children each discover it is
-        # missing, and so the operator learns the list is empty before a strike
-        # rather than during one. Note chosen_proxy, not the proxy_file
-        # parameter: reading the parameter here loaded None whenever the answer
-        # came from the prompt rather than from a flag, which is the only way
-        # most operators will ever supply it.
-        try:
-            found = load_proxies(chosen_proxy)
-        except ProxyListError as exc:
-            print(f"  [!] {exc}")
-            found = []
-        if found:
-            authenticated = sum(1 for p in found if p.needs_auth)
-            detail = f", {authenticated} authenticated" if authenticated else ""
-            print(
-                f"  Loaded {len(found)} prox{'y' if len(found) == 1 else 'ies'}{detail}."
-            )
-            print(
-                "  Only http_flood is proxied: the other profiles are UDP floods, "
-                "amplification queries or raw packets, which no HTTP tunnel can carry."
-            )
-        else:
-            print("  [!] That list has no usable entries; http_flood will run direct.")
-            chosen_proxy = ""
+        import getpass
+        import tempfile
+        import os
+        from .proxies import is_encrypted_proxy_file, decrypt_proxies
+
+        _proxy_temp_file = None
+        if is_encrypted_proxy_file(chosen_proxy):
+            password = getpass.getpass("  Proxy password: ")
+            if not password:
+                print("  [!] Password required for encrypted proxy file.")
+                chosen_proxy = ""
+            else:
+                try:
+                    with open(chosen_proxy, "rb") as f:
+                        data = f.read()
+                    plaintext = decrypt_proxies(data, password)
+                    fd, tmp_path = tempfile.mkstemp(prefix="adobo_proxies_", suffix=".txt")
+                    with os.fdopen(fd, "w") as f:
+                        f.write(plaintext)
+                    os.chmod(tmp_path, 0o600)
+                    _proxy_temp_file = tmp_path
+                    chosen_proxy = tmp_path
+                    print("  Proxies decrypted successfully.")
+                except ProxyListError as exc:
+                    print(f"  [!] {exc}")
+                    chosen_proxy = ""
+
+        if chosen_proxy:
+            try:
+                found = load_proxies(chosen_proxy)
+            except ProxyListError as exc:
+                print(f"  [!] {exc}")
+                found = []
+            if found:
+                authenticated = sum(1 for p in found if p.needs_auth)
+                detail = ", %d authenticated" % authenticated if authenticated else ""
+                print(
+                    "  Loaded %d prox%s%s." % (len(found), "y" if len(found) == 1 else "ies", detail)
+                )
+                print(
+                    "  Only http_flood is proxied: the other profiles are UDP floods, "
+                    "amplification queries or raw packets, which no HTTP tunnel can carry."
+                )
+            else:
+                print("  [!] That list has no usable entries; http_flood will run direct.")
+                chosen_proxy = ""
+                if _proxy_temp_file:
+                    try:
+                        os.unlink(_proxy_temp_file)
+                    except OSError:
+                        pass
+                    _proxy_temp_file = None
 
     # HTTP/1.1 keep-alive
     keep_alive = _ask_yes_no(
@@ -1950,4 +1979,10 @@ def nuclear_wizard(
         proxy_file=chosen_proxy,
     )
 
+    if _proxy_temp_file:
+        try:
+            import os
+            os.unlink(_proxy_temp_file)
+        except OSError:
+            pass
     return aggregator.run()
