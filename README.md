@@ -57,6 +57,14 @@ The sender counted 1,220. The target counted 1,218. They are allowed to differ �
 
 `udp_flood` · `syn_flood` · `icmp_flood` · `ack_flood` · `http_flood` · `slowloris` · `dns_amplification` · `ntp_amplification` · `cldap_amplification` · `ssdp_amplification`
 
+> **Note on errors:** When running `http_flood` or `rapid_reset`, you may see
+> "errors" reported in the output. This is **normal and expected** — it means
+> the tool is working and the target is responding (e.g. with HTTP errors or
+> connection resets). If the tool is **not** working, you won't see any error
+> messages at all; the run will simply show zero activity. Errors in these
+> profiles indicate the target is actively handling (and rejecting) your
+> requests, which is the intended behavior.
+
 ```bash
 python -m adobo --host 127.0.0.1 --port 8001 --profile <name> --pps 2000 --duration 10
 ```
