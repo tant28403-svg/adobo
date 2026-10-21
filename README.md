@@ -64,12 +64,7 @@ In nuclear mode, when the wizard asks for the proxy list path, type the path to 
 
 ### How the tool uses your proxies
 
-- **The list is read once at startup.** Each line is parsed as `[scheme://][user:pass@]host:port`. Only HTTP/HTTPS proxies are supported; anything else (a `socks5://` entry, for example) is refused by name rather than being treated as a hostname.
-- **Credentials.** `user:pass@` becomes a standard `Proxy-Authorization` header on the tunnel request. Passwords are never printed: output names a proxy as `user@host:port`.
-- **Health check first.** Before the run, every proxy is tested against the target. Dead ones are reported and skipped; if none survive, the run aborts instead of pretending to be distributed.
-- **Rotation is round-robin across the whole run.** One pool is shared by every worker, so the list is not re-used from the top by each worker separately. A proxy belongs to a TCP connection, so with keep-alive off (the default) the transport opens a connection per request and each request leaves through a different proxy. With keep-alive on, a proxy is held for 100 requests before the connection is recycled.
-- **Only HTTP traffic is proxied.** `http_flood` (including over HTTP/2) goes out through your proxies. UDP floods, amplification queries and raw or spoofed packets cannot be redirected through an HTTP proxy, so those still leave from your own address. In nuclear mode, `http_flood` is the only proxied profile.
-- **The run reports it.** The summary shows how many distinct proxies were actually reached, so a list that was only partly used is visible rather than implied.
+This is not proxy chaining. Each request is sent straight out through one of the proxies you listed, so the target sees that proxy's address as the source, the way it would see a real client. The list is rotated round-robin, so consecutive requests leave from different addresses. Only HTTP traffic (`http_flood`) can be proxied; UDP, amplification and raw packets still leave from your own machine.
 
 ## Use
 
