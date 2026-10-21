@@ -24,7 +24,7 @@ An authorised DDoS resilience lab: measures how your services behave under load.
 
 ## Download
 
-Python 3.11+ required.
+Python 3.11+ required. **Linux only.**
 
 ```bash
 git clone https://github.com/tant28403-svg/adobo.git
