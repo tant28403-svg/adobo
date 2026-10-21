@@ -106,7 +106,9 @@ python -m adobo --host 127.0.0.1 --port 8001 --profile <name> --pps 2000 --durat
 > connection and infrastructure can handle the combined load of all profiles
 > running simultaneously. On limited or shared networks, this may cause
 > congestion, packet loss, or connectivity issues for other devices and services
-> on the same network.
+> on the same network. **Avoid setting PPS too high** — in nuclear mode, PPS is
+> applied per profile, not divided across them, so 10 profiles at 500 PPS
+> means 5,000+ PPS combined. Start low and increase gradually.
 
 Every applicable profile in parallel.
 
