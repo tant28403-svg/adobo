@@ -77,6 +77,17 @@ pip install psutil cryptography pyfiglet
 pip install scapy aioquic      # raw profiles and HTTP/3 (won't send on unrooted devices)
 ```
 
+> **If `pydantic` fails to install on Termux:** it usually has no prebuilt
+> Android wheel, so pip compiles `pydantic-core` in Rust. Install the
+> toolchain first, then retry:
+> ```bash
+> termux-wake-lock
+> pkg install rust clang
+> pip install pydantic
+> ```
+> Or use Termux's package if available: `pkg install python-pydantic`.
+> Keep the device awake and plugged in; the build can take 10-20 minutes.
+
 ## Proxies
 
 If you have your own proxies, you can create a `proxies.txt` file (one proxy per line) and point the tool at it:
