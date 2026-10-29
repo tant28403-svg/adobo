@@ -60,6 +60,23 @@ Or install everything for a feature set at once:
 pip install -e .[raw,http3,ui,lab]
 ```
 
+### Termux / Android (download & install)
+
+```bash
+pkg update && pkg upgrade -y
+pkg install -y python git
+
+git clone https://github.com/tant28403-svg/adobo.git
+cd adobo
+
+pip install pydantic pyyaml httpx h2
+
+# Optional extras (fall back to pkg if a pip build fails):
+pip install psutil cryptography pyfiglet
+# pkg install python-psutil   # if pip's psutil build fails
+pip install scapy aioquic      # raw profiles and HTTP/3 (won't send on unrooted devices)
+```
+
 ## Proxies
 
 If you have your own proxies, you can create a `proxies.txt` file (one proxy per line) and point the tool at it:
@@ -231,26 +248,6 @@ Run `python -m adobo --help` to see all remaining options.
 ADOBO runs on [Termux](https://termux.dev) so you can use it directly from a phone.
 The core is pure Python and works without root; the raw-packet profiles that need
 `CAP_NET_RAW` will report themselves as unavailable instead of crashing.
-
-### Install on Termux
-
-```bash
-pkg update && pkg upgrade
-pkg install python git clang make pkg-config
-
-pip install pydantic pyyaml httpx h2
-
-# Optional extras (fall back to pkg if a pip build fails):
-pip install psutil cryptography pyfiglet
-# pkg install python-psutil   # if pip's psutil build fails
-```
-
-Raw profiles (scapy / linux_raw) are optional and will not send on an unrooted
-device:
-
-```bash
-pip install scapy aioquic
-```
 
 ### Run
 
