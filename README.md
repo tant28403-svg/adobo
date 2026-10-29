@@ -31,7 +31,8 @@ A DDoS resilience lab for authorised testing: it measures how your services beha
 
 ## Download
 
-Python 3.11 or later is required. **Linux only.**
+Python 3.11 or later is required. **Linux and Termux/Android** (see the Termux
+section below). Windows has known issues.
 
 > **Windows support:** The tool currently has some known issues on Windows, and work to resolve them is planned for a future update.
 
@@ -43,12 +44,20 @@ cd adobo
 If any dependencies are missing:
 
 ```bash
-pip install pydantic pyyaml psutil pyfiglet httpx h2 cryptography
+pip install pydantic pyyaml psutil httpx h2 cryptography
 ```
 
-Optional dependencies (for the raw profiles and HTTP/3):
+Optional dependencies:
+
 ```bash
-pip install scapy aioquic
+pip install scapy aioquic          # raw profiles and HTTP/3
+pip install pyfiglet               # banner rendering only
+```
+
+Or install everything for a feature set at once:
+
+```bash
+pip install -e .[raw,http3,ui,lab]
 ```
 
 ## Proxies
