@@ -8,7 +8,10 @@ import time
 from pathlib import Path
 from typing import Sequence
 
-from pyfiglet import Figlet
+try:  # Optional: banner rendering only. Termux/lean installs may not have it.
+    from pyfiglet import Figlet
+except ImportError:  # pragma: no cover - optional dependency
+    Figlet = None
 
 from .engine import EngineHooks, RunEngine, RunOutcome
 from .fingerprint import DEFAULT_FINGERPRINT_KEY
@@ -29,7 +32,7 @@ EXIT_ERROR = 1
 
 
 def _print_banner() -> None:
-    if sys.platform == "linux":
+    if sys.platform == "linux" and Figlet is not None:
         f = Figlet(font="standard")
         print(f.renderText("ADOBO"), flush=True)
 

@@ -25,14 +25,16 @@ dependencies = [
     # which meant the tool only worked on machines that happened to have it
     # installed already.
     "h2>=4.1",
-    # Banner rendering
-    "pyfiglet>=1.0",
     # Proxy encryption (--encrypt-proxies). Used for password-protected proxy files.
     "cryptography>=42.0",
 ]
 
 [project.optional-dependencies]
 raw = ["scapy>=2.6"]
+# Banner rendering (optional; tool works without it).
+ui = ["pyfiglet>=1.0"]
+# Termux / lean installs: core subset without psutil (monitor degrades gracefully).
+termux = ["pydantic>=2.6", "pyyaml>=6.0", "httpx>=0.28", "h2>=4.1"]
 # HTTP/3 (--transport h3). Optional in a way h2 is not: every aioquic import in
 # adobo/transports/http3_transport.py is inside a function or a lazy builder, so
 # the tool starts and every other transport works without it. It is declared here

@@ -217,6 +217,64 @@ python -m adobo.target --port 8001 --defenses all
 
 Run `python -m adobo --help` to see all remaining options.
 
+## Termux / Android
+
+ADOBO runs on [Termux](https://termux.dev) so you can use it directly from a phone.
+The core is pure Python and works without root; the raw-packet profiles that need
+`CAP_NET_RAW` will report themselves as unavailable instead of crashing.
+
+### Install on Termux
+
+```bash
+pkg update && pkg upgrade
+pkg install python git clang make pkg-config
+
+pip install pydantic pyyaml httpx h2
+
+# Optional extras (fall back to pkg if a pip build fails):
+pip install psutil cryptography pyfiglet
+# pkg install python-psutil   # if pip's psutil build fails
+```
+
+Raw profiles (scapy / linux_raw) are optional and will not send on an unrooted
+device:
+
+```bash
+pip install scapy aioquic
+```
+
+### Run
+
+```bash
+git clone https://github.com/tant28403-svg/adobo.git
+cd adobo
+
+# Keep the device awake while running:
+termux-wake-lock
+
+# Local target + load (same device):
+python -m adobo.target --port 8001
+python -m adobo --host 127.0.0.1 --port 8001 --profile http_flood --pps 500 --duration 10
+```
+
+To let another device reach the target, bind to all interfaces (only on a trusted
+network — the lab target is intentionally fragile):
+
+```bash
+python -m adobo.target --host 0.0.0.0 --port 8001
+python -m adobo --host <device-ip> --port 8001 --profile http_flood --pps 500 --duration 10
+```
+
+### Notes for mobile
+
+- **No root needed** for `http_flood`, `slowloris`, `rapid_reset`, the `_ns`
+  variants, and the socket/h2/h3/proxy/virtual transports. Spoofed raw profiles
+  report `CAP_NET_RAW` unavailable on unrooted devices — use the `_ns` variants.
+- **Battery/thermal:** keep PPS and workers low; nuclear mode is heavy.
+- **Backgrounding:** Android may kill Termux. Use `termux-wake-lock`, `tmux`,
+  or `nohup`.
+- **Python:** 3.11 or later (Termux `pkg install python` currently provides 3.11+).
+
 ## Tests
 
 The test suite is maintained privately and is not included in this public repository. If you have a copy that includes it, the suite runs with:
