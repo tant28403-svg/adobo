@@ -161,6 +161,7 @@ def _h2_request_shape(attack) -> dict:
         content_type=getattr(
             attack, "content_type", "application/x-www-form-urlencoded"
         ),
+        host_header=getattr(attack, "http_host", ""),
     )
 
 
@@ -283,6 +284,7 @@ def get_transport(config: RunConfig) -> Transport:
             use_tls=attack.use_tls,
             tls_verify=attack.tls_verify,
             sndbuf=65536,
+            host_header=getattr(attack, "http_host", ""),
         )
 
     if config.transport is TransportKind.LINUX_RAW:

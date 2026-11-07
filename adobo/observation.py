@@ -147,11 +147,22 @@ class _HttpStats:
         timeout: float,
         tls: bool = False,
         verify: bool = True,
+        host_header: str = "",
     ) -> None:
         scheme = "https" if tls else "http"
         self._url = f"{scheme}://{host}:{port}{path}"
         self._timeout = timeout
         self._verify = verify
+        self._headers = {"Host": host_header} if host_header else None
+        """The Host the attack presents, when one was configured.
+
+        httpx would otherwise derive Host from the URL - the IP - and on a
+        CDN-fronted target that lands on the edge's catch-all instead of the
+        site whose counters this reader exists to see. Note that TLS
+        *verification* still checks the URL host (the IP); a certificate that
+        only names the domain verifies only when the run's verify answer is
+        off or the target is addressed by name.
+        """
 
     async def get(self, timeout: float | None = None) -> dict[str, Any]:
         import httpx
@@ -160,7 +171,7 @@ class _HttpStats:
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(effective), verify=self._verify
         ) as client:
-            response = await client.get(self._url)
+            response = await client.get(self._url, headers=self._headers)
             response.raise_for_status()
             return response.json()
 
@@ -186,6 +197,7 @@ class TargetObserver:
         fetch: Callable[[float | None], Awaitable[dict[str, Any]]] | None = None,
         tls: bool = False,
         verify: bool = True,
+        host_header: str = "",
     ) -> None:
         scheme = "https" if tls else "http"
         self._url = f"{scheme}://{host}:{port}{path}"
@@ -199,7 +211,13 @@ class TargetObserver:
             self._fetch = fetch  # type: ignore[assignment]
         else:
             client = _HttpStats(
-                host, port, path=path, timeout=timeout, tls=tls, verify=verify
+                host,
+                port,
+                path=path,
+                timeout=timeout,
+                tls=tls,
+                verify=verify,
+                host_header=host_header,
             )
             self._fetch = client.get  # type: ignore[assignment]
 

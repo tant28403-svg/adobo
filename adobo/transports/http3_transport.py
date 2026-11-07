@@ -380,6 +380,7 @@ class Http3Transport(Transport):
         referer: str = "",
         body: str = "",
         content_type: str = "application/x-www-form-urlencoded",
+        host_header: str = "",
     ) -> None:
         super().__init__(target, profile)
         if not supports_profile(TransportKind.H3, profile):
@@ -416,6 +417,11 @@ class Http3Transport(Transport):
                 "no body, so the DATA frames would never be sent and the stream "
                 "would stall half-open"
             )
+        self.host_header = host_header
+        """Host header override (the ``:authority`` pseudo-header), and with it
+        the QUIC server_name. Empty means both follow the connection target as
+        before; set, a CDN-fronted target reached by IP routes to the site and
+        the handshake presents the certificate's name."""
         self._protocol: Any = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stop_async: asyncio.Event | None = None
@@ -519,7 +525,10 @@ class Http3Transport(Transport):
             is_client=True,
             alpn_protocols=H3_ALPN,
             verify_mode=self._verify_mode(),
-            server_name=self.target.host,
+            # server_name follows the configured Host when one is set: QUIC
+            # carries that name in the ClientHello, so a certificate that
+            # names the domain verifies even when the connection is the IP.
+            server_name=self.host_header or self.target.host,
         )
         # connect() is an async context manager, not a coroutine, so it cannot be
         # awaited. Entered and exited explicitly rather than with `async with` so
@@ -687,8 +696,12 @@ class Http3Transport(Transport):
         block this transport always produced.
         """
         scheme = "https"
-        authority = self.target.host
-        if self.target.port != 443:
+        # The configured Host, when one is set: an edge routes by :authority,
+        # so without it a flood addressed to the IP reaches the catch-all.
+        # A host override already carries whatever port form it came with, so
+        # it is used verbatim; empty keeps the historical composed value.
+        authority = self.host_header or self.target.host
+        if not self.host_header and self.target.port != 443:
             authority = f"{self.target.host}:{self.target.port}"
 
         persona = self.persona or (attack.persona() if attack is not None else None)

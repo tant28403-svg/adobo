@@ -88,6 +88,7 @@ class H2Transport(Transport):
         referer: str = "",
         body: str = "",
         content_type: str = "application/x-www-form-urlencoded",
+        host_header: str = "",
     ) -> None:
         super().__init__(target, profile)
         if not supports_profile(TransportKind.H2, profile):
@@ -100,6 +101,11 @@ class H2Transport(Transport):
         self.concurrency = concurrency
         self.tls_verify = tls_verify
         self.tcp_path = tcp_path
+        self.host_header = host_header
+        """Host header override (the ``:authority`` pseudo-header), and with
+        it the TLS SNI. Empty means both follow the connection target exactly
+        as before; set, a CDN-fronted target reached by IP routes to the site
+        and the handshake presents the certificate's name."""
         self._method = method.strip().lower()
         """The verb every stream on this connection sends.
 
@@ -191,9 +197,12 @@ class H2Transport(Transport):
 
             # TLS with ALPN
             ctx = self._build_tls_context()
+            # SNI follows the configured Host when one is set: the certificate
+            # on a CDN edge names the domain, so verification succeeds even
+            # when the connection target is the IP.
             self._sock = ctx.wrap_socket(
                 raw_sock,
-                server_hostname=self.target.host
+                server_hostname=self.host_header or self.target.host
             )
             negotiated = self._sock.selected_alpn_protocol()
             if negotiated != 'h2':
@@ -403,7 +412,10 @@ class H2Transport(Transport):
         pseudo_values = {
             ':method': self._method.upper(),
             ':path': self.tcp_path,
-            ':authority': self.target.host,
+            # The configured Host, when one is set: an edge routes by
+            # :authority, so without this a flood addressed to the IP lands on
+            # the catch-all. Empty keeps the historical target-host value.
+            ':authority': self.host_header or self.target.host,
             ':scheme': 'https',
         }
         order = (

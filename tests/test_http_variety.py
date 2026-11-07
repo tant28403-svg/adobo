@@ -79,6 +79,39 @@ class TestDefaultsAreUnchanged:
 
 
 # ---------------------------------------------------------------------------
+# Host header override
+# ---------------------------------------------------------------------------
+
+
+class TestHostHeader:
+    """The Host override, for CDN-fronted targets reached by IP.
+
+    A CDN edge routes by Host, so a flood that presents the target's IP as
+    Host reaches the edge's catch-all - a 308 redirect or a 403 - rather than
+    the site. The override changes exactly one line and nothing else.
+    """
+
+    def test_the_default_host_is_still_the_target(self) -> None:
+        assert b"Host: lab.internal\r\n" in build(size=128)
+
+    def test_the_override_replaces_only_the_host_line(self) -> None:
+        default = build(size=512)
+        overridden = build(size=512, host_header="www.lab.internal")
+        assert b"Host: www.lab.internal\r\n" in overridden
+        # The Host line changed; padding adjusts to keep total size constant,
+        # so only that line differs - verify by checking everything else
+        # matches the pattern (first line, persona, connection, seq, blank).
+        assert overridden.split(b"\r\n")[0] == default.split(b"\r\n")[0]  # request line
+        assert b"User-Agent: adobo-lab/0.1 (authorized testing)" in overridden
+        assert b"Connection: close" in overridden
+        assert b"X-Ddosim-Seq: 7" in overridden
+
+    def test_a_host_with_port_is_sent_verbatim(self) -> None:
+        payload = build(size=256, host_header="lab.internal:8443")
+        assert b"Host: lab.internal:8443\r\n" in payload
+
+
+# ---------------------------------------------------------------------------
 # POST
 # ---------------------------------------------------------------------------
 
@@ -238,6 +271,21 @@ class TestValidators:
         with pytest.raises(ValidationError, match="second request"):
             profile(cookie_header="a=b\r\nX-Evil: 1")
 
+    def test_a_space_in_http_host_is_refused(self) -> None:
+        with pytest.raises(ValidationError, match="bare host"):
+            profile(http_host="a b")
+
+    def test_a_slash_in_http_host_is_refused(self) -> None:
+        with pytest.raises(ValidationError, match="bare host"):
+            profile(http_host="lab.test/path")
+
+    def test_crlf_in_http_host_is_refused(self) -> None:
+        with pytest.raises(ValidationError, match="bare host"):
+            profile(http_host="lab.test\r\nX-Evil: 1")
+
+    def test_a_plain_host_with_port_is_accepted(self) -> None:
+        assert profile(http_host="lab.test:8443").http_host == "lab.test:8443"
+
     def test_crlf_in_referer_is_refused(self) -> None:
         with pytest.raises(ValidationError, match="second request"):
             profile(referer="https://x.test/\r\nHost: evil.test")
@@ -283,6 +331,20 @@ class TestCliMapping:
         assert attack.http_body == "a=1&b=2"
         assert attack.cookie_header == "id=1"
         assert attack.referer == "https://x.test/"
+
+    def test_http_host_flag_reaches_the_profile(self) -> None:
+        config = config_from_args(parse(["--http-host", "www.lab.internal"]))
+        assert config.attack.http_host == "www.lab.internal"
+
+    def test_http_host_defaults_to_empty(self) -> None:
+        assert config_from_args(parse([])).attack.http_host == ""
+
+    def test_a_bad_http_host_is_refused_naming_the_field(self, capsys) -> None:
+        """A space would split the Host header value; the refusal says so."""
+        with pytest.raises(SystemExit):
+            config_from_args(parse(["--http-host", "a b"]))
+        out = capsys.readouterr().out
+        assert "http_host" in out
 
     def test_defaults_survive_a_namespace_without_the_flags(self) -> None:
         """Hand-built Namespaces in older tests predate these flags."""

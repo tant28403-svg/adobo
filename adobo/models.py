@@ -239,6 +239,23 @@ class AttackProfile(BaseModel):
     content_type: str = Field(default="application/x-www-form-urlencoded", max_length=8192)
     """``Content-Type`` for a POST body."""
 
+    http_host: str = Field(default="", max_length=255)
+    """``Host`` header override, and with it the TLS SNI the request presents.
+
+    Empty (the default) means the header follows the connection target exactly
+    as it always has, so a run that sets nothing is byte-identical to one from
+    before this field existed.
+
+    Set when a CDN fronts the target and the operator connects by IP: the edge
+    routes by Host, so without this the flood (and every probe) reaches the
+    catch-all - a 308 redirect or a 403 - instead of the site. It is also the
+    clean fix for certificate verification against an IP: the handshakes
+    present the name the certificate actually carries.
+
+    One header value, validated to be exactly that: no spaces, no slashes, no
+    control characters.
+    """
+
     fingerprint: str = Field(default=DEFAULT_FINGERPRINT_KEY)
     """Which declared client identity to send. See :mod:`adobo.fingerprint`.
 
@@ -347,6 +364,18 @@ class AttackProfile(BaseModel):
                 "header values must not contain control characters: a CR or LF "
                 "inside a header would be read as the end of the header block, "
                 "and whatever follows as a second request"
+            )
+        return value
+
+    @field_validator("http_host")
+    @classmethod
+    def _http_host_must_be_an_authority(cls, value: str) -> str:
+        if _has_http_control_chars(value) or " " in value or "/" in value:
+            raise ValueError(
+                "http_host must be a bare host, optionally host:port: no "
+                "spaces, slashes or control characters. A raw space would "
+                "split the Host header value, and a slash does not belong in "
+                "an authority - the path belongs in --http-path"
             )
         return value
 

@@ -63,6 +63,7 @@ class SocketTransport(Transport):
         keep_alive: bool = False,
         use_tls: bool = False,
         tls_verify: bool = True,
+        host_header: str = "",
     ) -> None:
         super().__init__(target, profile)
         if not supports_profile(TransportKind.SOCKET, profile):
@@ -79,6 +80,12 @@ class SocketTransport(Transport):
         self.keep_alive = keep_alive
         self.use_tls = use_tls
         self.tls_verify = tls_verify
+        self.host_header = host_header
+        """Host header override, and with it the TLS SNI. Empty means both
+        follow the connection target as before. The Host line in each request
+        is built by build_payload from the profile, not here; this attribute
+        exists for the handshake, where a CDN-fronted target reached by IP
+        needs the certificate's name presented."""
         self._sock: socket.socket | None = None
         self._family = socket.AF_INET
         self._using_tcp = profile is ProfileName.HTTP_FLOOD
@@ -197,9 +204,12 @@ class SocketTransport(Transport):
                 # Wrap with TLS after successful TCP connect
                 if self.use_tls:
                     self._tls_context = self._build_tls_context()
+                    # SNI follows the configured Host: a CDN-fronted target
+                    # reached by IP presents the name the certificate carries,
+                    # so verification can stay on.
                     self._sock = self._tls_context.wrap_socket(
                         self._sock,
-                        server_hostname=self.target.host
+                        server_hostname=self.host_header or self.target.host
                     )
                     self._tls_wrapped = True
         except OSError as exc:

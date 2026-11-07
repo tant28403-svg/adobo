@@ -47,6 +47,9 @@ class _PeerSocket:
         self.sent = bytearray()
         self.closed = False
         self.events: list = []
+        self.sni: str | None = None
+        """What the handshake presented as server_name, recorded by the fake
+        TLS context - the h2 path's SNI is otherwise unobservable here."""
         self._peer = h2.connection.H2Connection(
             config=h2.config.H2Configuration(client_side=False, header_encoding="utf-8")
         )
@@ -92,7 +95,8 @@ class _RecordingContext:
     def __init__(self, recorder: _PeerSocket) -> None:
         self._recorder = recorder
 
-    def wrap_socket(self, sock, server_hostname=None):  # noqa: ANN001, ARG002
+    def wrap_socket(self, sock, server_hostname=None):  # noqa: ANN001
+        self._recorder.sni = server_hostname
         return self._recorder
 
 
@@ -190,6 +194,34 @@ class TestHeaderBlock:
         assert "referer" not in names
         assert "cookie" not in names
         assert "content-length" not in names
+
+    def test_a_configured_host_replaces_the_authority(self) -> None:
+        """A CDN edge routes by :authority, so the override must land there."""
+        transport = H2Transport(
+            TARGET, ProfileName.HTTP_FLOOD, host_header="www.lab.test"
+        )
+        headers = dict(transport._build_stream_headers())
+        assert headers[":authority"] == "www.lab.test"
+        # Exactly one value differs from the default block.
+        default = dict(
+            H2Transport(TARGET, ProfileName.HTTP_FLOOD)._build_stream_headers()
+        )
+        default[":authority"] = "www.lab.test"
+        assert headers == default
+
+    def test_the_handshake_presents_the_host_as_sni(self, monkeypatch) -> None:
+        """SNI follows the Host: the certificate's name is presented even
+        though the connection target is an address."""
+        transport, recorder = _drive(monkeypatch, host_header="www.lab.test")
+        with transport:
+            transport.send_one(b"")
+        assert recorder.sni == "www.lab.test"
+
+    def test_the_default_handshake_presents_the_target(self, monkeypatch) -> None:
+        transport, recorder = _drive(monkeypatch)
+        with transport:
+            transport.send_one(b"")
+        assert recorder.sni == TARGET.host
 
 
 # ---------------------------------------------------------------------------

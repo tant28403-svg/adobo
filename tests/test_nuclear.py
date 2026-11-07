@@ -547,6 +547,17 @@ class TestOperatorValuesReachTheChildren:
         assert attack.use_http2 is True
         assert attack.h2_concurrency == 250
 
+    def test_http_host_reaches_the_child(self) -> None:
+        attack = _child_attack(http_host="www.lab.test")
+        assert attack.http_host == "www.lab.test"
+
+    def test_a_literal_http_host_is_not_silently_ignored(self) -> None:
+        """The regression that matters: a literal would pass the test above
+        only if it happened to equal www.lab.test. Check a second value so
+        no constant can satisfy both."""
+        assert _child_attack(http_host="api.lab.test").http_host == "api.lab.test"
+        assert _child_attack(http_host="lab.test:8443").http_host == "lab.test:8443"
+
     def test_http2_picks_the_h2_transport_for_the_http_profile(self) -> None:
         """Routing is decided in build_profiles, tuning in the aggregator. Both
         halves have to be right or the run silently uses plain HTTP/1.1."""

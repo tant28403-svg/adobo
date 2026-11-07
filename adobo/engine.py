@@ -335,11 +335,19 @@ class RunEngine:
             or config.transport is TransportKind.H3
         )
         self._probe_verify = bool(getattr(config.attack, "tls_verify", True))
+        self._probe_host = getattr(config.attack, "http_host", "") or ""
+        """The Host header the attack presents, when one was configured.
+
+        The probes and the /stats read follow it, because on a CDN-fronted
+        target the Host is what decides whether the request reaches the site
+        or the edge's catch-all - a probe without it measures the catch-all.
+        """
         self._observer = TargetObserver(
             config.target.host,
             config.target.port,
             tls=self._probe_tls,
             verify=self._probe_verify,
+            host_header=self._probe_host,
         )
         self._observe_target_enabled = observe_target
         self._stats_before: tuple[int, int] | None = None
@@ -712,6 +720,7 @@ class RunEngine:
                         referer=profile.referer,
                         body=profile.http_body,
                         content_type=profile.content_type,
+                        host_header=profile.http_host,
                     )
                 )
             next_send += interval * self.batch
@@ -1035,6 +1044,7 @@ class RunEngine:
                 self.probe_path,
                 timeout=self.probe_timeout_s,
                 tls_verify=tls_verify,
+                host_header=self._probe_host,
             )
             self._probes.append(
                 ProbeResult(
@@ -1057,8 +1067,12 @@ class RunEngine:
             f"{self.probe_path}"
         )
         started = time.monotonic()
+        # The Host the attack presents, when one is configured: an edge routes
+        # by it, so a probe without it measures the catch-all rather than the
+        # site the flood is aimed at.
+        headers = {"Host": self._probe_host} if self._probe_host else None
         try:
-            response = await client.get(url)
+            response = await client.get(url, headers=headers)
         except Exception as exc:  # noqa: BLE001 - any failure is a failed probe
             return ProbeResult(
                 t=t,

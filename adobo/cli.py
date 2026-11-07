@@ -298,6 +298,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--http-host",
+        dest="http_host",
+        default="",
+        help=(
+            "Host header for http_flood (and TLS SNI), e.g. yourdomain.com. "
+            "Required when a CDN fronts the target and you connect by IP: the "
+            "edge routes by Host, so without it the flood reaches the "
+            "catch-all instead of the site"
+        ),
+    )
+    parser.add_argument(
         "--referer",
         default="",
         help="Referer header value for http_flood (omitted from the request when empty)",
@@ -608,6 +619,7 @@ def config_from_args(args: argparse.Namespace) -> RunConfig:
             referer=referer,
             http_body=body,
             content_type=content_type,
+            http_host=getattr(args, "http_host", "") or "",
         )
     except ValidationError as exc:
         # A refused configuration is an operator mistake with an obvious fix,
@@ -911,6 +923,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     if getattr(args, "proxy_default_scheme", "http") in (None, "http")
                     else args.proxy_default_scheme
                 ),
+                http_host=getattr(args, "http_host", "") or None,
                 # --profiles is forwarded as a preset: the wizard validates it
                 # against the profiles that survive the privilege and port
                 # filters, so a name that cannot run in this strike is a hard

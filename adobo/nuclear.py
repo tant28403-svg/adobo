@@ -708,6 +708,7 @@ class NuclearAggregator:
         http_body: str = "",
         content_type: str = "application/x-www-form-urlencoded",
         proxy_default_scheme: str = "http",
+        http_host: str = "",
     ):
         self.profiles = profiles
         self.target_ip = target_ip
@@ -746,6 +747,11 @@ class NuclearAggregator:
         self.http_body = http_body
         self.content_type = content_type
         self.proxy_default_scheme = proxy_default_scheme
+        self.http_host = http_host
+        """Host header override for the http_flood child and the parent's
+        probes//stats reads. Empty means everything follows the target's
+        address exactly as before. See AttackProfile.http_host for why a
+        CDN-fronted target reached by IP needs it."""
 
         # Use spawn context for Windows compatibility
         self._ctx = mp.get_context('spawn')
@@ -1488,6 +1494,7 @@ class NuclearAggregator:
             "referer": self.referer,
             "http_body": self.http_body,
             "content_type": self.content_type,
+            "http_host": self.http_host,
         }
 
     def run(self) -> int:
@@ -1534,6 +1541,7 @@ class NuclearAggregator:
             stats_port,
             tls=tls_stats,
             verify=self.tls_verify,
+            host_header=self.http_host,
         )
         self._stats_before = _read_stats(self._observer)
 
@@ -1843,6 +1851,7 @@ def nuclear_wizard(
     data: str | None = None,
     content_type: str | None = None,
     proxy_default_scheme: str | None = None,
+    http_host: str | None = None,
     selected_profiles: str | None = None,
 ) -> int:
     """Interactive wizard for nuclear mode.
@@ -2065,6 +2074,18 @@ def nuclear_wizard(
                     except OSError:
                         pass
                     _proxy_temp_file = None
+
+    # Host header override. Asked because a CDN-fronted target reached by IP
+    # cannot be tested without it: the edge routes by Host, so the flood, the
+    # probes and the /stats read all land on the catch-all (a 308 redirect or
+    # a 403) instead of the site. The question is optional with a blank
+    # default, so a strike that needs none is byte-identical to one from
+    # before this question existed. TLS SNI follows it too, which is also how
+    # a certificate that names the domain verifies against an IP connection.
+    chosen_http_host = _ask_optional_str(
+        "Host header for http_flood (blank = none; use when a CDN fronts the target)",
+        preset=http_host,
+    )
 
     # HTTP/1.1 keep-alive
     keep_alive = _ask_yes_no(
@@ -2346,6 +2367,7 @@ def nuclear_wizard(
         http_body=data or "",
         content_type=content_type or "application/x-www-form-urlencoded",
         proxy_default_scheme=proxy_default_scheme or "http",
+        http_host=chosen_http_host,
     )
 
     # Announce what the flags did, in the same voice as the workers line: a
@@ -2362,6 +2384,11 @@ def nuclear_wizard(
         print(f"  http_flood request shape: {', '.join(parts)}")
     if proxy_default_scheme:
         print(f"  proxy default scheme: {proxy_default_scheme}")
+    if chosen_http_host:
+        print(
+            f"  Host header: {chosen_http_host} "
+            f"(http_flood requests, availability probes and /stats all present it)"
+        )
 
     if _proxy_temp_file:
         try:

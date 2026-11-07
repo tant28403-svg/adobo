@@ -651,6 +651,35 @@ class TestRequestShape:
             (b"accept", b"*/*"),
         ]
 
+    def test_a_configured_host_replaces_the_authority(self) -> None:
+        """The Host override lands in :authority, verbatim and alone."""
+        from adobo.transports.http3_transport import Http3Transport
+
+        target = Target(host="127.0.0.1", port=443)
+        default = Http3Transport(target, ProfileName.HTTP_FLOOD)._build_headers(None)
+        overridden = Http3Transport(
+            target, ProfileName.HTTP_FLOOD, host_header="www.lab.test"
+        )._build_headers(None)
+        assert dict(overridden)[b":authority"] == b"www.lab.test"
+        # Everything else is identical to the default block.
+        assert [
+            (name, value) for name, value in overridden if name != b":authority"
+        ] == [
+            (name, value) for name, value in default if name != b":authority"
+        ]
+
+    def test_a_host_with_port_is_sent_verbatim(self) -> None:
+        """Unlike the composed authority, the override is not re-suffixed: the
+        operator already wrote whatever port form they meant."""
+        from adobo.transports.http3_transport import Http3Transport
+
+        transport = Http3Transport(
+            Target(host="127.0.0.1", port=8443),
+            ProfileName.HTTP_FLOOD,
+            host_header="lab.test:443",
+        )
+        assert dict(transport._build_headers(None))[b":authority"] == b"lab.test:443"
+
     def test_post_declares_method_type_and_length(self) -> None:
         from adobo.transports.http3_transport import Http3Transport
 

@@ -342,9 +342,9 @@ class TestTheWizardIsDriven:
     BASE = {
         "host": "127.0.0.1", "port": "8123", "pps": "100", "duration": "2",
         "http3": "n", "http2": "n", "concurrency": "100", "personas": "",
-        "rotation": "", "preamble": "", "proxy": "", "keep_alive": "n",
-        "tls": "n", "verify": "y", "workers": "4", "payload": "512", "spoof": "n",
-        "profiles": "",
+        "rotation": "", "preamble": "", "proxy": "", "http_host": "",
+        "keep_alive": "n", "tls": "n", "verify": "y", "workers": "4",
+        "payload": "512", "spoof": "n", "profiles": "",
     }
 
     #: Order the wizard asks in. `concurrency` and `preamble` only appear when
@@ -366,13 +366,16 @@ class TestTheWizardIsDriven:
     #: this class failed with answers fed to the wrong prompt until the order
     #: was re-read off the wizard.
     #:
+    #: `http_host` sits between `proxy` and `keep_alive`; it is asked on every
+    #: strike (blank = none), so no conditional is needed for it.
+    #:
     #: `profiles` is the last question: it is asked after build_profiles, the
     #: privilege drop and the port filter, because the menu lists what the
     #: strike could actually run. Blank means every available profile.
     ORDER = [
         "host", "port", "pps", "duration", "http3", "http2", "concurrency",
-        "personas", "rotation", "preamble", "proxy", "keep_alive", "tls",
-        "verify", "workers", "payload", "spoof", "profiles",
+        "personas", "rotation", "preamble", "proxy", "http_host", "keep_alive",
+        "tls", "verify", "workers", "payload", "spoof", "profiles",
     ]
 
     def _with(self, *, omit: tuple = (), protocol: str = "tls-h2", **replacements) -> list[str]:

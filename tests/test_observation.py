@@ -262,9 +262,9 @@ class TestProbeScheme:
         captured: dict = {}
         original = module._HttpStats
 
-        def spy(host, port, *, path, timeout, tls=False, verify=True):
-            captured.update(host=host, port=port, path=path, tls=tls, verify=verify)
-            return original(host, port, path=path, timeout=timeout, tls=tls, verify=verify)
+        def spy(host, port, *, path, timeout, tls=False, verify=True, host_header=""):
+            captured.update(host=host, port=port, path=path, tls=tls, verify=verify, host_header=host_header)
+            return original(host, port, path=path, timeout=timeout, tls=tls, verify=verify, host_header=host_header)
 
         monkeypatch.setattr(module, "_HttpStats", spy)
         module.TargetObserver("127.0.0.1", 8443, tls=True, verify=False)
