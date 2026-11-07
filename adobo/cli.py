@@ -16,13 +16,13 @@ except ImportError:  # pragma: no cover - optional dependency
 from .engine import EngineHooks, RunEngine, RunOutcome
 from .fingerprint import DEFAULT_FINGERPRINT_KEY
 from .models import AttackProfile, ProfileName, RunConfig, Target, TransportKind
+from pydantic import ValidationError
 
 DEFAULT_ROTATION = "per_connection"
 """Parser default for --fingerprint-rotation, named so nuclear mode can tell an
 unset flag from a deliberate ``--fingerprint-rotation per_connection``."""
 from .nuclear import nuclear_wizard
 from .safety import PolicyViolation, SafetyGuard
-from .wizard import wizard
 
 __all__ = ["main"]
 
@@ -200,10 +200,53 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         default="",
         help=(
-            "Proxy list for --transport proxy: one per line as host:port or "
-            "user:pass@host:port. Rotates per connection, so without "
+            "Proxy list for --transport proxy: one per line as "
+            "[scheme://][user:pass@]host:port. Scheme prefixes: http://, "
+            "socks4://, socks5://; bare host:port lines follow "
+            "--proxy-default-scheme. Rotates per connection, so without "
             "--keep-alive that is one proxy per request. TCP profiles only."
         ),
+    )
+    parser.add_argument(
+        "--proxy-default-scheme",
+        choices=["http", "socks4", "socks5"],
+        dest="proxy_default_scheme",
+        default="http",
+        help=(
+            "scheme assumed for proxy-list lines without a scheme:// prefix "
+            "(default: http). Tags a whole downloaded SOCKS list without "
+            "rewriting it; an explicit prefix in the file always wins"
+        ),
+    )
+    parser.add_argument(
+        "--download-proxies",
+        action="store_true",
+        help=(
+            "download public proxy lists, merge, dedupe and write them to "
+            "--proxy-file (default: proxies.txt), then exit. List management, "
+            "not a run: no --host needed"
+        ),
+    )
+    parser.add_argument(
+        "--proxy-kind",
+        choices=["all", "http", "socks4", "socks5"],
+        default="all",
+        help="which protocols --download-proxies fetches (default: all)",
+    )
+    parser.add_argument(
+        "--check-proxies",
+        action="store_true",
+        help=(
+            "test every proxy in --proxy-file by tunnelling to a reachability "
+            "probe, then exit. Writes the survivors to a new file - the input "
+            "is never overwritten"
+        ),
+    )
+    parser.add_argument(
+        "--check-output",
+        metavar="PATH",
+        default="",
+        help="where --check-proxies writes the verified list (default: <input>-checked.txt)",
     )
     parser.add_argument(
         "--encrypt-proxies",
@@ -227,6 +270,57 @@ def build_parser() -> argparse.ArgumentParser:
         "--keep-alive",
         action="store_true",
         help="Reuse HTTP connections for http_flood (higher throughput; delivery may overcount if target closes connections)",
+    )
+    parser.add_argument(
+        "--method",
+        choices=["get", "post", "head"],
+        default="get",
+        help=(
+            "HTTP verb for http_flood (default: get). Applies to the HTTP/1.1 "
+            "transports (socket and proxy); a post body needs --data or --data-file"
+        ),
+    )
+    parser.add_argument(
+        "--path",
+        dest="http_path",
+        default="/api/data",
+        help=(
+            "request path for http_flood (default: /api/data). Must start with "
+            "'/' and be percent-encoded - no raw spaces or control characters"
+        ),
+    )
+    parser.add_argument(
+        "--cookie",
+        default="",
+        help=(
+            "Cookie header value for http_flood, e.g. 'id=xxx; session=yyy'. "
+            "Omitted from the request when empty"
+        ),
+    )
+    parser.add_argument(
+        "--referer",
+        default="",
+        help="Referer header value for http_flood (omitted from the request when empty)",
+    )
+    parser.add_argument(
+        "--data",
+        default="",
+        help="request body for --method post, e.g. 'a=1&b=2' (requires --method post)",
+    )
+    parser.add_argument(
+        "--data-file",
+        dest="data_file",
+        default="",
+        help=(
+            "read the --method post body from a file, e.g. --data-file data.json "
+            "(overrides --data)"
+        ),
+    )
+    parser.add_argument(
+        "--content-type",
+        dest="content_type",
+        default="application/x-www-form-urlencoded",
+        help="Content-Type for a --method post body (default: application/x-www-form-urlencoded)",
     )
     parser.add_argument(
         "--tls",
@@ -295,6 +389,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--quiet", action="store_true", help="suppress progress output")
     parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "resolve the configuration and print exactly what a run would do - "
+            "transport, request shape, proxy pool, TLS - then exit. No packet "
+            "is sent; needs --host"
+        ),
+    )
+    parser.add_argument(
         "--serve-target",
         action="store_true",
         help=(
@@ -357,12 +460,37 @@ def inspect_h2(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _resolve_body(args: argparse.Namespace) -> tuple[str, str]:
+    """ ``(body, error)``: the request body from ``--data`` or ``--data-file``.
+
+    An empty error string means success. Reading happens in one helper rather
+    than only in the single-profile path because the nuclear branch forwards
+    the body too: a ``--data-file`` that only ``config_from_args`` read made a
+    nuclear strike silently send GET while the operator watched for POSTs.
+    """
+    body = getattr(args, "data", "") or ""
+    data_file = getattr(args, "data_file", "") or ""
+    if data_file:
+        from pathlib import Path
+
+        try:
+            body = Path(data_file).read_text(encoding="utf-8")
+        except OSError as exc:
+            # A missing body file is an operator mistake with an obvious fix,
+            # not a traceback situation: name the flag, the path and the reason.
+            return "", f"could not read --data-file {data_file}: {exc}"
+    return body, ""
+
+
 def config_from_args(args: argparse.Namespace) -> RunConfig:
     profile = ProfileName(args.profile)
 
     # Read once with a default, because callers that build a Namespace by hand
     # (and several tests do) predate this flag and have no such attribute.
     proxy_file = getattr(args, "proxy_file", "") or ""
+    proxy_default_scheme = (
+        getattr(args, "proxy_default_scheme", "http") or "http"
+    )
 
     # Auto-select transport
     transport = args.transport
@@ -407,6 +535,21 @@ def config_from_args(args: argparse.Namespace) -> RunConfig:
     if getattr(args, "http3", False) and transport == "auto":
         transport = "h3"
 
+    # Request-shape flags for http_flood. getattr with defaults because callers
+    # that build a Namespace by hand (and several tests do) predate these flags
+    # and have no such attribute - the same reason proxy_file is read this way.
+    http_method = getattr(args, "method", "get") or "get"
+    http_path = getattr(args, "http_path", "/api/data") or "/api/data"
+    cookie_header = getattr(args, "cookie", "") or ""
+    referer = getattr(args, "referer", "") or ""
+    content_type = (
+        getattr(args, "content_type", "") or "application/x-www-form-urlencoded"
+    )
+    body, body_error = _resolve_body(args)
+    if body_error:
+        print(f"[!] {body_error}")
+        raise SystemExit(EXIT_ERROR)
+
     # Clamp before the model sees the values. AttackProfile refuses anything
     # over 65,507 bytes, so a --payload of 1900000 raised a pydantic
     # ValidationError here - before any policy was consulted and with no
@@ -425,9 +568,8 @@ def config_from_args(args: argparse.Namespace) -> RunConfig:
         for note in policy_notes:
             print(f"  {note}")
 
-    return RunConfig(
-        target=Target(host=args.host, port=args.port if args.port is not None else 80),
-        attack=AttackProfile(
+    try:
+        attack = AttackProfile(
             profile=profile,
             pps=fields["pps"],
             duration_seconds=fields["duration_seconds"],
@@ -442,11 +584,33 @@ def config_from_args(args: argparse.Namespace) -> RunConfig:
             fingerprint=args.fingerprint,
             fingerprint_rotation=args.fingerprint_rotation,
             h2_preamble=args.h2_preamble,
-        ),
+            http_method=http_method,
+            http_path=http_path,
+            cookie_header=cookie_header,
+            referer=referer,
+            http_body=body,
+            content_type=content_type,
+        )
+    except ValidationError as exc:
+        # A refused configuration is an operator mistake with an obvious fix,
+        # not a crash: name each bad field and its reason and stop. Raising the
+        # raw pydantic error printed a traceback that buried the one line that
+        # mattered - "cookie_header: header values must not contain control
+        # characters" - under the construction site's stack.
+        print("[!] Invalid run configuration:")
+        for error in exc.errors():
+            location = ".".join(str(part) for part in error["loc"]) or "config"
+            print(f"    {location}: {error['msg']}")
+        raise SystemExit(EXIT_ERROR) from None
+
+    return RunConfig(
+        target=Target(host=args.host, port=args.port if args.port is not None else 80),
+        attack=attack,
         transport=TransportKind(transport),
         defenses=[],
         label="cli run",
         proxy_file=proxy_file,
+        proxy_default_scheme=proxy_default_scheme,
     )
 
 
@@ -457,7 +621,10 @@ def run_once(config: RunConfig, quiet: bool = False) -> int:
     # Health check proxies before the run starts
     if config.transport is TransportKind.PROXY:
         from .proxies import shared_pool
-        pool = shared_pool(config.proxy_file or None)
+        pool = shared_pool(
+            config.proxy_file or None,
+            default_scheme=config.proxy_default_scheme,
+        )
         alive, dead = pool.health_check(
             config.target.host, config.target.port, timeout=5.0
         )
@@ -493,10 +660,86 @@ def run_once(config: RunConfig, quiet: bool = False) -> int:
     return outcome.exit_code
 
 
+def _print_preview(config: RunConfig) -> None:
+    """Print what a run would do, and send nothing.
+
+    --dry-run existed below the CLI only: the flag ran the engine with workers
+    disabled, which reported zero packets and previewed nothing. A preview
+    worth having answers "what exactly would this command do" - the resolved
+    transport, the request a target would receive, the pool the egress would
+    rotate through, the certificate decision - before any socket is opened.
+    """
+    attack = config.attack
+    print("=== Dry run: what this command would do ===")
+    print(f"  target     {config.target}  ({attack.profile.value})")
+    print(f"  transport  {config.transport.value}")
+    print(
+        f"  rate       {attack.pps:,} pps for {attack.duration_seconds:g}s "
+        f"across {attack.workers} worker(s)"
+    )
+    print(f"  payload    {attack.payload_size:,} bytes per packet")
+    if attack.profile is ProfileName.HTTP_FLOOD:
+        extras = []
+        if attack.cookie_header:
+            extras.append("cookie set")
+        if attack.referer:
+            extras.append("referer set")
+        if attack.http_body:
+            extras.append(f"body: {len(attack.http_body)} bytes")
+        shaped = f"{attack.http_method.upper()} {attack.http_path}"
+        if extras:
+            shaped += f"  ({', '.join(extras)})"
+        print(f"  request    {shaped}")
+        print(
+            f"  identity   {attack.fingerprint} "
+            f"(rotation: {attack.fingerprint_rotation})"
+        )
+        if attack.use_tls or attack.use_http2:
+            verify = "on" if attack.tls_verify else "OFF"
+            print(f"  tls        on (certificate verification: {verify})")
+    if config.transport is TransportKind.PROXY:
+        from .proxies import ProxyListError, load_proxies
+
+        try:
+            pool_size = len(
+                load_proxies(config.proxy_file or None, config.proxy_default_scheme)
+            )
+        except ProxyListError as exc:
+            print(f"  proxies    UNUSABLE: {exc}")
+        else:
+            print(
+                f"  proxies    {pool_size} from "
+                f"{config.proxy_file or 'proxies.txt'} "
+                f"(default scheme: {config.proxy_default_scheme})"
+            )
+    print("  no packet was sent.")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     _print_banner()
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    # The mode flags are mutually exclusive. Each one is a run-and-exit branch
+    # checked in sequence below, so two set together meant the first in line
+    # ran and the second was silently dropped - `--check-proxies --nuclear`
+    # checked proxies and never struck, with no word about the discarded flag.
+    modes = [
+        name
+        for name, given in (
+            ("--inspect-h2", getattr(args, "inspect_h2", False)),
+            ("--encrypt-proxies", getattr(args, "encrypt_proxies", False)),
+            ("--download-proxies", getattr(args, "download_proxies", False)),
+            ("--check-proxies", getattr(args, "check_proxies", False)),
+            ("--serve-target", getattr(args, "serve_target", False)),
+            ("--nuclear", getattr(args, "nuclear", False)),
+            ("--dry-run", getattr(args, "dry_run", False)),
+        )
+        if given
+    ]
+    if len(modes) > 1:
+        print("[!] Pick one mode; these cannot be combined: " + ", ".join(modes))
+        return EXIT_ERROR
 
     # Inspecting the HTTP/2 preamble is a measurement, not an attack, so it runs
     # before the target-serving and wizard branches and reaches neither the run
@@ -534,6 +777,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         _say("Add proxies.enc to .gitignore (already done) and delete proxies.txt if desired.")
         return EXIT_OK
 
+    # Downloading and checking proxy lists are list-management operations, not
+    # runs. The checker touches each proxy and one well-known reachability
+    # host (1.1.1.1:80) and never the target, so neither step requires --host;
+    # both run and exit here, before the wizard and the engine can be reached.
+    if getattr(args, "download_proxies", False):
+        from .proxy_sources import download_proxies
+
+        return download_proxies(
+            getattr(args, "proxy_kind", "all") or "all",
+            args.proxy_file or "proxies.txt",
+        )
+
+    if getattr(args, "check_proxies", False):
+        from .proxy_sources import check_proxies_file
+
+        return check_proxies_file(
+            args.proxy_file or "proxies.txt",
+            default_scheme=getattr(args, "proxy_default_scheme", "http") or "http",
+            output=getattr(args, "check_output", "") or None,
+        )
+
     # Serving the target is the other half of the tool, and it is a different job
     # from attacking: nothing here is a flood, so the wizard and the run engine
     # must not be reached. Delegating rather than reimplementing keeps
@@ -552,6 +816,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             ]
         )
 
+    # A preview needs a target to describe, and it must come after the mode
+    # exclusivity check so --dry-run --nuclear is refused rather than previewed.
+    if getattr(args, "dry_run", False):
+        if not args.host:
+            print("[!] --dry-run previews a run, so it needs --host.")
+            return EXIT_ERROR
+        config = config_from_args(args)
+        print()
+        _print_preview(config)
+        return EXIT_OK
+
     # Nuclear mode with no --host, or when asked for explicitly. The wizard is
     # interactive, so it reads stdin; a Ctrl-C inside it is a normal way to back
     # out and is handled here rather than left to escape as a traceback.
@@ -562,6 +837,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     # here - the operator would type --fingerprint chrome_131, watch the wizard
     # run ten profiles, and have no reason to suspect the persona never applied.
     if args.nuclear or not args.host:
+        # The body is resolved here, not in config_from_args, because the
+        # nuclear branch never reaches that function: a --data-file would
+        # otherwise be silently ignored and the strike would send GET.
+        body_value, body_error = _resolve_body(args)
+        if body_error:
+            print(f"[!] {body_error}")
+            return EXIT_ERROR
         try:
             exit_code = nuclear_wizard(
                 # argparse defaults are non-empty, so passing them through
@@ -581,6 +863,35 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ),
                 h2_preamble=None if args.h2_preamble == "auto" else args.h2_preamble,
                 proxy_file=args.proxy_file or None,
+                # Request-shape flags. Only a value that differs from the
+                # parser default is deliberate, so the wizard announces
+                # exactly what the operator typed and nothing else - the same
+                # rule the identity flags above follow. getattr because
+                # hand-built Namespaces in older tests predate these flags.
+                http_method=(
+                    None
+                    if getattr(args, "method", "get") in (None, "get")
+                    else args.method
+                ),
+                http_path=(
+                    None
+                    if getattr(args, "http_path", "/api/data") in (None, "/api/data")
+                    else args.http_path
+                ),
+                cookie=getattr(args, "cookie", "") or None,
+                referer=getattr(args, "referer", "") or None,
+                data=body_value or None,
+                content_type=(
+                    None
+                    if getattr(args, "content_type", "")
+                    in (None, "application/x-www-form-urlencoded")
+                    else args.content_type
+                ),
+                proxy_default_scheme=(
+                    None
+                    if getattr(args, "proxy_default_scheme", "http") in (None, "http")
+                    else args.proxy_default_scheme
+                ),
             )
         except KeyboardInterrupt:
             # Same code as an interrupted run, so a caller can treat "the

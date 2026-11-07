@@ -425,6 +425,7 @@ def run_target(
     If http2 is True, enables HTTP/2 (requires SSL).
     """
     import ssl
+    import inspect
     import uvicorn
 
     config = settings or TargetSettings()
@@ -439,13 +440,24 @@ def run_target(
         uvicorn_kwargs["ssl_certfile"] = config.ssl_certfile
         uvicorn_kwargs["ssl_keyfile"] = config.ssl_keyfile
     if http2 and config.ssl_certfile and config.ssl_keyfile:
-        # Create SSL context with ALPN for HTTP/2
+        # The context must advertise h2 via ALPN - that advertisement is how
+        # an HTTP/2 client negotiates the protocol at all, and TLS without it
+        # makes the h2 transport refuse the connection with "server offered
+        # None". But ALPN alone is not enough: uvicorn also has to select an
+        # h2-capable protocol class, which needs http2=True with the zttp
+        # http class. Without them the client negotiates h2 and uvicorn's
+        # HTTP/1.1 parser then logs every preface as an invalid request.
         ssl_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
         ssl_ctx.load_cert_chain(config.ssl_certfile, config.ssl_keyfile)
-        ssl_ctx.set_alpn_protocols(['h2'])
-        uvicorn_kwargs["ssl_context"] = ssl_ctx
-        # Don't pass certfile/keyfile when using custom ssl_context
-        uvicorn_kwargs.pop("ssl_certfile", None)
-        uvicorn_kwargs.pop("ssl_keyfile", None)
+        ssl_ctx.set_alpn_protocols(["h2"])
+        if "ssl_context_factory" in inspect.signature(uvicorn.Config.__init__).parameters:
+            uvicorn_kwargs["ssl_context_factory"] = lambda *args: ssl_ctx
+            uvicorn_kwargs["http2"] = True
+            uvicorn_kwargs["http"] = "zttp"
+            uvicorn_kwargs.pop("ssl_certfile", None)
+            uvicorn_kwargs.pop("ssl_keyfile", None)
+        # Older uvicorn has no factory hook: serve TLS from the certfile
+        # already in kwargs. An h2 run against it fails the negotiation with
+        # a message that names what is missing, rather than crashing here.
 
     uvicorn.run(**uvicorn_kwargs)

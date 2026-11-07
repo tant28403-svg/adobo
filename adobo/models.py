@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .fingerprint import (
     DEFAULT_FINGERPRINT_KEY,
@@ -124,6 +124,20 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _has_http_control_chars(text: str) -> bool:
+    """True when *text* contains anything that cannot appear in a header value:
+    C0 controls (including CR, LF and NUL) or DEL.
+
+    A CR or LF here is not a cosmetic problem. It terminates the header block
+    early, so the bytes after it are parsed as the start of a new request on
+    the same connection - which corrupts a keep-alive run's counts and, on a
+    proxy transport, would smuggle a request past the tunnel that was never
+    configured. Rejecting at model construction is the cheap place to draw the
+    line.
+    """
+    return any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in text)
+
+
 # --------------------------------------------------------------------------
 # Configuration models
 # --------------------------------------------------------------------------
@@ -161,6 +175,54 @@ class AttackProfile(BaseModel):
     tls_verify: bool = True
     use_http2: bool = False
     h2_concurrency: int = Field(default=100, ge=1, le=1000)
+
+    http_method: str = Field(default="get", max_length=10)
+    """The verb ``http_flood`` sends: ``get``, ``post`` or ``head``.
+
+    HTTP/1.1 only - the socket and proxy transports share one request builder,
+    so both inherit this. The h2 transport keeps its own GET-only builder this
+    round, and a POST body would need ``:method`` plus DATA frames there.
+
+    A HEAD flood is not a cheaper GET: servers route HEAD through the same
+    handler and then discard the body, which is a different shape of work than
+    a cache-absorbed GET, and measuring that difference is the point of having
+    the option.
+    """
+
+    http_path: str = Field(default="/api/data", max_length=2048)
+    """Request target for ``http_flood``.
+
+    Must start with ``/`` and contain no spaces or control characters - a raw
+    space would split the request line into three-and-a-half parts, and what
+    the server does with that is not worth finding out. Percent-encode instead.
+    """
+
+    cookie_header: str = Field(default="", max_length=8192)
+    """Raw ``Cookie`` header value, e.g. ``id=xxx; session=yyy``.
+
+    Omitted from the wire entirely when empty, so existing runs are unchanged.
+    This is one header value, not a cookie jar: no parsing, no per-request
+    mutation, because a stateful client is a different tool.
+    """
+
+    referer: str = Field(default="", max_length=8192)
+    """``Referer`` header value, omitted from the wire when empty.
+
+    A WAF rule that admits same-site navigation and denies hotlinked requests
+    cannot be tested without controlling this header, which is the whole reason
+    it is configurable rather than hardcoded to absent.
+    """
+
+    http_body: str = Field(default="", max_length=65535)
+    """Request body for ``post``.
+
+    A GET or HEAD carries no body by definition, so configuring one alongside
+    either is refused at construction rather than silently dropped - a run that
+    reports a POST-shaped load it never sent is a lying run (validated below).
+    """
+
+    content_type: str = Field(default="application/x-www-form-urlencoded", max_length=8192)
+    """``Content-Type`` for a POST body."""
 
     fingerprint: str = Field(default=DEFAULT_FINGERPRINT_KEY)
     """Which declared client identity to send. See :mod:`adobo.fingerprint`.
@@ -235,6 +297,53 @@ class AttackProfile(BaseModel):
             return value
         resolve_h2_profile(value)  # raises ValueError listing the valid keys
         return value
+
+    @field_validator("http_method")
+    @classmethod
+    def _http_method_must_be_known(cls, value: str) -> str:
+        method = value.strip().lower()
+        if method not in ("get", "post", "head"):
+            raise ValueError(
+                f"unknown HTTP method {value!r}; choose from: get, post, head"
+            )
+        return method
+
+    @field_validator("http_path")
+    @classmethod
+    def _http_path_must_be_a_request_target(cls, value: str) -> str:
+        if not value.startswith("/"):
+            raise ValueError(
+                f"http_path must start with '/', got {value!r} - "
+                "the host belongs in --host, and special characters "
+                "should be percent-encoded"
+            )
+        if " " in value or _has_http_control_chars(value):
+            raise ValueError(
+                "http_path must not contain spaces or control characters: "
+                "a raw space splits the request line"
+            )
+        return value
+
+    @field_validator("cookie_header", "referer", "content_type")
+    @classmethod
+    def _header_value_must_be_a_single_line(cls, value: str) -> str:
+        if _has_http_control_chars(value):
+            raise ValueError(
+                "header values must not contain control characters: a CR or LF "
+                "inside a header would be read as the end of the header block, "
+                "and whatever follows as a second request"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _body_needs_post(self) -> "AttackProfile":
+        if self.http_body and self.http_method != "post":
+            raise ValueError(
+                "http_body requires http_method 'post': a GET or HEAD carries "
+                "no body, so the data would be silently dropped and the run "
+                "would report a shape it never sent"
+            )
+        return self
 
     def persona_keys(self) -> list[str]:
         """The configured personas, in the order given."""
@@ -330,6 +439,26 @@ class RunConfig(BaseModel):
     pushes. Empty means no proxies, which keeps every existing call site that
     builds a RunConfig unchanged.
     """
+
+    proxy_default_scheme: str = "http"
+    """The scheme assumed for proxy-list lines written without a ``scheme://``
+    prefix.
+
+    ``http`` by default, which is what a bare ``host:port`` has always meant
+    here; ``socks4`` or ``socks5`` tags a whole downloaded list without
+    rewriting it. An explicit prefix in the file always wins, so one file can
+    still mix kinds.
+    """
+
+    @field_validator("proxy_default_scheme")
+    @classmethod
+    def _proxy_default_scheme_must_be_known(cls, value: str) -> str:
+        scheme = value.strip().lower()
+        if scheme not in ("http", "socks4", "socks5"):
+            raise ValueError(
+                f"unknown proxy scheme {value!r}; choose from: http, socks4, socks5"
+            )
+        return scheme
 
 
 # --------------------------------------------------------------------------

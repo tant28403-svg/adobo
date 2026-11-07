@@ -83,6 +83,11 @@ class H2Transport(Transport):
         tcp_path: str = "/api/data",
         fingerprint: Fingerprint | None = None,
         h2_profile: H2Profile | None = None,
+        method: str = "get",
+        cookie_header: str = "",
+        referer: str = "",
+        body: str = "",
+        content_type: str = "application/x-www-form-urlencoded",
     ) -> None:
         super().__init__(target, profile)
         if not supports_profile(TransportKind.H2, profile):
@@ -95,6 +100,28 @@ class H2Transport(Transport):
         self.concurrency = concurrency
         self.tls_verify = tls_verify
         self.tcp_path = tcp_path
+        self._method = method.strip().lower()
+        """The verb every stream on this connection sends.
+
+        Validated here as well as in the model because this transport is also
+        constructed directly in tests, and a bad verb is a wire-format problem:
+        h2 would happily compress a method the server then rejects, and the run
+        would report served-zeroes that look like a target failure.
+        """
+        if self._method not in ("get", "post", "head"):
+            raise TransportError(
+                f"unknown HTTP method {method!r}; choose from: get, post, head"
+            )
+        self._cookie_header = cookie_header
+        self._referer = referer
+        self._content_type = content_type
+        self._encoded_body = body.encode("utf-8") if body else b""
+        if self._encoded_body and self._method != "post":
+            raise TransportError(
+                "a request body requires the post method: a GET or HEAD carries "
+                "no body, so the DATA frames would never be sent and the stream "
+                "would stall half-open"
+            )
         self.stream_timeout = DEFAULT_STREAM_TIMEOUT
         self.drain_timeout = DEFAULT_DRAIN_TIMEOUT
         self._persona = fingerprint
@@ -271,9 +298,22 @@ class H2Transport(Transport):
                 self._drain_responses()
 
         stream_id = self._conn.get_next_available_stream_id()
-        self._conn.send_headers(
-            stream_id, self._build_stream_headers(), end_stream=True
-        )
+        headers = self._build_stream_headers()
+        if self._method == "post" and self._encoded_body:
+            # A body makes the request span two frame types: HEADERS first,
+            # open (no END_STREAM), then DATA frames that carry the body and
+            # close the stream. END_STREAM on the HEADERS would end the request
+            # before its body existed, and the server would read a truncated
+            # POST - or, worse, count one request while waiting forever on a
+            # body that the client believes it sent.
+            self._conn.send_headers(stream_id, headers, end_stream=False)
+            self._send_body(stream_id)
+        else:
+            # GET, HEAD, and a zero-length POST are complete at HEADERS. A HEAD
+            # carries no body by definition; a zero-length POST is framed by its
+            # Content-Length: 0 header, so END_STREAM here is correct, not a
+            # truncation.
+            self._conn.send_headers(stream_id, headers, end_stream=True)
         self._streams[stream_id] = StreamState(
             stream_id=stream_id,
             state="headers_sent",
@@ -284,6 +324,51 @@ class H2Transport(Transport):
 
         # Try to get response immediately
         self._drain_responses()
+
+    def _send_body(self, stream_id: int) -> None:
+        """The request body as DATA frames, under the peer's flow-control window.
+
+        ``h2`` raises FlowControlError if a send exceeds the window, so the
+        chunk size is clamped to what :meth:`local_flow_control_window` reports
+        - h2's names are from the connection's point of view, and ``local`` is
+        the window for data *we* send, while ``remote`` governs what the peer
+        may send us. Draining responses while the window is closed lets the
+        peer's WINDOW_UPDATEs land. The final chunk carries END_STREAM - a body
+        that ends without it leaves the stream half-open and the server waiting
+        on a request that will never finish.
+
+        If the run is cancelled mid-body the stream is reset rather than left
+        dangling: a half-sent POST on a multiplexed connection is a stream the
+        server would hold open for as long as its own timeouts allow, which is
+        exactly the state a resilience lab should not manufacture by accident.
+        """
+        offset = 0
+        total = len(self._encoded_body)
+        while offset < total:
+            # Two ceilings: the send window h2 enforces on every send_data, and
+            # the negotiated max frame size (default 16 KiB) - a 70 KiB body
+            # sent as one frame would kill the worker rather than merely wait.
+            available = min(
+                self._conn.local_flow_control_window(stream_id),
+                self._conn.max_outbound_frame_size,
+            )
+            if available <= 0:
+                self._drain_responses()
+                if self._should_stop_external():
+                    self._conn.reset_stream(
+                        stream_id, error_code=h2.errors.ErrorCodes.CANCEL
+                    )
+                    self._sock.sendall(self._conn.data_to_send())
+                    return
+                if self._conn.local_flow_control_window(stream_id) <= 0:
+                    time.sleep(0.01)
+                continue
+            chunk = self._encoded_body[offset:offset + available]
+            offset += len(chunk)
+            self._conn.send_data(
+                stream_id, chunk, end_stream=offset >= total
+            )
+            self._sock.sendall(self._conn.data_to_send())
 
     def _build_stream_headers(self) -> list[tuple[str, str]]:
         """The header block for one request stream.
@@ -306,9 +391,17 @@ class H2Transport(Transport):
 
         With no persona the identity stays the self-identifying
         "adobo-h2-flood", which is unchanged from before personas existed.
+
+        The method lives in the pseudo-header block, so a POST or HEAD request
+        changes what this returns - and ``rapid_reset`` pins the method back to
+        GET in its own ``__init__``, because the shape it reproduces is the
+        CVE's, not the run's. Referer and cookie are inserted after the persona
+        block, matching the HTTP/1.1 builder's relative order, and a POST adds
+        ``content-type`` and ``content-length`` - the length is what lets the
+        server know how many DATA frames to expect before the stream is done.
         """
         pseudo_values = {
-            ':method': 'GET',
+            ':method': self._method.upper(),
             ':path': self.tcp_path,
             ':authority': self.target.host,
             ':scheme': 'https',
@@ -327,6 +420,13 @@ class H2Transport(Transport):
             )
         else:
             headers.append(('user-agent', 'adobo-h2-flood'))
+        if self._referer:
+            headers.append(('referer', self._referer))
+        if self._cookie_header:
+            headers.append(('cookie', self._cookie_header))
+        if self._method == 'post':
+            headers.append(('content-type', self._content_type))
+            headers.append(('content-length', str(len(self._encoded_body))))
         return headers
 
     def _drain_responses(self) -> None:

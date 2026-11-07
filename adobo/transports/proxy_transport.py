@@ -21,6 +21,13 @@ target's *name*, not its address, so the proxy does the lookup. That is
 deliberate: resolving here and sending an address would make the proxy's view of
 the target irrelevant, and a proxy that cannot reach the target is a fact about
 the proxy, not about the run.
+
+**SOCKS entries in the list.** A line prefixed ``socks4://`` or ``socks5://``
+is tunnelled with a SOCKS handshake instead of CONNECT -
+:func:`connect_tunnel` dispatches on the scheme and everything downstream of
+the tunnel is shared, so a SOCKS-proxied run reports the same way an
+HTTP-proxied one does and rotation, dead-marking and health checks all apply
+to both without a second code path.
 """
 
 from __future__ import annotations
@@ -32,6 +39,7 @@ from ..models import ProfileName, Target, TransportKind
 from ..proxies import Proxy, ProxyListError, ProxyPool
 from .base import TransportError, supports_profile
 from .http2_transport import H2Transport
+from .socks import SOCKSError, socks_connect
 from .socket_transport import SocketTransport
 
 __all__ = [
@@ -77,14 +85,33 @@ def connect_tunnel(
     target_port: int,
     timeout: float,
 ) -> None:
-    """Establish a CONNECT tunnel to *target_host* through *proxy*.
+    """Establish a tunnel to *target_host* through *proxy*.
 
-    Raises :class:`ProxyConnectionError` on any non-2xx response, on a
-    connection that closes before answering, and on a response that never
-    terminates. Credentials are never included in an error message - a refused
-    tunnel is exactly when a password is most likely to end up pasted into a
-    bug report.
+    Scheme-aware: an HTTP proxy gets a ``CONNECT`` request, a SOCKS4/4a/5 proxy
+    gets the SOCKS handshake (:mod:`adobo.transports.socks`). Either way, on
+    return the socket speaks end-to-end with the target, and any TLS wrapping
+    happens in the caller exactly as it would on a direct connection.
+
+    Raises :class:`ProxyConnectionError` on any refusal, on a connection that
+    closes before answering, and on a response that never terminates.
+    Credentials are never included in an error message - a refused tunnel is
+    exactly when a password is most likely to end up pasted into a bug report.
     """
+    if proxy.is_socks:
+        try:
+            socks_connect(sock, proxy, target_host, target_port, timeout)
+        except SOCKSError as exc:
+            sock.close()
+            raise ProxyConnectionError(
+                f"proxy {proxy.label()} failed the {proxy.scheme} handshake: {exc}"
+            ) from exc
+        except (socket.timeout, OSError) as exc:
+            sock.close()
+            raise ProxyConnectionError(
+                f"proxy {proxy.label()} failed during the {proxy.scheme} handshake: {exc}"
+            ) from exc
+        return
+
     authority = target_host if ":" not in target_host else f"[{target_host}]"
     request = (
         f"CONNECT {authority}:{target_port} HTTP/1.1\r\n"

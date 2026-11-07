@@ -82,6 +82,13 @@ class RapidResetTransport(H2Transport):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        # rapid reset reproduces one specific request shape: an ordinary GET
+        # HEADERS immediately cancelled (CVE-2023-44487). Whatever method the
+        # run configured, the reset rides a GET - the thing under test is the
+        # server's stream accounting, not its body handling, and a body would
+        # change the frame sequence this profile exists to reproduce.
+        self._method = "get"
+        self._encoded_body = b""
         self.resets_sent = 0
         self.resets_blocked = 0
         """Resets the h2 library refused. Non-zero means the frames were not

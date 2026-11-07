@@ -319,6 +319,12 @@ class Http3Transport(Transport):
         connect_timeout: float = DEFAULT_CONNECT_TIMEOUT,
         tls_verify: bool = True,
         persona: Any = None,
+        tcp_path: str = "/api/data",
+        method: str = "get",
+        cookie_header: str = "",
+        referer: str = "",
+        body: str = "",
+        content_type: str = "application/x-www-form-urlencoded",
     ) -> None:
         super().__init__(target, profile)
         if not supports_profile(TransportKind.H3, profile):
@@ -334,6 +340,27 @@ class Http3Transport(Transport):
         self.connect_timeout = connect_timeout
         self.tls_verify = tls_verify
         self.persona = persona
+        # Request shape. The parameter names follow the shared factory helper
+        # (_h2_request_shape, which every HTTP construction site splats), so
+        # one helper feeds all three HTTP transports and a future option
+        # cannot be wired at one site and not the others - which is how
+        # tcp_path was once lost on every transport but HTTP/1.1.
+        self.tcp_path = tcp_path
+        self._method = method.strip().lower()
+        if self._method not in ("get", "post", "head"):
+            raise TransportError(
+                f"unknown HTTP method {method!r}; choose from: get, post, head"
+            )
+        self._cookie_header = cookie_header
+        self._referer = referer
+        self._content_type = content_type
+        self._encoded_body = body.encode("utf-8") if body else b""
+        if self._encoded_body and self._method != "post":
+            raise TransportError(
+                "a request body requires the post method: a GET or HEAD carries "
+                "no body, so the DATA frames would never be sent and the stream "
+                "would stall half-open"
+            )
         self._protocol: Any = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stop_async: asyncio.Event | None = None
@@ -552,12 +579,28 @@ class Http3Transport(Transport):
             self._next_stream += 4
             headers = self._build_headers(attack)
             before = getattr(protocol, "bytes_sent", 0)
-            h3.send_headers(
-                stream_id=stream_id,
-                headers=headers,
-                end_stream=False,
-            )
-            h3.send_data(stream_id=stream_id, data=b"", end_stream=True)
+            if self._encoded_body:
+                # A body makes the request span two frame types: HEADERS first,
+                # open (no END_STREAM), then one DATA frame carrying the body
+                # and ending the stream. aioquic buffers bytes past the peer's
+                # flow-control window rather than raising, so no manual window
+                # arithmetic is needed here - unlike the h2 transport, whose
+                # library raises FlowControlError and forces the chunking.
+                h3.send_headers(
+                    stream_id=stream_id, headers=headers, end_stream=False
+                )
+                h3.send_data(
+                    stream_id=stream_id, data=self._encoded_body, end_stream=True
+                )
+            else:
+                # GET, HEAD, and a zero-length POST are complete at headers:
+                # the empty DATA frame with END_STREAM is how this transport
+                # has always ended a body-less request, and it stays that way
+                # so a default run is byte-identical to before methods existed.
+                h3.send_headers(
+                    stream_id=stream_id, headers=headers, end_stream=False
+                )
+                h3.send_data(stream_id=stream_id, data=b"", end_stream=True)
             protocol.transmit()
             # Measured from the endpoint rather than from the request, because an
             # HTTP/3 GET has no body and a body length would report zero bytes
@@ -581,6 +624,12 @@ class Http3Transport(Transport):
 
         The authority carries the port unless it is the default for the scheme,
         which is what RFC 9114 requires and what a real client sends.
+
+        The method, path, referer, cookie and content headers follow the same
+        composition rules as the h2 builder: identity-level headers after the
+        persona block, framing headers last, everything lower-case because h3
+        forbids uppercase outright. A GET with no options produces the exact
+        block this transport always produced.
         """
         scheme = "https"
         authority = self.target.host
@@ -589,13 +638,26 @@ class Http3Transport(Transport):
 
         persona = self.persona or (attack.persona() if attack is not None else None)
         headers = [
-            (b":method", b"GET"),
+            (b":method", self._method.upper().encode("ascii")),
             (b":authority", authority.encode("ascii", "ignore")),
             (b":scheme", scheme.encode("ascii")),
-            (b":path", b"/api/data"),
+            (b":path", self.tcp_path.encode("ascii", "ignore") or b"/api/data"),
             (b"user-agent", _user_agent(persona).encode("latin-1", "replace")),
             (b"accept", b"*/*"),
         ]
+        if self._referer:
+            headers.append((b"referer", self._referer.encode("latin-1", "replace")))
+        if self._cookie_header:
+            headers.append(
+                (b"cookie", self._cookie_header.encode("latin-1", "replace"))
+            )
+        if self._method == "post":
+            headers.append(
+                (b"content-type", self._content_type.encode("latin-1", "replace"))
+            )
+            headers.append(
+                (b"content-length", str(len(self._encoded_body)).encode("ascii"))
+            )
         return headers
 
     def _verify_mode(self) -> Any:

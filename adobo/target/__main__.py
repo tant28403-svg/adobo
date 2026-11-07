@@ -177,7 +177,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     print("  Ctrl-C to stop")
 
     try:
-        run_target(settings, log_level=args.log_level)
+        # http2 is forwarded explicitly: TargetSettings collects it from the
+        # CLI, and dropping it here meant the flag parsed, printed nothing,
+        # and never reached the server - the target served TLS without ALPN
+        # and every h2 run against it failed the negotiation.
+        run_target(
+            settings,
+            log_level=args.log_level,
+            http2=bool(getattr(settings, "http2", False)),
+        )
     except KeyboardInterrupt:
         print("\nstopped")
         return 130

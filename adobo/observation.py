@@ -106,22 +106,42 @@ class TargetObservation(Protocol):
 
 
 class _HttpStats:
-    """Fetches ``/stats`` over HTTP.
+    """Fetches ``/stats`` over HTTP or HTTPS.
 
     Declared as a class rather than a function so a test can substitute a stub
     without a network, and so the reason for a failure can be carried through as
     a string instead of an exception type the caller has to know.
+
+    *tls* follows the attack: a run that speaks TLS to the target must read its
+    counters over TLS too, because a plaintext read against a TLS-only port
+    never answers - and an unobserved run is exactly the ambiguity this module
+    exists to eliminate. *verify* follows the run's certificate decision, so a
+    lab target with a self-signed certificate is readable instead of failing
+    the handshake on a check the operator already declined.
     """
 
-    def __init__(self, host: str, port: int, *, path: str, timeout: float) -> None:
-        self._url = f"http://{host}:{port}{path}"
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        *,
+        path: str,
+        timeout: float,
+        tls: bool = False,
+        verify: bool = True,
+    ) -> None:
+        scheme = "https" if tls else "http"
+        self._url = f"{scheme}://{host}:{port}{path}"
         self._timeout = timeout
+        self._verify = verify
 
     async def get(self, timeout: float | None = None) -> dict[str, Any]:
         import httpx
 
         effective = self._timeout if timeout is None else timeout
-        async with httpx.AsyncClient(timeout=httpx.Timeout(effective)) as client:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(effective), verify=self._verify
+        ) as client:
             response = await client.get(self._url)
             response.raise_for_status()
             return response.json()
@@ -146,8 +166,11 @@ class TargetObserver:
         path: str = STATS_PATH,
         timeout: float = 0.5,
         fetch: Callable[[float | None], Awaitable[dict[str, Any]]] | None = None,
+        tls: bool = False,
+        verify: bool = True,
     ) -> None:
-        self._url = f"http://{host}:{port}{path}"
+        scheme = "https" if tls else "http"
+        self._url = f"{scheme}://{host}:{port}{path}"
         self._timeout = timeout
         self._last_error: str | None = None
         # Why the most recent alive() sample failed, or None if it succeeded or
@@ -157,7 +180,9 @@ class TargetObserver:
         if fetch is not None:
             self._fetch = fetch  # type: ignore[assignment]
         else:
-            client = _HttpStats(host, port, path=path, timeout=timeout)
+            client = _HttpStats(
+                host, port, path=path, timeout=timeout, tls=tls, verify=verify
+            )
             self._fetch = client.get  # type: ignore[assignment]
 
     async def read(self, timeout: float | None = None) -> tuple[int, int] | None:

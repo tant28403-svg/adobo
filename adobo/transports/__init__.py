@@ -142,6 +142,28 @@ def linux_raw_capability() -> RawCapability:
         )
 
 
+def _h2_request_shape(attack) -> dict:
+    """The request-shape kwargs every HTTP/2 and HTTP/3 construction site passes.
+
+    One helper rather than copies of the same six lines, because a flag added
+    at one site and not the others is exactly how ``--path`` ended up never
+    reaching h2: the transports all had a ``tcp_path`` parameter, and every
+    caller kept passing none. getattr with defaults because hand-built
+    Namespaces in older tests predate these fields - the same pattern the
+    socket branch uses for tls_verify.
+    """
+    return dict(
+        tcp_path=getattr(attack, "http_path", "/api/data"),
+        method=getattr(attack, "http_method", "get"),
+        cookie_header=getattr(attack, "cookie_header", ""),
+        referer=getattr(attack, "referer", ""),
+        body=getattr(attack, "http_body", ""),
+        content_type=getattr(
+            attack, "content_type", "application/x-www-form-urlencoded"
+        ),
+    )
+
+
 def get_transport(config: RunConfig) -> Transport:
     """Construct the transport named by *config*.
 
@@ -174,6 +196,7 @@ def get_transport(config: RunConfig) -> Transport:
             profile,
             tls_verify=getattr(attack, "tls_verify", True),
             persona=persona,
+            **_h2_request_shape(attack),
         )
 
     if config.transport is TransportKind.PROXY:
@@ -181,7 +204,10 @@ def get_transport(config: RunConfig) -> Transport:
         # a setup failure before any worker exists, rather than N identical
         # errors from N workers a moment later. shared_pool() so every worker
         # draws from one rotation - see its docstring for why that matters.
-        pool = shared_pool(config.proxy_file or None)
+        pool = shared_pool(
+            config.proxy_file or None,
+            default_scheme=getattr(config, "proxy_default_scheme", "http"),
+        )
         attack = config.attack
         if getattr(attack, "use_http2", False):
             return ProxyH2Transport(
@@ -194,6 +220,7 @@ def get_transport(config: RunConfig) -> Transport:
                 connect_timeout=1.0,
                 fingerprint=persona,
                 h2_profile=attack.h2_profile(),
+                **_h2_request_shape(attack),
             )
         # No `fingerprint` here: SocketTransport builds its persona per request
         # from the attack profile rather than being handed one, so passing it
@@ -229,6 +256,7 @@ def get_transport(config: RunConfig) -> Transport:
             connect_timeout=1.0,
             fingerprint=persona,
             h2_profile=attack.h2_profile(),
+            **_h2_request_shape(attack),
         )
 
     if config.transport is TransportKind.SOCKET:
@@ -246,6 +274,7 @@ def get_transport(config: RunConfig) -> Transport:
                 connect_timeout=1.0,
                 fingerprint=persona,
                 h2_profile=attack.h2_profile(),
+                **_h2_request_shape(attack),
             )
         return SocketTransport(
             config.target,

@@ -396,8 +396,13 @@ def _http_request(
     seed: int,
     keep_alive: bool = False,
     fingerprint: Fingerprint | None = None,
+    method: str = "get",
+    cookie_header: str = "",
+    referer: str = "",
+    body: str = "",
+    content_type: str = "application/x-www-form-urlencoded",
 ) -> bytes:
-    """A minimal HTTP/1.1 GET with a unique cache-busting header.
+    """A minimal HTTP/1.1 request with a unique cache-busting header.
 
     Uniqueness matters: a caching layer in front of the target would otherwise
     serve this from cache and the flood would measure nothing.
@@ -418,6 +423,18 @@ def _http_request(
     request, while the persona block is identity-level and varies per run. Mixing
     the two would put ``Connection: close`` under persona control, where it
     could contradict the connection the transport is actually reusing.
+
+    *method* selects the verb (GET, POST or HEAD). Referer and cookie lines are
+    inserted after the persona block and before ``Connection``, and are omitted
+    from the wire entirely when unset, so a run that configures none of them is
+    byte-identical to a run that could not.
+
+    **A POST body is framed by Content-Length, so filler may never follow it.**
+    Bytes appended after the body would be read as part of the body (corrupting
+    it) or as the start of a pipelined request (counting an error the run did
+    not ask for). POST padding therefore always goes inside the header block as
+    an ``X-Pad`` line, exactly the mechanism the keep-alive branch below uses,
+    and the request leaves as head + blank line + body, never padded past that.
     """
     persona = (
         fingerprint
@@ -425,14 +442,36 @@ def _http_request(
         else FINGERPRINTS[DEFAULT_FINGERPRINT_KEY]
     )
     connection = "keep-alive" if keep_alive else "close"
+    verb = method.upper()
+    encoded_body = body.encode("utf-8") if body else b""
     lines = [
-        f"GET {path} HTTP/1.1",
+        f"{verb} {path} HTTP/1.1",
         f"Host: {host}",
     ]
     lines.extend(f"{name}: {value}" for name, value in persona.headers)
+    if referer:
+        lines.append(f"Referer: {referer}")
+    if cookie_header:
+        lines.append(f"Cookie: {cookie_header}")
+    if verb == "POST":
+        lines.append(f"Content-Type: {content_type}")
+        lines.append(f"Content-Length: {len(encoded_body)}")
     lines.append(f"Connection: {connection}")
     lines.append(f"X-Ddosim-Seq: {seed}")
     head = ("\r\n".join(lines) + "\r\n").encode("ascii")
+
+    if verb == "POST":
+        blank = b"\r\n"
+        natural = len(head) + len(blank) + len(encoded_body)
+        if size > natural:
+            # Same budget as the keep-alive branch below, plus the body: the
+            # blank line (2), the "X-Pad: " prefix (7), the pad line's own CRLF
+            # (2) and every body byte all come out of *size* before the F's do.
+            budget = size - len(head) - 2 - 7 - 2 - len(encoded_body)
+            if budget > 0:
+                head += b"X-Pad: " + b"F" * budget + b"\r\n"
+        return head + blank + encoded_body
+
     if keep_alive:
         # Padding goes *inside* the header block, before the blank line, and
         # that placement is load-bearing rather than cosmetic. Appending filler
@@ -546,6 +585,11 @@ def build_payload(
     path: str = "/api/data",
     keep_alive: bool = False,
     fingerprint: Fingerprint | None = None,
+    method: str = "get",
+    cookie_header: str = "",
+    referer: str = "",
+    body: str = "",
+    content_type: str = "application/x-www-form-urlencoded",
 ) -> bytes:
     """Build the payload for one packet of *profile*.
 
@@ -563,6 +607,13 @@ def build_payload(
     the other profiles are binary protocol messages with no header block to
     impersonate, and slowloris in particular must stay deliberately truncated,
     so completing its headers would remove the attack entirely.
+
+    *method*, *cookie_header*, *referer*, *body* and *content_type* shape the
+    HTTP/1.1 request. All keyword-only with defaults matching the historical
+    output, so existing call sites - including the scapy transport, which
+    forwards none of them - keep producing the same bytes. They apply to
+    ``HTTP_FLOOD`` only; the h2 transport builds its own header block and does
+    not reach this path.
     """
     size = max(0, int(size))
 
@@ -587,7 +638,17 @@ def build_payload(
     if profile is ProfileName.HTTP_FLOOD:
         host = target.host if target is not None else "127.0.0.1"
         return _http_request(
-            host, path, size, seed, keep_alive=keep_alive, fingerprint=fingerprint
+            host,
+            path,
+            size,
+            seed,
+            keep_alive=keep_alive,
+            fingerprint=fingerprint,
+            method=method,
+            cookie_header=cookie_header,
+            referer=referer,
+            body=body,
+            content_type=content_type,
         )
 
     if profile is ProfileName.RAPID_RESET:

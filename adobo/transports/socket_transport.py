@@ -237,6 +237,18 @@ class SocketTransport(Transport):
                     self._sock.setsockopt(socket.SOL_SOCKET, option, 1 << 20)
                 except OSError:
                     pass
+            # Nagle off on a reused connection. With Connection: close each
+            # request is the only bytes on a fresh socket, so Nagle has nothing
+            # to wait for; on a keep-alive socket a short request written after
+            # a response can sit in Nagle's buffer until the peer's delayed ACK
+            # arrives - the classic 40ms stall per request, which at keep-alive
+            # rates is the throughput, lost. Best-effort like the buffers: a
+            # platform without TCP_NODELAY gets a slower connection, not a
+            # wrong one.
+            try:
+                self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:
+                pass
         # Bounded separately from the send timeout. A connect to a host that is
         # not listening can hang for the full send timeout, and paying that cost
         # once per transport setup would let a dead target silently eat a short

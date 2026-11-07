@@ -201,8 +201,26 @@ class RunEngine:
         # needs psutil and therefore only works locally, while this works over
         # HTTP and so measures a remote target too. Between them, a run has some
         # evidence from the target's side rather than none.
+        #
+        # The probe and the /stats reader speak the scheme the attack speaks.
+        # A plaintext probe against a TLS-only target never answers: it reads
+        # 0% availability and no served count for a target that answered every
+        # request - the h3 lesson (see _probe_availability_h3) one layer down,
+        # and the same reason the h2 smoke run against a TLS target reported
+        # 0.0/100. h2 and h3 always ride TLS in this tool, so they imply https
+        # here without a flag of their own - and h3 is a transport rather than
+        # a profile flag, so it is checked on the config.
+        self._probe_tls = bool(
+            getattr(config.attack, "use_tls", False)
+            or getattr(config.attack, "use_http2", False)
+            or config.transport is TransportKind.H3
+        )
+        self._probe_verify = bool(getattr(config.attack, "tls_verify", True))
         self._observer = TargetObserver(
-            config.target.host, config.target.port
+            config.target.host,
+            config.target.port,
+            tls=self._probe_tls,
+            verify=self._probe_verify,
         )
         self._observe_target_enabled = observe_target
         self._stats_before: tuple[int, int] | None = None
@@ -486,8 +504,14 @@ class RunEngine:
                         profile.payload_size,
                         target=self.config.target,
                         seed=sequence,
+                        path=profile.http_path,
                         keep_alive=profile.keep_alive,
                         fingerprint=persona,
+                        method=profile.http_method,
+                        cookie_header=profile.cookie_header,
+                        referer=profile.referer,
+                        body=profile.http_body,
+                        content_type=profile.content_type,
                     )
                 )
             next_send += interval * self.batch
@@ -746,9 +770,11 @@ class RunEngine:
         if self.config.transport is TransportKind.H3:
             await self._probe_availability_h3()
             return
-        self._probe_protocol = "http/1.1"
+        self._probe_protocol = "http/1.1" if not self._probe_tls else "https/1.1"
         timeout = httpx.Timeout(self.probe_timeout_s)
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx.AsyncClient(
+            timeout=timeout, verify=self._probe_verify
+        ) as client:
             while not self.controller.should_stop():
                 result = await self._single_probe(client)
                 self._probes.append(result)
@@ -804,8 +830,9 @@ class RunEngine:
 
     async def _single_probe(self, client: Any) -> ProbeResult:
         t = round(self.controller.elapsed, 3)
+        scheme = "https" if self._probe_tls else "http"
         url = (
-            f"http://{self.config.target.host}:{self.config.target.port}"
+            f"{scheme}://{self.config.target.host}:{self.config.target.port}"
             f"{self.probe_path}"
         )
         started = time.monotonic()
@@ -1146,7 +1173,10 @@ class RunEngine:
         if self.config.transport is not TransportKind.PROXY:
             return None
         try:
-            pool = shared_pool(self.config.proxy_file or None)
+            pool = shared_pool(
+                self.config.proxy_file or None,
+                default_scheme=self.config.proxy_default_scheme,
+            )
         except ProxyListError as exc:
             # Setup failed before any transport existed, so this is only
             # reachable if the list disappeared between construction and here.

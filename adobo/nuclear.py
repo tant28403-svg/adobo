@@ -564,9 +564,19 @@ def run_profile_process(
         # Worker errors used to be collected and dropped, so a profile whose
         # transport refused to open looked identical to one that was busy. The
         # hook surfaces the reason the moment it happens.
+        #
+        # terminal=False marks this as a mid-run worker error, not the child's
+        # verdict: the run continues, engine.run() still returns a result with
+        # the full counters, and the finished event - which re-derives success
+        # from what was actually sent - is what the parent should render. The
+        # parent that treated this event as terminal turned a productive
+        # profile into a permanent [ERROR] with its measurement discarded.
         def _report(exc: BaseException) -> None:
             log(f"ERROR {type(exc).__name__}: {exc}", label)
-            emit(result_queue, label, "failed", error=f"{exc!r}")
+            emit(
+                result_queue, label, "failed",
+                error=f"{exc!r}", terminal=False,
+            )
 
         # Live counters. Without these the parent's table shows zero for every
         # profile until it finishes, because a running child has no result yet -
@@ -652,7 +662,13 @@ def run_profile_process(
         detail = f"{exc}\n{traceback.format_exc()}"
         log(f"FAILED {type(exc).__name__}: {exc}", label)
         _write_crash(f"CRASH: {detail}")
-        emit(result_queue, label, "failed", success=False, result=None, error=detail)
+        # terminal=True: this child will never emit "finished" - the parent
+        # must render the failure as the profile's verdict rather than leave
+        # the row reading [STARTING] until the clock runs out.
+        emit(
+            result_queue, label, "failed",
+            success=False, result=None, error=detail, terminal=True,
+        )
 
 
 class NuclearAggregator:
@@ -676,6 +692,13 @@ class NuclearAggregator:
         fingerprint_rotation: str = "",
         h2_preamble: str = "",
         proxy_file: str = "",
+        http_method: str = "get",
+        http_path: str = "/api/data",
+        cookie_header: str = "",
+        referer: str = "",
+        http_body: str = "",
+        content_type: str = "application/x-www-form-urlencoded",
+        proxy_default_scheme: str = "http",
     ):
         self.profiles = profiles
         self.target_ip = target_ip
@@ -702,6 +725,18 @@ class NuclearAggregator:
         self.fingerprint_rotation = fingerprint_rotation
         self.h2_preamble = h2_preamble
         self.proxy_file = proxy_file
+        # Request-shape options for the http_flood child, same convention as
+        # the identity options above: a strike that asks for none of them
+        # carries the model defaults and builds the AttackProfile it always
+        # built. Only the HTTP flood child receives the shape (see
+        # _http_shape_options for why the body cannot ride on every child).
+        self.http_method = http_method
+        self.http_path = http_path
+        self.cookie_header = cookie_header
+        self.referer = referer
+        self.http_body = http_body
+        self.content_type = content_type
+        self.proxy_default_scheme = proxy_default_scheme
 
         # Use spawn context for Windows compatibility
         self._ctx = mp.get_context('spawn')
@@ -757,13 +792,21 @@ class NuclearAggregator:
         from terminal ones, because a late "started" overwriting a finished
         result would silently discard real measurements.
 
-        A terminal *failure* outranks a later terminal *success* from the same
-        child. A profile whose transport cannot be opened emits "failed" with
-        the real reason, and then still emits "finished" when ``engine.run()``
-        returns normally - it has no exception to raise. Letting that second
-        event overwrite the first turned a run that sent nothing into a clean
-        success, which is how seven raw profiles came to read as silent no-ops
-        while the actual error was printed and then thrown away.
+        The **finished event is the child's own terminal verdict and always
+        wins.** It re-derives success from what was actually sent - a transport
+        that never opened still reports failure there, with the run's notes as
+        the reason - and it carries the full counters the tables render. What
+        must not happen is the inverse: a *mid-run* worker error (``terminal``
+        is false on those) poisoning a profile that then completed. A single
+        worker's socket dying at t=0.5s used to flip the row to [ERROR] with
+        sent=0 for the rest of the run and discard the finished measurement of
+        a profile that had sent fifty thousand packets.
+
+        A *terminal* failure (``terminal=True``, from the child's crash path)
+        is different: no "finished" will ever follow it, so the failure itself
+        is recorded as the verdict - otherwise the row would sit at [STARTING]
+        until the clock ran out, which is exactly what the crash event exists
+        to prevent.
         """
         label = event["profile"]
         kind = event["event"]
@@ -773,11 +816,19 @@ class NuclearAggregator:
         if kind == "started":
             self.started.add(label)
             return
-        self.started.discard(label)
         if kind == "failed":
+            # The reason is kept either way: when the finished run also failed,
+            # its own composed reason travels with the finished event, and the
+            # raw worker error stays here for context.
             self.failures[label] = event
-        elif label in self.failures:
+            if event.get("terminal"):
+                self.started.discard(label)
+                self.results[label] = event
+            # Non-terminal: results and started are untouched. The row keeps
+            # rendering [RUNNING] with live counters, because that is what the
+            # child is.
             return
+        self.started.discard(label)
         self.results[label] = event
 
     def _progress_loop(self) -> None:
@@ -1350,11 +1401,13 @@ class NuclearAggregator:
                     # before these options existed. Passing "" here would fail
                     # the persona validator instead.
                     **self._identity_options(),
+                    **self._http_shape_options(profile.profile),
                 ),
                 transport=profile.transport,
                 defenses=[],
                 label=self._label(profile),
                 proxy_file=self.proxy_file if profile.transport is TransportKind.PROXY else "",
+                proxy_default_scheme=self.proxy_default_scheme,
             )
             configs.append(config)
         return configs
@@ -1376,6 +1429,33 @@ class NuclearAggregator:
             options["h2_preamble"] = self.h2_preamble
         return options
 
+    def _http_shape_options(self, profile: ProfileName) -> dict[str, str]:
+        """The request-shape kwargs for the http_flood child, and only it.
+
+        The model refuses a body on a GET and a header value containing a line
+        break at construction time, so a shape option riding on a UDP child
+        would abort that child with a ValidationError rather than being quietly
+        dropped - the honest failure, but a failure a strike should not be able
+        to cause at all. Non-HTTP children therefore spread with the model
+        defaults, which keeps their configs identical to a strike that asked
+        for no shape.
+
+        Note the asymmetry with :meth:`_identity_options`, which spreads onto
+        every child: a persona on a UDP child is simply unused, while a body on
+        one is refused. The shape is profile-conditional because its validator
+        is.
+        """
+        if profile is not ProfileName.HTTP_FLOOD:
+            return {}
+        return {
+            "http_method": self.http_method,
+            "http_path": self.http_path,
+            "cookie_header": self.cookie_header,
+            "referer": self.referer,
+            "http_body": self.http_body,
+            "content_type": self.content_type,
+        }
+
     def run(self) -> int:
         """Execute the nuclear strike."""
         self.start_time = time.time()
@@ -1386,7 +1466,16 @@ class NuclearAggregator:
         # run: ten children each reading it would apply ten times the intended
         # probe load to a target that is already saturated, and all ten would
         # lose the race to answer.
-        self._observer = TargetObserver(self.target_ip, self._http_port())
+        #
+        # The reading follows the HTTP child's scheme: a strike that asked for
+        # TLS reads its counters over TLS, or a TLS-only target reports as
+        # unobserved no matter how much it served.
+        self._observer = TargetObserver(
+            self.target_ip,
+            self._http_port(),
+            tls=bool(self.use_tls or self.use_http2),
+            verify=self.tls_verify,
+        )
         self._stats_before = _read_stats(self._observer)
 
         # Pre-create configs for each profile
@@ -1637,14 +1726,24 @@ def nuclear_wizard(
     fingerprint_rotation: str | None = None,
     h2_preamble: str | None = None,
     proxy_file: str | None = None,
+    http_method: str | None = None,
+    http_path: str | None = None,
+    cookie: str | None = None,
+    referer: str | None = None,
+    data: str | None = None,
+    content_type: str | None = None,
+    proxy_default_scheme: str | None = None,
 ) -> int:
     """Interactive wizard for nuclear mode.
 
-    The four keyword arguments are values the caller already has - the matching
+    The keyword arguments are values the caller already has - the matching
     command-line flags. Passing one skips the matching question and states what
     was chosen, because a flag the wizard silently ignores is worse than a flag
     the wizard does not have: the operator typed it, saw the wizard ask about
-    something else, and reasonably concluded the two are unrelated.
+    something else, and reasonably concluded the two are unrelated. The request
+    shape options follow the same rule, and are announced rather than asked:
+    seven more interactive questions for options that already exist as flags
+    would grow the wizard without growing what it can do.
     """
     print("\n=== Nuclear Strike ===")
     host = _ask("Target IP")
@@ -1977,7 +2076,29 @@ def nuclear_wizard(
         fingerprint_rotation=chosen_rotation,
         h2_preamble=chosen_preamble,
         proxy_file=chosen_proxy,
+        http_method=http_method or "get",
+        http_path=http_path or "/api/data",
+        cookie_header=cookie or "",
+        referer=referer or "",
+        http_body=data or "",
+        content_type=content_type or "application/x-www-form-urlencoded",
+        proxy_default_scheme=proxy_default_scheme or "http",
     )
+
+    # Announce what the flags did, in the same voice as the workers line: a
+    # shape the operator set on the command line must be visible in the
+    # wizard's output, or a strike reports a request it did not send.
+    if any((http_method, http_path, cookie, referer, data, content_type)):
+        parts = [f"{(http_method or 'get').upper()} {http_path or '/api/data'}"]
+        if data:
+            parts.append(f"body: {len(data)} bytes")
+        if cookie:
+            parts.append("cookie set")
+        if referer:
+            parts.append("referer set")
+        print(f"  http_flood request shape: {', '.join(parts)}")
+    if proxy_default_scheme:
+        print(f"  proxy default scheme: {proxy_default_scheme}")
 
     if _proxy_temp_file:
         try:

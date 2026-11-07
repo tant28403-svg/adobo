@@ -65,12 +65,19 @@ class Proxy:
     Frozen because a pool hands the same instance to every worker thread, and a
     transport that could mutate the proxy it was handed could do so while another
     thread was reading it.
+
+    *scheme* is ``http`` (an HTTP proxy reached with CONNECT) or ``socks4`` /
+    ``socks5`` (reached with a SOCKS handshake). It is a property of the entry,
+    read from its ``scheme://`` prefix, rather than a run-level setting, because
+    a single list legitimately mixes kinds: bare ``host:port`` lines keep the
+    historical default via ``default_scheme`` at parse time.
     """
 
     host: str
     port: int
     username: str | None = None
     password: str | None = None
+    scheme: str = "http"
 
     @property
     def needs_auth(self) -> bool:
@@ -79,6 +86,10 @@ class Proxy:
     @property
     def endpoint(self) -> str:
         return f"{_bracket(self.host)}:{self.port}"
+
+    @property
+    def is_socks(self) -> bool:
+        return self.scheme in ("socks4", "socks5")
 
     def authorization(self) -> str | None:
         """The ``Proxy-Authorization`` value, or None when the proxy is open.
@@ -94,9 +105,10 @@ class Proxy:
 
     def label(self) -> str:
         """How to name this proxy in output. Never includes credentials."""
+        prefix = "" if self.scheme == "http" else f"{self.scheme}://"
         if self.needs_auth:
-            return f"{self.username}@{self.endpoint}"
-        return self.endpoint
+            return f"{prefix}{self.username}@{self.endpoint}"
+        return f"{prefix}{self.endpoint}"
 
     def __str__(self) -> str:  # pragma: no cover - display only
         return self.label()
@@ -107,19 +119,25 @@ def _bracket(host: str) -> str:
     return f"[{host}]" if ":" in host else host
 
 
-def parse_proxy(line: str) -> Proxy:
+def parse_proxy(line: str, default_scheme: str = "http") -> Proxy:
     """Parse one proxy entry.
 
     Accepted, in the order they are peeled off::
 
         [scheme://][user:pass@]host:port
 
-    A scheme of ``http`` or ``https`` is accepted and ignored - both mean the
-    same thing to us, since we CONNECT and then speak TLS ourselves. Any other
-    scheme is refused by name rather than treated as a hostname, because
-    ``socks5://1.2.3.4:1080`` parsed as a host would produce a connection to a
-    host literally called ``socks5``, and the operator would spend a while
-    wondering why.
+    *scheme* is ``http``/``https`` (both mean CONNECT to us), ``socks4``,
+    ``socks4a`` or ``socks5`` (``socks5h`` is accepted as an alias for
+    ``socks5``: the ``h`` marks remote DNS, and the SOCKS5 CONNECT carries the
+    name either way, so the distinction does not exist at this layer). A line
+    with no scheme gets *default_scheme*, which is how a plain ``host:port``
+    list stays HTTP as it always was while a downloaded SOCKS list can be
+    tagged wholesale without rewriting it.
+
+    Any other scheme is refused by name rather than treated as a hostname,
+    because ``socks5://1.2.3.4:1080`` parsed as a host would produce a
+    connection to a host literally called ``socks5``, and the operator would
+    spend a while wondering why.
     """
     text = line.strip()
     if not text:
@@ -129,11 +147,22 @@ def parse_proxy(line: str) -> Proxy:
     if "://" in text:
         scheme, _, text = text.partition("://")
         scheme = scheme.lower()
-        if scheme not in ("http", "https"):
+        if scheme in ("http", "https"):
+            scheme = "http"
+        elif scheme in ("socks4", "socks4a", "socks5", "socks5h"):
+            # 4a is a wire-level extension of 4 (the proxy resolves the name),
+            # and socks5h's remote-DNS is how the SOCKS5 CONNECT works here
+            # regardless, so both collapse to the base scheme.
+            scheme = "socks5" if scheme in ("socks5", "socks5h") else "socks4"
+        else:
             raise ProxyListError(
-                f"unsupported proxy scheme {scheme!r}: only http and https "
-                f"proxies are supported"
+                f"unsupported proxy scheme {scheme!r}: supported schemes are "
+                f"http, https, socks4, socks4a and socks5"
             )
+    else:
+        scheme = default_scheme
+    if scheme not in ("http", "socks4", "socks5"):  # pragma: no cover - guarded above
+        raise ProxyListError(f"unsupported proxy scheme {scheme!r}")
 
     username: str | None = None
     password: str | None = None
@@ -163,7 +192,7 @@ def parse_proxy(line: str) -> Proxy:
             f"proxy port {port} is out of range in {line.strip()!r}"
         )
 
-    return Proxy(host=host, port=port, username=username, password=password)
+    return Proxy(host=host, port=port, username=username, password=password, scheme=scheme)
 
 
 def _split_host_port(text: str) -> tuple[str, str, bool]:
@@ -195,18 +224,21 @@ def _split_host_port(text: str) -> tuple[str, str, bool]:
     return host, port, False
 
 
-def load_proxies(path: str | Path | None = None) -> list[Proxy]:
+def load_proxies(path: str | Path | None = None, default_scheme: str = "http") -> list[Proxy]:
     """Read a proxy list, one entry per line.
 
-    Blank lines and ``#`` comments are skipped, so a list can be annotated -
+    Blank lines and ``#`` comments are skipped, so a list can be annotated - 
     which matters when the list is a few thousand purchased endpoints and the
     only way to know which region a line belongs to is what someone wrote next
     to it.
 
+    *default_scheme* applies only to entries written without a ``scheme://``
+    prefix - see :func:`parse_proxy`. An explicit prefix always wins.
+
     Returns an empty list when *path* is None or does not exist: a missing file
     is a configuration the operator can fix, and failing the run at startup with
     a stack trace for it would be a worse answer than running without proxies
-    would be. Callers that require proxies must check ``len()`` themselves -
+    would be. Callers that require proxies must check ``len()`` themselves - 
     :func:`require_proxies` does.
     """
     if path is None:
@@ -225,7 +257,7 @@ def load_proxies(path: str | Path | None = None) -> list[Proxy]:
             seen: set[tuple[str, int, str | None]] = set()
             for entry in entries:
                 try:
-                    proxy = parse_proxy(entry)
+                    proxy = parse_proxy(entry, default_scheme)
                 except ProxyListError:
                     continue
                 key = (proxy.host, proxy.port, proxy.username)
@@ -269,7 +301,7 @@ def load_proxies(path: str | Path | None = None) -> list[Proxy]:
             if not line:
                 continue
             try:
-                proxy = parse_proxy(line)
+                proxy = parse_proxy(line, default_scheme)
             except ProxyListError as exc:
                 raise ProxyListError(
                     f"{target}:{number}: {exc}"
@@ -285,9 +317,9 @@ def load_proxies(path: str | Path | None = None) -> list[Proxy]:
     return proxies
 
 
-def require_proxies(path: str | Path | None) -> list[Proxy]:
+def require_proxies(path: str | Path | None, default_scheme: str = "http") -> list[Proxy]:
     """Load a proxy list and insist it is not empty."""
-    proxies = load_proxies(path)
+    proxies = load_proxies(path, default_scheme)
     if not proxies:
         raise ProxyListError(
             f"no proxies found in {path or DEFAULT_PROXY_FILE}. One proxy per "
@@ -296,11 +328,13 @@ def require_proxies(path: str | Path | None) -> list[Proxy]:
     return proxies
 
 
-_POOLS: dict[tuple[str, float], ProxyPool] = {}
+_POOLS: dict[tuple[str, float, str], ProxyPool] = {}
 _POOLS_LOCK = threading.Lock()
 
 
-def shared_pool(path: str | Path | None) -> ProxyPool:
+def shared_pool(
+    path: str | Path | None, default_scheme: str = "http"
+) -> ProxyPool:
     """The one pool for a proxy list, shared by every transport in the process.
 
     The engine builds one transport per worker and each calls ``get_transport``
@@ -311,10 +345,11 @@ def shared_pool(path: str | Path | None) -> ProxyPool:
     per-IP rate limiter or connection cap catches. A distributed run that opens
     with a synchronised stampede is not a distributed run.
 
-    Keyed on path and mtime so editing the list between runs builds a new pool,
-    and so two different lists in one process never share a rotation.
+    Keyed on path, mtime and *default_scheme* so editing the list between runs
+    builds a new pool, so two different lists in one process never share a
+    rotation, and so the same file under two scheme defaults does not either.
     """
-    proxies = require_proxies(path)
+    proxies = require_proxies(path, default_scheme)
     first = proxies[0]
     from .config import project_path
 
@@ -323,7 +358,7 @@ def shared_pool(path: str | Path | None) -> ProxyPool:
         stamp = resolved.stat().st_mtime if resolved is not None else 0.0
     except OSError:
         stamp = 0.0
-    key = (f"{first.endpoint}:{len(proxies)}", stamp)
+    key = (f"{first.endpoint}:{len(proxies)}", stamp, default_scheme)
     with _POOLS_LOCK:
         pool = _POOLS.get(key)
         if pool is None:
@@ -413,7 +448,12 @@ class ProxyPool:
     def health_check(
         self, target_host: str, target_port: int, timeout: float = 5.0
     ) -> tuple[list[Proxy], list[tuple[Proxy, str]]]:
-        """Test each proxy by attempting a CONNECT tunnel to the target.
+        """Test each proxy by attempting a tunnel to the target.
+
+        Scheme-aware: an HTTP proxy gets a CONNECT, a SOCKS proxy gets the
+        SOCKS handshake - both arrive through
+        :func:`~adobo.transports.proxy_transport.connect_tunnel`, so the check
+        cannot drift from what a run actually does.
 
         Returns (alive_proxies, dead_proxies_with_reasons).
         """
