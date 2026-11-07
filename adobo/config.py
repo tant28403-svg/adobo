@@ -1,11 +1,9 @@
 """YAML-backed configuration loading and validation.
 
-Three files drive the tool, all optional-but-recommended and all overridable by
-path:
+Two files drive the tool, both optional-but-recommended and overridable by path:
 
-    config/lab.yaml            policy: allowlist, ceilings, measurement cadence
-    config/authorization.yaml  written authorisation record (fails closed)
-    config/waf_rules.yaml      mitigation rule set (parsed by adobo.defenses)
+    config/lab.yaml       policy: allowlist, ceilings, measurement cadence
+    config/waf_rules.yaml mitigation rule set (parsed by adobo.defenses)
 
 Nothing here opens a socket. Loading a config is a pure, testable operation.
 """
@@ -33,7 +31,6 @@ from .models import Target
 # config would silently fail to load.
 
 LAB_CONFIG_NAME = "lab.yaml"
-AUTHORIZATION_CONFIG_NAME = "authorization.yaml"
 WAF_CONFIG_NAME = "waf_rules.yaml"
 
 
@@ -167,7 +164,7 @@ def load_lab_config(path: str | Path | None = None) -> LabConfig:
 # dated, scoped record was edited first - including to the loopback lab target
 # shipped in this repository, so the first thing a new user had to do was
 # authorise a test against their own machine. The model and load_authorization
-# are kept here only as a record of what was removed; nothing reads them.
+# are kept here as a historical record only; nothing in the engine reads them.
 # --------------------------------------------------------------------------
 
 
@@ -220,7 +217,7 @@ def load_authorization(path: str | Path | None = None) -> AuthorizationConfig | 
     authorisation gate, and no file needs to exist before a run is allowed.
     """
     target_path = (
-        project_path(path) if path else config_path(AUTHORIZATION_CONFIG_NAME)
+        project_path(path) if path else config_path("authorization.yaml")
     )
     if not target_path.exists():
         return None

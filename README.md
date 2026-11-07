@@ -223,6 +223,7 @@ pip install scapy aioquic      # raw profiles and HTTP/3 (won't send on unrooted
 | `--dry-run` | off | Print exactly what a run would do - resolved transport, request shape, proxy pool, TLS - then exit. No packet is sent |
 | `--nuclear` | off | Run the interactive nuclear wizard |
 | `--profiles` | (all) | With `--nuclear`: comma-separated profiles the strike runs, e.g. `dns_amplification,http_flood` |
+| `--http-host` | (none) | Host header + SNI for `http_flood` (and TLS SNI for all transports); required when a CDN fronts the target and you connect by IP — the edge routes by Host, so without it the flood reaches the catch-all instead of the site |
 
 ### Shaping the HTTP request (`http_flood`)
 
@@ -339,6 +340,27 @@ A run prints a result block like:
 > applied per profile, not divided across them, so 10 profiles at 500 PPS
 > means 5,000+ PPS combined. Start low and increase gradually.
 
+### How to Use Nuclear Mode (Read Before You Run)
+
+**Do not just press Enter through the prompts.** Each question determines whether your traffic actually reaches the target or hits a catch-all/handshake failure. Here is what each question controls:
+
+| Prompt | What it controls | Common mistake |
+|---|---|---|
+| **Target IP** | Where the traffic goes | Using a bare IP when a CDN fronts the target — the edge routes by Host header, so without `--http-host` the flood hits the catch-all (308 redirect / 403). **Use your domain name instead.** |
+| **Port** | TCP/UDP destination | Port 80 = plaintext; port 443 = TLS. If you type 80 but 443 speaks TLS, the wizard offers to switch. |
+| **PPS / Duration** | Applied **per profile**, not divided | 10 profiles at 500 PPS = 5,000 PPS combined. Start low. |
+| **HTTP/3 (QUIC)** | Uses UDP 443; needs `aioquic` | Most CDN edges don't answer QUIC. Wizard tests one handshake first — no answer → fallback to HTTP/1.1. |
+| **HTTP/2** | Requires TLS; multiplexes streams | Needs a TLS port that negotiates h2. Wizard skips if target refused TLS. |
+| **Personas** | Rotating browser identities | Blank = lab self-identifying client (default, safe). |
+| **Proxy list** | Rotating egress for `http_flood` only | UDP/raw profiles can't be proxied; only HTTP traffic tunnels. |
+| **Keep-alive** | Reuses HTTP connections | Higher throughput; use `--keep-alive` flag for single-profile runs. |
+| **TLS/HTTPS** | Auto-enabled on port 443 | Answer `n` if cert doesn't cover your IP (or use domain name instead). Skipped if HTTP/3 chosen (QUIC is always TLS). |
+| **Verify TLS** | Cert verification | `n` for self-signed; skipped when HTTP/3 chosen (QUIC always TLS). |
+| **Workers** | Threads per profile | Capped at 800; more workers ≠ more packets if server limits concurrency. |
+| **Payload size** | Bytes per packet | Max 1,400 (MTU ceiling). |
+| **IP spoofing** | Forged source IP | Requires root/CAP_NET_RAW; only for raw profiles. |
+| **Profiles to run** | Which profiles execute | Blank = all surviving filters; or names/numbers (e.g. `http_flood,rapid_reset` or `10,9`). |
+
 Runs the selected profiles in parallel (default: every applicable profile):
 
 ```bash
@@ -357,6 +379,7 @@ Use HTTP/3 (QUIC) for http_flood? (needs the aioquic package) [y/N]:
 Use HTTP/2 for http_flood? (requires TLS, enables multiplexing) [y/N]:
 Client personas for http_flood (comma-separated, blank = none):
 Proxy list for http_flood (path, blank = none):
+Host header for http_flood (blank = none; use when a CDN fronts the target):
 Enable HTTP/1.1 keep-alive for http_flood? (higher throughput) [y/N]:
 Use TLS/HTTPS for http_flood? (auto-enabled on port 443) [y/N]:
 Verify TLS certificates? (disable for self-signed certs) [Y/n]:
@@ -366,7 +389,7 @@ Enable IP spoofing for raw profiles? (requires root/CAP_NET_RAW) [y/N]:
   profiles available for this strike:
      1. icmp_flood             (linux_raw)
      ...
-  Profiles to run (comma-separated numbers or names, blank = all):
+   Profiles to run (comma-separated numbers or names, blank = all):
 ```
 
 Conditional questions: **HTTP/2 concurrency** and the **h2 preamble** appear
@@ -403,6 +426,7 @@ One input uses a default that isn't prompted:
 | Client personas | Rotating browser identities for `http_flood` (see `--fingerprint`) |
 | TLS / verify | TLS for `http_flood`; the verify choice applies to `rapid_reset` too |
 | Proxy list | Rotating egress for `http_flood`; only HTTP traffic can be proxied |
+| Host header | `Host` header + SNI for `http_flood` (and all transports); routes CDN-fronted targets to your app instead of catch-all; also fixes cert verification against IP targets |
 | IP spoofing | Adds the spoofed variants. Needs root |
 | Profiles to run | Which profiles the strike runs. Blank = all; comma-separated numbers or names from the menu just printed; duplicates collapse, unknown names re-ask |
 
@@ -564,7 +588,6 @@ Located under `config/` (resolved via `adobo.paths`, source-tree or PyInstaller 
 |---|---|
 | `config/lab.yaml` | Policy: allowlist CIDRs, ceilings, measurement cadence, paths. Optional; defaults are conservative. |
 | `config/waf_rules.yaml` | Mitigation rule set (parsed by `adobo.defenses`). Optional; built-in defaults when absent. |
-| `config/authorization.yaml` | Legacy authorisation record; no longer consulted by the engine |
 
 `lab.yaml` is optional; when absent the tool falls back to conservative defaults
 (max payload 1400 bytes, allowlist 127.0.0.0/8, probe path /healthz, etc.).
@@ -583,7 +606,7 @@ adobo/
 │   ├── cli.py              # argparse entry point
 │   ├── engine.py           # run orchestration
 │   ├── models.py           # RunConfig, AttackProfile, Target, ...
-│   ├── config.py           # lab.yaml / authorization / waf loading
+│   ├── config.py           # lab.yaml / waf_rules.yaml loading
 │   ├── safety.py           # policy ceilings (clamp only)
 │   ├── nuclear.py          # nuclear wizard
 │   ├── fingerprint.py      # client identity / HTTP/2 preamble
@@ -595,7 +618,7 @@ adobo/
 │   ├── transports/         # socket, scapy, linux_raw, virtual, h2, h3, proxy, socks
 │   └── target/             # lab target server (FastAPI/uvicorn) + UDP reflectors
 ├── config/
-│   └── authorization.yaml  # legacy authorisation template
+│   └── lab.yaml            # policy: allowlist CIDRs, ceilings, paths
 ├── tests/
 └── scripts/
 ```
