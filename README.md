@@ -42,10 +42,12 @@ solely on the sender's claims.
 Use cases:
 
 - Resilience benchmarking: quantify availability and latency under load
-- Mitigation testing: run against the hardened target to validate rate limits, WAF rules, circuit breakers
+- Mitigation testing: run against the hardened target to validate rate limits, WAF rules, circuit breakers, challenge gates
 - Education: study how different flood and amplification techniques behave
 - Protocol inspection: measure HTTP/2 connection preambles and fingerprints
-- Proxy/egress testing: distribute HTTP floods across a proxy list
+- Proxy/egress testing: distribute HTTP floods across a SOCKS4/SOCKS5/HTTP proxy list
+- Amplification measurement: point the profiles at the built-in UDP reflectors and get a measured factor, not just a published estimate
+- Nuclear strikes: every profile in parallel — or a selection of your choosing
 
 ## Table of Contents
 
@@ -168,7 +170,7 @@ pip install scapy aioquic      # raw profiles and HTTP/3 (won't send on unrooted
 | Command | Description |
 |---|---|
 | `python -m adobo` | Run a single profile against a target (default entry point) |
-| `python -m adobo --nuclear` | Interactive nuclear wizard: runs every applicable profile in parallel |
+| `python -m adobo --nuclear` | Interactive nuclear wizard: runs the selected profiles in parallel (default: all) |
 | `python -m adobo --serve-target` | Serve the lab target instead of attacking |
 | `python -m adobo.target` | Start the lab target server directly |
 | `python -m adobo --download-proxies` | Fetch public proxy lists into `proxies.txt` (list management; no target) |
@@ -220,6 +222,7 @@ pip install scapy aioquic      # raw profiles and HTTP/3 (won't send on unrooted
 | `--quiet` | off | Suppress progress output |
 | `--dry-run` | off | Print exactly what a run would do - resolved transport, request shape, proxy pool, TLS - then exit. No packet is sent |
 | `--nuclear` | off | Run the interactive nuclear wizard |
+| `--profiles` | (all) | With `--nuclear`: comma-separated profiles the strike runs, e.g. `dns_amplification,http_flood` |
 
 ### Shaping the HTTP request (`http_flood`)
 
@@ -312,8 +315,11 @@ A run prints a result block like:
 
 > ## ⚠️ WARNING: HIGH CPU USAGE ⚠️
 >
-> **Nuclear mode runs every applicable profile in parallel and can consume
-> significant CPU and system resources.** Make sure you have a capable machine
+> **Nuclear mode runs every selected profile in parallel and can consume
+> significant CPU and system resources.** The default selection is every
+> applicable profile; narrow it with the "Profiles to run" question or
+> `--profiles` if your machine or network is the constraint. Make sure you
+> have a capable machine
 > (multi-core CPU, sufficient RAM) before running it. On low-end or shared
 > systems, nuclear mode may cause high CPU usage, slow response times, or
 > system instability. **Consider running individual profiles first to gauge
@@ -323,7 +329,7 @@ A run prints a result block like:
 > - **CPU:** 8 cores or above
 > - **RAM:** 16 GB or more
 >
-> **⚠️ Network saturation warning:** Nuclear mode runs every applicable profile
+> **⚠️ Network saturation warning:** Nuclear mode runs every selected profile
 > in parallel and can saturate your own network bandwidth. Make sure your network
 > connection and infrastructure can handle the combined load of all profiles
 > running simultaneously. On limited or shared networks, this may cause
@@ -346,25 +352,41 @@ Target IP: 127.0.0.1
 Port (for TCP/UDP profiles) [80]: 8001
 PPS per profile (max 20,000 - max_pps) [500]:
 Duration (s) [60]:
+Use HTTP/3 (QUIC) for http_flood? (needs the aioquic package) [y/N]:
 Use HTTP/2 for http_flood? (requires TLS, enables multiplexing) [y/N]:
-Enable HTTP/1.1 keep-alive for http_flood? (higher throughput, delivery may overcount) [y/N]:
+Client personas for http_flood (comma-separated, blank = none):
+Proxy list for http_flood (path, blank = none):
+Enable HTTP/1.1 keep-alive for http_flood? (higher throughput) [y/N]:
 Use TLS/HTTPS for http_flood? (auto-enabled on port 443) [y/N]:
+Verify TLS certificates? (disable for self-signed certs) [Y/n]:
+Worker threads per profile [4]:
 Payload size (bytes) (max 1,400 - max_payload_bytes) [512]:
 Enable IP spoofing for raw profiles? (requires root/CAP_NET_RAW) [y/N]:
+  profiles available for this strike:
+     1. icmp_flood             (linux_raw)
+     ...
+  Profiles to run (comma-separated numbers or names, blank = all):
 ```
 
-One question uses a default that isn't prompted:
+Conditional questions: **HTTP/2 concurrency** and the **h2 preamble** appear
+only when HTTP/2 is on; **persona rotation** only when a persona was given;
+HTTP/2 is not offered at all when HTTP/3 was chosen; the **workers** question
+appears only when `lab.yaml` leaves `max_workers` unset.
+
+One input uses a default that isn't prompted:
 
 - **Reflector ports** use the well-known service ports (53 / 123 / 389 / 1900).
-- **Worker threads** are capped by `max_workers` (default ceiling: 200).
 
 | Question | What it does |
 |---|---|
-| PPS / Duration | Applied to **each** profile, not divided across them |
-| Workers | Per profile. Default 4, maximum `max_workers` (200) |
+| PPS / Duration | Applied to **each** selected profile, not divided across them |
+| Workers | Per profile. Asked when `max_workers` is unset; capped by it otherwise |
 | Payload | Bytes per packet. Ceiling 1,400 |
+| Client personas | Rotating browser identities for `http_flood` (see `--fingerprint`) |
+| TLS / verify | TLS for `http_flood`; the verify choice applies to `rapid_reset` too |
+| Proxy list | Rotating egress for `http_flood`; only HTTP traffic can be proxied |
 | IP spoofing | Adds the spoofed variants. Needs root |
-| Profiles to run | Which profiles the strike runs. Blank = all; otherwise comma-separated numbers or names from the menu just printed. Duplicates collapse, unknown names re-ask |
+| Profiles to run | Which profiles the strike runs. Blank = all; comma-separated numbers or names from the menu just printed; duplicates collapse, unknown names re-ask |
 
 **Choosing profiles:** the menu lists what this strike could actually run —
 after the privilege and port filters, so deselecting is never a surprise. You
@@ -515,11 +537,13 @@ Located under `config/` (resolved via `adobo.paths`, source-tree or PyInstaller 
 | File | Purpose |
 |---|---|
 | `config/lab.yaml` | Policy: allowlist CIDRs, ceilings, measurement cadence, paths. Optional; defaults are conservative. |
-| `config/waf_rules.yaml` | Mitigation rule set (parsed by `adobo.defenses`) |
+| `config/waf_rules.yaml` | Mitigation rule set (parsed by `adobo.defenses`). Optional; built-in defaults when absent. |
 | `config/authorization.yaml` | Legacy authorisation record; no longer consulted by the engine |
 
 `lab.yaml` is optional; when absent the tool falls back to conservative defaults
 (max payload 1400 bytes, allowlist 127.0.0.0/8, probe path /healthz, etc.).
+`waf_rules.yaml` is optional the same way: `adobo.defenses` ships built-in
+rules and loads the file only when it exists.
 
 ## Project Structure
 
@@ -540,12 +564,12 @@ adobo/
 │   ├── h2profile.py / h2inspect.py
 │   ├── observation.py / monitor.py / scoring.py / report.py
 │   ├── defenses.py / cancellation.py / paths.py
-│   ├── proxies.py
-│   ├── transports/         # socket, scapy, linux_raw, virtual, h2, h3, proxy, ...
-│   └── target/             # lab target server (FastAPI/uvicorn)
+│   ├── proxies.py           # proxy lists: parsing, pools, encryption
+│   ├── proxy_sources.py     # --download-proxies / --check-proxies
+│   ├── transports/         # socket, scapy, linux_raw, virtual, h2, h3, proxy, socks
+│   └── target/             # lab target server (FastAPI/uvicorn) + UDP reflectors
 ├── config/
-│   ├── authorization.yaml
-│   └── waf_rules.yaml
+│   └── authorization.yaml  # legacy authorisation template
 ├── tests/
 └── scripts/
 ```
@@ -588,6 +612,11 @@ python -m adobo --host <device-ip> --port 8001 --profile http_flood --pps 500 --
 - **Python:** 3.11 or later (Termux `pkg install python` currently provides 3.11+).
 
 ## Tests
+
+The suite is 1,100+ tests and passes on Windows, Linux and Termux — it covers
+the payload builders byte-for-byte, the SOCKS and HTTP proxy handshakes, the
+defense middleware, the nuclear wizard's question flow, and end-to-end runs
+against the lab target and the in-process h3/reflector servers.
 
 ```bash
 python -m pytest tests/ -q
