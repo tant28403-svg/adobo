@@ -514,6 +514,15 @@ class TestOperatorValuesReachTheChildren:
         attack = _child_attack(workers=200)
         assert attack.workers == 200
 
+    def test_workers_at_the_model_ceiling_reach_the_child(self) -> None:
+        """800 is the hard ceiling; a strike pinned to it must still run.
+
+        The ceiling became a model bound in the same change that raised the
+        operator-facing one, so a value that was legal everywhere yesterday
+        but sat exactly at the new limit is the boundary worth pinning.
+        """
+        assert _child_attack(workers=800).workers == 800
+
     def test_a_non_default_worker_count_is_not_silently_replaced(self) -> None:
         """The regression that matters: a literal would pass the test above
         only if it happened to equal 200. Check a second value so no constant

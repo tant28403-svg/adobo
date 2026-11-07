@@ -166,6 +166,53 @@ class TestCeilingsClampAndReport:
         assert any("payload" in n.lower() for n in notes)
 
 
+class TestTheWorkersCeiling:
+    """800 worker threads is the hard ceiling, built into three places.
+
+    The old top-up raised the operator-facing ceiling from 200 to 800 without
+    moving the model bound, so the places where the value was checked disagreed:
+    the wizard accepted one number, the model refused another, and a
+    ``lab.yaml`` could still keep the old 200 in force. The ceiling is now one
+    constant (``WORKERS_CEILING``) the model bound, the pre-model clamp and the
+    wizard prompt all read, and ``lab.yaml`` may lower it for a constrained
+    machine but never raise it past 800.
+    """
+
+    def test_the_model_accepts_the_ceiling_and_refuses_one_more(self) -> None:
+        _profile(workers=800)  # in range; constructing it is the assertion
+        with pytest.raises(ValidationError):
+            _profile(workers=801)
+
+    def test_the_ceiling_applies_without_a_lab_configuration(self) -> None:
+        guard = SafetyGuard()
+        assert guard.lab.limits.max_workers is None
+        fields, notes = guard.clamp_fields(workers=8000)
+        assert fields["workers"] == 800
+        assert any("model limit" in n for n in notes)
+
+    def test_a_lab_max_workers_above_the_ceiling_cannot_raise_it(self) -> None:
+        """The hard ceiling is not operator-editable through lab.yaml.
+
+        A lab-configured max_workers still governs (the wizard prints it, the
+        gate clamps to it), but only downwards: at 2,000, a request for 5,000
+        workers lands at 800, not 2,000.
+        """
+        guard = SafetyGuard(lab=_lab(max_workers=2000))
+        fields, notes = guard.clamp_fields(workers=5000)
+        assert fields["workers"] == 800
+        assert any("model limit" in n for n in notes)
+
+    def test_a_value_at_the_ceiling_is_left_alone(self) -> None:
+        guard = SafetyGuard()
+        fields, notes = guard.clamp_fields(workers=800)
+        assert fields["workers"] == 800
+        assert notes == []
+
+    def test_the_summary_reports_the_hard_ceiling(self) -> None:
+        """A wizard prompt quoting ceilings should never say workers are uncapped."""
+        assert "workers<=800" in SafetyGuard().describe_ceilings()
+
+
 # ---------------------------------------------------------------------------
 # preflight
 # ---------------------------------------------------------------------------

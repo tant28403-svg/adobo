@@ -190,7 +190,7 @@ pip install scapy aioquic      # raw profiles and HTTP/3 (won't send on unrooted
 | `--profile` | `udp_flood` | Attack profile (see [Profiles](#profiles)) |
 | `--pps` | 5000 | Packets per second |
 | `--duration` | 10 | Seconds |
-| `--workers` | 4 | Worker threads |
+| `--workers` | 4 | Worker threads (hard ceiling: 800; `max_workers` in lab.yaml can lower it only) |
 | `--payload` | 512 | Payload size in bytes |
 | `--transport` | `auto` | `socket`, `scapy`, `linux_raw`, `virtual`, `h2`, `h3`, `proxy` |
 | `--tls` | auto on HTTPS ports | Use TLS/HTTPS for `http_flood` |
@@ -258,7 +258,8 @@ lab target, h2 needs the target serving TLS with ALPN:
 
 Ceilings (`max_pps`, `max_duration_seconds`, `max_payload_bytes`, `max_workers`) are
 read from `config/lab.yaml` and only ever lower requested values; reductions are
-printed. Throughput is not capped by default.
+printed. Throughput is not capped by default. Worker threads additionally have a
+built-in hard ceiling of 800 that `lab.yaml` cannot raise.
 
 ## Profiles
 
@@ -359,7 +360,7 @@ Proxy list for http_flood (path, blank = none):
 Enable HTTP/1.1 keep-alive for http_flood? (higher throughput) [y/N]:
 Use TLS/HTTPS for http_flood? (auto-enabled on port 443) [y/N]:
 Verify TLS certificates? (disable for self-signed certs) [Y/n]:
-Worker threads per profile [4]:
+Worker threads per profile (max 800 - workers ceiling) [4]:
 Payload size (bytes) (max 1,400 - max_payload_bytes) [512]:
 Enable IP spoofing for raw profiles? (requires root/CAP_NET_RAW) [y/N]:
   profiles available for this strike:
@@ -380,7 +381,7 @@ One input uses a default that isn't prompted:
 | Question | What it does |
 |---|---|
 | PPS / Duration | Applied to **each** selected profile, not divided across them |
-| Workers | Per profile. Asked when `max_workers` is unset; capped by it otherwise |
+| Workers | Per profile. Asked when `max_workers` is unset (max 800); a configured `max_workers` applies instead but can never raise the value above 800 |
 | Payload | Bytes per packet. Ceiling 1,400 |
 | Client personas | Rotating browser identities for `http_flood` (see `--fingerprint`) |
 | TLS / verify | TLS for `http_flood`; the verify choice applies to `rapid_reset` too |

@@ -16,7 +16,10 @@ target is named by the operator either way.
 The ceilings stay because they are what keeps a run inside what the machine
 can actually measure. A run configured past them is not a stronger test, it is
 a run whose numbers no longer describe the thing being tested. They are
-enforced, they lower only, and they are never silent.
+enforced, they lower only, and they are never silent. On top of the
+``lab.yaml`` policy sit built-in model bounds (payload, HTTP/2 concurrency,
+workers via ``WORKERS_CEILING``) - repeated in ``SafetyGuard.MODEL_CEILINGS``
+so the gate can clamp to them before the model makes the refusal a crash.
 
 The legal and ethical position is unchanged and lives in the README: only
 target systems you own or have written permission to test.
@@ -28,7 +31,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .config import LabConfig, load_lab_config
-from .models import AttackProfile, Target
+from .models import AttackProfile, Target, WORKERS_CEILING
 
 
 class PolicyViolation(Exception):
@@ -62,8 +65,13 @@ class SafetyGuard:
     #: to them before the model sees a value it will reject. AttackProfile
     #: refuses anything over 65,507 bytes, and a refusal at construction time
     #: is a raw ValidationError with no mention of the policy ceiling - which is
-    #: exactly the crash a 1,900,000-byte payload produced.
-    MODEL_CEILINGS = {"payload_size": 65_507, "h2_concurrency": 1000}
+    #: exactly the crash a 1,900,000-byte payload produced. ``workers`` shares
+    #: :data:`WORKERS_CEILING` with the model so the two limits cannot drift.
+    MODEL_CEILINGS = {
+        "payload_size": 65_507,
+        "h2_concurrency": 1000,
+        "workers": WORKERS_CEILING,
+    }
 
     def clamp_fields(self, **requested: Any) -> tuple[dict[str, Any], list[str]]:
         """Cap raw requested values, before any model validates them.
@@ -155,7 +163,8 @@ class SafetyGuard:
         limits = self.lab.limits
         pps = "uncapped" if limits.max_pps is None else f"pps<={limits.max_pps:,}"
         duration = "uncapped" if limits.max_duration_seconds is None else f"duration<={limits.max_duration_seconds:g}s"
-        workers = "uncapped" if limits.max_workers is None else f"workers<={limits.max_workers:,}"
+        ceiling = WORKERS_CEILING if limits.max_workers is None else min(limits.max_workers, WORKERS_CEILING)
+        workers = f"workers<={ceiling:,}"
         return f"{pps} {duration} payload<={limits.max_payload_bytes:,}B {workers}"
 
 

@@ -343,10 +343,13 @@ class TestTheWizardIsDriven:
     #: `workers` sits between `verify` and `payload`, and is only *asked* when
     #: lab.yaml leaves max_workers unset - the shipped default, and the
     #: repository ships no lab.yaml. With a ceiling configured the wizard
-    #: prints the capped value instead of prompting. It was added to the wizard
-    #: after these scripts were written, and every test in this class failed
-    #: with answers fed to the wrong prompt until the order was re-read off the
-    #: wizard.
+    #: prints the capped value instead of prompting, capped at the 800 hard
+    #: ceiling a configured-but-higher max_workers can never lift. The ask
+    #: itself is bounded (like payload), so an over-ceiling answer re-asks
+    #: within the question - tested below by splicing in the retry. It was
+    #: added to the wizard after these scripts were written, and every test in
+    #: this class failed with answers fed to the wrong prompt until the order
+    #: was re-read off the wizard.
     #:
     #: `profiles` is the last question: it is asked after build_profiles, the
     #: privilege drop and the port filter, because the menu lists what the
@@ -520,6 +523,30 @@ class TestTheWizardIsDriven:
         )
         configs = aggregator._build_configs()
         assert all(c.attack.tls_verify is False for c in configs)
+
+    def test_a_worker_answer_over_the_ceiling_re_asks(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """The workers ask is bounded, so 900 is refused and 800 is taken.
+
+        The retry lives inside the same prompt (like the payload ask), so the
+        script needs two answers in the workers slot - hence the positional
+        splice rather than `_with`, which models each question as one answer.
+        """
+        script = self._with(workers="@@WORKERS@@")
+        slot = script.index("@@WORKERS@@")
+        script[slot : slot + 1] = ["900", "800"]
+        captured = _scripted_wizard(monkeypatch, script, tmp_path)
+        assert captured["workers"] == 800
+
+    def test_a_worker_answer_at_the_ceiling_needs_no_retry(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """800 is accepted on the first answer; the script stays one-per-question."""
+        captured = _scripted_wizard(
+            monkeypatch, self._with(workers="800"), tmp_path
+        )
+        assert captured["workers"] == 800
 
     # -- profile selection --------------------------------------------------
 

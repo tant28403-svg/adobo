@@ -13,7 +13,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from .models import ProfileName, RunConfig, Target, TransportKind, AttackProfile
+from .models import ProfileName, RunConfig, Target, TransportKind, AttackProfile, WORKERS_CEILING
 from .cancellation import CancelReason
 from .engine import EngineHooks, RunEngine
 from .observation import TargetObserver, refused_connection
@@ -1986,7 +1986,27 @@ def nuclear_wizard(
         )
 
     # Workers and payload
+    # WORKERS_CEILING is the hard model ceiling (800): a lab.yaml max_workers
+    # above it cannot be honoured because AttackProfile refuses the value, so
+    # the effective ceiling is the lower of the two - the operator is told
+    # which one applied rather than seeing a number the run then ignored.
+    effective_workers = WORKERS_CEILING
     if limits.max_workers is not None:
+        effective_workers = min(effective_workers, limits.max_workers)
+    if limits.max_workers is None:
+        # No policy ceiling; ask the operator, bounded by the model ceiling
+        # the way payload and pps are bounded by theirs.
+        workers = _ask_int_bounded(
+            "Worker threads per profile", 4, 1, effective_workers, "workers ceiling"
+        )
+        print(f"  Worker threads per profile: {workers} (operator-specified)")
+    elif limits.max_workers > WORKERS_CEILING:
+        workers = effective_workers
+        print(
+            f"  Worker threads per profile: {workers} (workers ceiling - "
+            f"max_workers of {limits.max_workers:,} is above the hard limit)"
+        )
+    else:
         # Policy ceiling is set; use it and inform the operator.
         workers = limits.max_workers
         if config_path(LAB_CONFIG_NAME).exists():
@@ -1994,13 +2014,6 @@ def nuclear_wizard(
         else:
             worker_source = "built-in default (max_workers)"
         print(f"  Worker threads per profile: {workers} (from {worker_source})")
-    else:
-        # No ceiling; ask the operator how many workers to use.
-        workers = _ask_int("Worker threads per profile", 4)
-        if workers < 1:
-            print("  must be at least 1")
-            workers = _ask_int("Worker threads per profile", 4)
-        print(f"  Worker threads per profile: {workers} (operator-specified, no max_workers limit)")
     payload_size = _ask_int_bounded(
         "Payload size (bytes)", 512, 0, limits.max_payload_bytes, "max_payload_bytes"
     )

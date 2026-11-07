@@ -193,7 +193,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--duration", type=float, default=10.0, help="duration in seconds (default: 10)")
     parser.add_argument("--transport", choices=["socket", "scapy", "linux_raw", "virtual", "h2", "h3", "proxy"], default="auto", help="transport type (default: auto)")
     parser.add_argument("--payload", type=int, default=512, help="payload size in bytes (default: 512)")
-    parser.add_argument("--workers", type=int, default=4, help="worker threads (default: 4)")
+    parser.add_argument("--workers", type=int, default=4, help="worker threads (default: 4, ceiling: 800)")
     parser.add_argument("--spoof-sources", action="store_true", help="spoof source IP (requires --transport scapy + Admin)")
     parser.add_argument(
         "--proxy-file",

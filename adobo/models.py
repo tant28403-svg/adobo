@@ -143,6 +143,18 @@ def _has_http_control_chars(text: str) -> bool:
 # --------------------------------------------------------------------------
 
 
+WORKERS_CEILING = 800
+"""The maximum worker threads a single profile may run, everywhere.
+
+One number, three enforcement points that must never drift apart: the model
+refuses more (``AttackProfile.workers``), the safety gate clamps a raw
+request to it before the model ever sees the value (``SafetyGuard.
+MODEL_CEILINGS``), and the nuclear wizard's prompt is bounded by it. A
+``lab.yaml`` ``max_workers`` can always lower it further for a constrained
+machine; it can never raise it past this.
+"""
+
+
 class Target(BaseModel):
     """A destination the engine is permitted to send traffic to."""
 
@@ -168,7 +180,10 @@ class AttackProfile(BaseModel):
     pps: int = Field(default=2000, gt=0)
     duration_seconds: float = Field(default=10.0, gt=0)
     payload_size: int = Field(default=512, ge=0, le=65507)
-    workers: int = Field(default=4, ge=1)
+    workers: int = Field(default=4, ge=1, le=WORKERS_CEILING)
+    """Worker threads for this profile. Hard ceiling of
+    :data:`WORKERS_CEILING` - the engine spawns one thread per worker per
+    transport, and past this the threads cost more than they send."""
     spoof_sources: bool = False
     keep_alive: bool = False
     use_tls: bool = False
