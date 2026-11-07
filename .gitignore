@@ -19,8 +19,6 @@ dist/
 *.key
 *.crt
 
-config/
-
 CHECKPOINT.md
 PROGRESS.md
 
@@ -28,4 +26,3 @@ proxies.txt
 *.proxies
 proxy_list.txt
 proxies.enc
-tests/
