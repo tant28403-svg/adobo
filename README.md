@@ -129,7 +129,7 @@ pip install -e .[raw,http3,ui,lab]
 ### Requirements
 
 - Python 3.11 or later
-- Linux or Termux/Android (Windows has known issues)
+- Linux, Windows or Termux/Android (raw-socket profiles need Npcap + Administrator on Windows; everything else, including the full test suite, runs on Windows)
 - Git
 - `scapy` + Administrator/root for raw (spoofed) profiles
 - `aioquic` for HTTP/3 (`--transport h3`)
@@ -171,6 +171,8 @@ pip install scapy aioquic      # raw profiles and HTTP/3 (won't send on unrooted
 | `python -m adobo --nuclear` | Interactive nuclear wizard: runs every applicable profile in parallel |
 | `python -m adobo --serve-target` | Serve the lab target instead of attacking |
 | `python -m adobo.target` | Start the lab target server directly |
+| `python -m adobo --download-proxies` | Fetch public proxy lists into `proxies.txt` (list management; no target) |
+| `python -m adobo --check-proxies` | Test every proxy in `proxies.txt` and write the survivors to a new file |
 | `python -m adobo --encrypt-proxies` | Encrypt a proxy list into `proxies.enc` |
 | `python -m adobo --inspect-h2` | Measure the configured HTTP/2 preamble and exit |
 | `ADOBO` | Installed console script (see `[project.scripts]`) |
@@ -196,7 +198,19 @@ pip install scapy aioquic      # raw profiles and HTTP/3 (won't send on unrooted
 | `--h2-concurrency` | 100 | Concurrent HTTP/2 streams per connection |
 | `--keep-alive` | off | Reuse HTTP connections (higher throughput) |
 | `--spoof-sources` | off | Spoof source IP (requires scapy + Admin) |
+| `--method` | `get` | HTTP verb for `http_flood`: `get`, `post` or `head` (all HTTP transports: socket, proxy, h2, h3) |
+| `--path` | `/api/data` | Request path for `http_flood`; must start with `/`, percent-encode spaces |
+| `--cookie` | (none) | `Cookie` header value for `http_flood`, e.g. `'id=xxx; session=yyy'` |
+| `--referer` | (none) | `Referer` header value for `http_flood` |
+| `--data` | (none) | Request body for `--method post`, e.g. `'a=1&b=2'` |
+| `--data-file` | (none) | Read the POST body from a file (overrides `--data`) |
+| `--content-type` | `application/x-www-form-urlencoded` | `Content-Type` for a POST body |
 | `--proxy-file` | (none) | Path to proxy list for `--transport proxy` (HTTP profiles only) |
+| `--proxy-default-scheme` | `http` | Scheme for list lines without a `scheme://` prefix (`http`, `socks4`, `socks5`) |
+| `--download-proxies` | off | Fetch public proxy lists, merge + dedupe into `--proxy-file`, then exit |
+| `--proxy-kind` | `all` | Which protocols `--download-proxies` fetches: `all`/`http`/`socks4`/`socks5` |
+| `--check-proxies` | off | Tunnel-test every proxy, write survivors to a new file, then exit |
+| `--check-output` | `<input>-checked.txt` | Where `--check-proxies` writes the verified list |
 | `--proxy-password` | (none) | Password for an encrypted proxy file |
 | `--proxy-health-check` | on | Test proxies before the run |
 | `--fingerprint` | `lab_default` | Client identity for `http_flood`/`slowloris` |
@@ -204,7 +218,32 @@ pip install scapy aioquic      # raw profiles and HTTP/3 (won't send on unrooted
 | `--h2-preamble` | `auto` | HTTP/2 connection preamble to send |
 | `--inspect-h2` | off | Measure preamble and exit (sends nothing to target) |
 | `--quiet` | off | Suppress progress output |
+| `--dry-run` | off | Print exactly what a run would do - resolved transport, request shape, proxy pool, TLS - then exit. No packet is sent |
 | `--nuclear` | off | Run the interactive nuclear wizard |
+
+### Shaping the HTTP request (`http_flood`)
+
+```bash
+# A POST flood against a login endpoint, with cookies and a referer:
+python -m adobo --host 127.0.0.1 --port 8001 --profile http_flood \
+                --method post --path /login --data 'user=a&pass=b' \
+                --cookie 'session=xyz' --referer https://lab.local/login \
+                --keep-alive
+
+# HEAD flood through SOCKS proxies from a verified list:
+python -m adobo --host 127.0.0.1 --port 8001 --profile http_flood \
+                --method head --transport proxy --proxy-file proxies-checked.txt
+```
+
+`--method` works on every HTTP transport - socket, proxy, h2 and h3. Over
+h2 and h3, a POST rides HEADERS (no END_STREAM) followed by DATA frames that
+carry the body (clamped to h2's flow-control window and frame size; aioquic
+buffers past its window on h3); HEAD and GET end at HEADERS, as they always
+did. A body requires `--method post`, and header values may not contain line
+breaks - both are refused before the run starts rather than producing a
+malformed request on the wire. Against the
+lab target, h2 needs the target serving TLS with ALPN:
+`python -m adobo.target --port 8443 --ssl-certfile cert.pem --ssl-keyfile key.pem --http2`.
 
 ### Target Flags (`--serve-target`)
 
@@ -212,6 +251,7 @@ pip install scapy aioquic      # raw profiles and HTTP/3 (won't send on unrooted
 |---|---|---|
 | `--defenses` | `none` | Mitigations: comma-separated or `all`/`none` |
 | `--work-ms` | (none) | Simulated database work per `/api/data` request, in ms |
+| `--reflector` | off | Also start the UDP reflectors (DNS 53, NTP 123, CLDAP 389, SSDP 1900) for end-to-end amplification measurement |
 
 Ceilings (`max_pps`, `max_duration_seconds`, `max_payload_bytes`, `max_workers`) are
 read from `config/lab.yaml` and only ever lower requested values; reductions are
@@ -353,17 +393,54 @@ Or via the main entry point:
 python -m adobo --serve-target --port 8001 --defenses all
 ```
 
+### Reflector (measuring amplification)
+
+The amplification profiles measure request volume only when nothing answers
+them: a spoofed query is answered at the victim, so the response is never
+visible from the sender and the run reports the protocol's nominal ratio as an
+estimate. Start the lab target with its UDP reflectors and the loop closes end
+to end:
+
+```bash
+python -m adobo.target --port 8001 --reflector
+# starts DNS 53, NTP 123, CLDAP 389 and SSDP 1900 on the target's --host
+```
+
+Aim a real-source amplification run at it and the report gains a *measured*
+amplification factor alongside the declared estimate:
+
+```bash
+python -m adobo --host 127.0.0.1 --profile dns_amplification \
+                --transport socket --payload 64 --pps 500 --duration 10
+```
+
+The reflector answers maximally and caps every reply (3,000 bytes) - a lab
+service that can emit unlimited traffic is not a lab service. Use small
+`--payload` values for realistic ratios: the profiles pad their queries to the
+payload size, so the measured factor falls as the payload grows. Ports below
+1024 need root on Linux/Termux; a standalone `python -m adobo.reflector` also
+exists.
+
 ## Proxies
 
 Create a `proxies.txt` (one proxy per line) and point the tool at it:
 
 ```
 # proxies.txt
-# Format: [user:pass@]host:port
+# Format: [scheme://][user:pass@]host:port
 # Lines starting with # are comments.
 1.2.3.4:8080
 user:pass@5.6.7.8:3128
+socks5://9.10.11.12:1080
+socks4://13.14.15.16:1080
 ```
+
+A line's `scheme://` prefix selects its protocol: `http://` (or bare
+`host:port`, the historical default) is tunnelled with CONNECT,
+`socks4://`/`socks5://` with a SOCKS handshake. `socks4a://` and `socks5h://`
+are accepted as aliases. To treat a whole file of bare lines as SOCKS without
+rewriting it, set `--proxy-default-scheme socks5` — an explicit prefix in the
+file always wins.
 
 ```bash
 python -m adobo --host 127.0.0.1 --port 8001 --profile http_flood \
@@ -371,6 +448,35 @@ python -m adobo --host 127.0.0.1 --port 8001 --profile http_flood \
 ```
 
 `ADOBO_PROXY_FILE` and `ADOBO_PROXIES` environment variables also work.
+
+### Downloading a list
+
+Rather than collecting one by hand, fetch the public aggregate lists:
+
+```bash
+python -m adobo --download-proxies                     # all kinds into proxies.txt
+python -m adobo --download-proxies --proxy-kind socks5 --proxy-file socks5.txt
+```
+
+This merges every source, dedupes, tags each entry with its protocol
+(SOCKS entries keep their prefix, so the file reads correctly with no extra
+flags), and writes the file. Sources are third-party aggregators that change
+without notice; a source that fails is skipped and counted. **The list is
+unverified** — which is what the next step is for.
+
+### Checking a list
+
+```bash
+python -m adobo --check-proxies                        # checks proxies.txt
+python -m adobo --check-proxies --proxy-file socks5.txt --check-output good.txt
+```
+
+Every proxy is tested by dialling it and tunneling to a reachability probe
+(`1.1.1.1:80`) through the same code path a run uses, so a SOCKS proxy is
+verified with its actual handshake. The survivors are written to a **new**
+file (default: `<input>-checked.txt`); the input is never overwritten, so a
+transient failure mid-check cannot wipe a large list. Exit code is 0 when at
+least one proxy survived, 1 when none did.
 
 To keep the list encrypted:
 
@@ -416,7 +522,6 @@ adobo/
 │   ├── config.py           # lab.yaml / authorization / waf loading
 │   ├── safety.py           # policy ceilings (clamp only)
 │   ├── nuclear.py          # nuclear wizard
-│   ├── wizard.py
 │   ├── fingerprint.py      # client identity / HTTP/2 preamble
 │   ├── h2profile.py / h2inspect.py
 │   ├── observation.py / monitor.py / scoring.py / report.py

@@ -315,6 +315,17 @@ class Transport(ABC):
     def _count_sent(self, nbytes: int) -> None:
         self._counters.record_sent(nbytes)
 
+    def _count_response(self, nbytes: int) -> None:
+        """Record a reply that actually arrived at this process.
+
+        Only meaningful for non-spoofed runs: a forged source address makes the
+        reflector reply to the victim, and no datagram comes back here. This is
+        the half that turns ``measured_amplification`` from always-None into a
+        real ratio when the run is set up so replies are receivable - the
+        ``_ns`` profiles against a reflector, for instance.
+        """
+        self._counters.record_response(nbytes)
+
     def _count_error(self) -> None:
         self._counters.record_error()
 

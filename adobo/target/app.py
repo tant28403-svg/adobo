@@ -288,6 +288,20 @@ def create_app(settings: TargetSettings | None = None) -> FastAPI:
                 headers={"Retry-After": "2"},
             )
 
+        # -- challenge gate --------------------------------------------------
+        # Deliberately ahead of BOTH the WAF and the rate limiter. The
+        # reasoning is the one the rate-limiter comment below already makes,
+        # and it applies to the WAF identically: a client whose strikes came
+        # from WAF denials would otherwise be flat 403'd forever and never be
+        # offered the challenge those very denials exist to earn. A 503
+        # challenge is something a legitimate client can solve; a 403 and a
+        # 429 are not, so the recoverable response has to come first. (The
+        # gate used to sit after the WAF, which made it unreachable through
+        # the live path: its only strike source was the WAF itself.)
+        if config.challenge is not None and config.challenge.needs_challenge(facts.client):
+            app.state.errors += 1
+            return _verdict_response(config.challenge.serve_challenge())
+
         # -- WAF: static rules and volume -----------------------------------
         if config.waf is not None:
             verdict = config.waf.evaluate(facts)
@@ -296,16 +310,6 @@ def create_app(settings: TargetSettings | None = None) -> FastAPI:
                     config.challenge.register_failure(facts.client)
                 app.state.errors += 1
                 return _verdict_response(verdict)
-
-        # -- challenge gate --------------------------------------------------
-        # Deliberately ahead of the rate limiter. If the rate limiter ran first, a
-        # client that trips it would be flat 429'd forever and never be offered a
-        # challenge, which makes this gate dead code whenever both mitigations are
-        # enabled. A 503 challenge is something a legitimate client can solve; a
-        # 429 is not, so the recoverable response has to come first.
-        if config.challenge is not None and config.challenge.needs_challenge(facts.client):
-            app.state.errors += 1
-            return _verdict_response(config.challenge.serve_challenge())
 
         # -- rate limit ------------------------------------------------------
         if config.rate_limiter is not None and not config.rate_limiter.allow(facts.client):

@@ -322,10 +322,37 @@ class SocketTransport(Transport):
                 self._send_tcp(payload)
             else:
                 self._sock.sendto(payload, self._address())
+                self._drain_udp_replies()
         except (OSError, TransportError) as exc:
             self._count_error()
             raise TransportError(f"Send failed: {exc}") from exc
         self._count_sent(len(payload))
+
+    def _drain_udp_replies(self) -> None:
+        """Count every reply that has arrived, without ever waiting.
+
+        This is the other half of measured amplification. A non-spoofed
+        amplification run's replies come back to this very socket; without a
+        drain they sit unread in the kernel buffer and
+        ``bytes_received`` stays at zero, so a run against a live reflector
+        still reports ``amplification: -``. The drain is a zero-timeout
+        ``select`` followed by reads of exactly what is ready - it never blocks
+        the send loop, and a socket error here is the next send's problem, not
+        a counting failure.
+        """
+        import select
+
+        sock = self._sock
+        if sock is None:
+            return
+        try:
+            while select.select([sock], [], [], 0)[0]:
+                data, _addr = sock.recvfrom(65_535)
+                self._count_response(len(data))
+        except (OSError, ValueError):
+            # select or recvfrom on a dying socket: the send path raises the
+            # meaningful error; draining must not raise its own.
+            pass
 
     def _address(self) -> tuple[str, int]:
         return (self.target.host, self.target.port)

@@ -593,6 +593,12 @@ class RunEngine:
         Workers are removed from the live list when they finish, so the retired
         accumulator is what makes the totals still correct once they have all
         exited - which is exactly when the run's stats are read.
+
+        Every field travels, including ``responses`` and ``bytes_received``:
+        dropping them here is what kept measured amplification permanently
+        ``None`` even when a non-spoofed run's transport had counted replies -
+        the counters existed, the property existed, and the sum silently
+        discarded both.
         """
         with self._transport_lock:
             live = [t.snapshot() for t in self._worker_transports]
@@ -602,6 +608,10 @@ class RunEngine:
             sent=retired.sent + sum(s.sent for s in live),
             bytes=retired.bytes + sum(s.bytes for s in live),
             errors=retired.errors + sum(s.errors for s in live),
+            responses=retired.responses + sum(s.responses for s in live),
+            bytes_received=(
+                retired.bytes_received + sum(s.bytes_received for s in live)
+            ),
         )
 
     # ------------------------------------------------------------------

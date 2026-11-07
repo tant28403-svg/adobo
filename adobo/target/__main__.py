@@ -70,6 +70,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="simulated database work per /api/data request, in ms",
     )
     parser.add_argument(
+        "--reflector",
+        action="store_true",
+        help=(
+            "also start the UDP reflectors (DNS 53, NTP 123, CLDAP 389, "
+            "SSDP 1900) so the amplification profiles can be measured end to "
+            "end against this host"
+        ),
+    )
+    parser.add_argument(
         "--ssl-certfile",
         default=None,
         help="path to SSL certificate file (enables HTTPS)",
@@ -177,6 +186,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     print("  Ctrl-C to stop")
 
     try:
+        # The reflector is started here rather than inside run_target: it is
+        # optional, and its threads are daemons that live exactly as long as
+        # this process - which is as long as uvicorn blocks below.
+        if getattr(args, "reflector", False):
+            from .reflector import Reflector
+
+            reflector = Reflector(host=args.host)
+            bound = reflector.start()
+            print("  reflector:")
+            for name, port in sorted(bound.items()):
+                print(f"    {name:<6} udp://{args.host}:{port}")
         # http2 is forwarded explicitly: TargetSettings collects it from the
         # CLI, and dropping it here meant the flag parsed, printed nothing,
         # and never reached the server - the target served TLS without ALPN

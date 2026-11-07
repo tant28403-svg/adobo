@@ -407,6 +407,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--reflector",
+        action="store_true",
+        help=(
+            "with --serve-target: also start the UDP reflectors (DNS, NTP, "
+            "CLDAP, SSDP on their well-known ports) so amplification profiles "
+            "can be measured end to end"
+        ),
+    )
+    parser.add_argument(
         "--defenses",
         default="none",
         help=(
@@ -813,6 +822,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 *(["--port", str(args.port)] if args.port is not None else []),
                 "--defenses", args.defenses,
                 *(["--work-ms", str(args.work_ms)] if args.work_ms is not None else []),
+                *(["--reflector"] if getattr(args, "reflector", False) else []),
             ]
         )
 
