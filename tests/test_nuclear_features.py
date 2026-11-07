@@ -258,6 +258,7 @@ def _scripted_wizard(
     tmp_path,
     presets: dict | None = None,
     expect: int = 0,
+    wizard_protocol: str = "tls-h2",
 ) -> dict:
     """Run the real wizard on scripted answers and capture what it decided.
 
@@ -291,6 +292,13 @@ def _scripted_wizard(
     monkeypatch.setattr("builtins.input", _input)
     monkeypatch.setattr(nuclear, "check_privileges", lambda: (True, True))
     monkeypatch.setattr(nuclear, "check_child_raw_capability", lambda: (True, ""))
+    # The wizard asks the target what it speaks before the transport questions.
+    # Patched, like the port probes: a real detection against 127.0.0.1:8123
+    # would refuse, mute the h2/h3/TLS questions and shift every answer down.
+    # "tls-h2" is the verdict that keeps the shipped question flow.
+    monkeypatch.setattr(
+        nuclear, "detect_target_protocol", lambda host, port, timeout=2.0: wizard_protocol
+    )
     # True means the reflector port reads as closed, which makes the wizard skip
     # those profiles outright rather than stopping to ask whether to continue
     # with no reflector. Which profiles exist is not what these tests are about.
@@ -360,22 +368,38 @@ class TestTheWizardIsDriven:
         "verify", "workers", "payload", "spoof", "profiles",
     ]
 
-    def _with(self, *, omit: tuple = (), **replacements) -> list[str]:
+    def _with(self, *, omit: tuple = (), protocol: str = "tls-h2", **replacements) -> list[str]:
+        """Answers the wizard will read back, one per question it asks.
+
+        *protocol* is the verdict the wizard's target probe is patched to
+        return, and it decides which questions exist at all - the same way
+        http3/http2 decisions do, below.
+        """
         values = dict(self.BASE)
         values.update(replacements)
-        http3 = values["http3"] == "y"
+        # plain has no TLS-capable port in play, so no HTTP-transport question
+        # can be honoured: h3 omitted, h2 omitted, and with them the follow-ups.
+        http3_asked = protocol != "plain"
+        http3_enabled = http3_asked and values["http3"] == "y"
         # Asked and enabled are different questions. HTTP/2 is offered whenever
-        # HTTP/3 was declined, but only *enabled* when the answer is yes - and
+        # HTTP/3 was declined - but only when the target negotiated h2 (or the
+        # probe stayed silent), and only *enabled* when the answer is yes - and
         # only then are the concurrency and preamble follow-ups asked at all.
-        http2_asked = not http3
-        http2_on = values["http2"] == "y" and http2_asked
+        http2_asked = protocol in ("tls-h2", "unknown") and not http3_enabled
+        http2_on = http2_asked and values["http2"] == "y"
+        # The TLS dialogue (and the verify question riding it) exists whenever
+        # the strike could speak TLS at all; a plaintext target drops the pair.
+        tls_dialogue = protocol != "plain"
         asked = [
             key
             for key in self.ORDER
             if key not in omit
+            and not (key == "http3" and not http3_asked)
             and not (key == "http2" and not http2_asked)
             and not (key in ("concurrency", "preamble") and not http2_on)
             and not (key == "rotation" and not values["personas"])
+            and not (key == "tls" and not tls_dialogue)
+            and not (key == "verify" and not tls_dialogue)
         ]
         return [str(values[key]) for key in asked]
 
@@ -491,6 +515,11 @@ class TestTheWizardIsDriven:
         monkeypatch.setattr("builtins.input", _input)
         monkeypatch.setattr(nuclear, "check_privileges", lambda: (True, True))
         monkeypatch.setattr(nuclear, "check_child_raw_capability", lambda: (True, ""))
+        monkeypatch.setattr(
+            nuclear,
+            "detect_target_protocol",
+            lambda host, port, timeout=2.0: "tls-h2",
+        )
         monkeypatch.setattr(nuclear, "probe_udp_port", lambda host, port: True)
 
         class _Aggregator:
@@ -639,6 +668,11 @@ class TestTheWizardIsDriven:
         monkeypatch.setattr("builtins.input", _input)
         monkeypatch.setattr(nuclear, "check_privileges", lambda: (True, True))
         monkeypatch.setattr(nuclear, "check_child_raw_capability", lambda: (True, ""))
+        monkeypatch.setattr(
+            nuclear,
+            "detect_target_protocol",
+            lambda host, port, timeout=2.0: "tls-h2",
+        )
         monkeypatch.setattr(nuclear, "probe_udp_port", lambda host, port: False)
         monkeypatch.setattr(nuclear, "probe_tcp_port", lambda host, port: True)
 
@@ -664,8 +698,168 @@ class TestTheWizardIsDriven:
 
 
 # ---------------------------------------------------------------------------
-# Wizard plumbing
+# The wizard learns what the target speaks
 # ---------------------------------------------------------------------------
+
+
+class TestTheWizardKnowsWhatTheTargetSpeaks(TestTheWizardIsDriven):
+    """The transport questions are gated on the target, not just on itself.
+
+    The regression that produced this: an operator typing a plaintext website's
+    IP on port 80 was offered HTTP/3, HTTP/2 and rapid_reset - every one of
+    which rides TLS and could only burn its connect timeout on that port - and
+    watched a strike hand zero packets to the OS for the entire duration while
+    every row read [RUNNING] or [ERROR] and availability read 0% "probed".
+
+    The verdict is the same kind of fact as the privilege and port filters: a
+    menu that lists a profile that cannot run is misleading in exactly the way
+    those filters exist to prevent.
+    """
+
+    def test_a_plain_target_skips_the_transport_questions(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        captured = _scripted_wizard(
+            monkeypatch, self._with(protocol="plain"), tmp_path, wizard_protocol="plain"
+        )
+        assert captured["use_http3"] is False
+        assert captured["use_http2"] is False
+        assert captured["tls_verify"] is True  # defaulted, not asked
+        # http_flood exists and rides the one transport that can speak plain.
+        names = {p.name: p for p in captured["profiles"]}
+        from adobo.models import TransportKind
+
+        assert "http_flood" in names
+        assert names["http_flood"].transport is TransportKind.SOCKET
+
+    def test_a_plain_target_drops_rapid_reset_before_the_menu(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """Dropped before selection: blank = all must not include it."""
+        captured = _scripted_wizard(
+            monkeypatch, self._with(protocol="plain"), tmp_path, wizard_protocol="plain"
+        )
+        names = [p.name for p in captured["profiles"]]
+        assert "http_flood" in names
+        assert "rapid_reset" not in names
+
+    def test_a_preset_naming_rapid_reset_on_a_plain_target_aborts(
+        self, monkeypatch, tmp_path, capsys
+    ) -> None:
+        """The honest failure mode for a flag: abort naming the valid list.
+
+        Silently running without the named profile would shorten the strike
+        without saying so; running everything else and claiming it matched
+        would be worse.
+        """
+        captured = _scripted_wizard(
+            monkeypatch,
+            self._with(protocol="plain", profiles="rapid_reset"),
+            tmp_path,
+            presets={"selected_profiles": "rapid_reset"},
+            expect=1,
+            wizard_protocol="plain",
+        )
+        out = capsys.readouterr().out
+        assert "unknown profile(s): rapid_reset" in out
+        assert "http_flood" in out  # the valid list is printed
+        assert captured == {}  # nothing ran
+
+    def test_an_open_tls_port_on_443_offers_the_switch(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """The wizard's suggestion, not an override: declining keeps port N.
+
+        Detection on the typed port says plain; the same detection on 443 says
+        tls-h2, so the wizard offers to switch. Accepting re-derives the
+        questions on the TLS port - these answers say yes - and every
+        TCP-addressing profile is built on 443.
+        """
+        import adobo.nuclear as nuclear
+
+        captured: dict = {}
+        lines = list(self._with(protocol="tls-h2"))
+        lines.insert(2, "y")  # the switch offer, right after the port answer
+
+        def _input(*_a, **_k):
+            if not lines:
+                raise AssertionError("the wizard asked more questions than the script")
+            return lines.pop(0)
+
+        monkeypatch.setattr("builtins.input", _input)
+        monkeypatch.setattr(nuclear, "check_privileges", lambda: (True, True))
+        monkeypatch.setattr(nuclear, "check_child_raw_capability", lambda: (True, ""))
+
+        def _detect(host, port, timeout=2.0):
+            return "tls-h2" if port == 443 else "plain"
+
+        monkeypatch.setattr(nuclear, "detect_target_protocol", _detect)
+        monkeypatch.setattr(nuclear, "probe_udp_port", lambda host, port: True)
+        monkeypatch.setattr(nuclear, "probe_tcp_port", lambda host, port: True)
+
+        class _Aggregator:
+            def __init__(self, **kw):
+                captured.update(kw)
+
+            def run(self):
+                return 0
+
+        monkeypatch.setattr(nuclear, "NuclearAggregator", _Aggregator)
+        assert nuclear.nuclear_wizard() == 0
+        names = {p.name: p for p in captured["profiles"]}
+        assert names["http_flood"].port == 443
+        assert "rapid_reset" in names
+
+    def test_declining_the_switch_keeps_the_plain_flow(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """No is a decision, not a failure: plain questions, plain profiles."""
+        import adobo.nuclear as nuclear
+
+        lines = list(self._with(protocol="plain"))
+        lines.insert(2, "n")  # decline the switch offer
+
+        captured: dict = {}
+
+        def _input(*_a, **_k):
+            if not lines:
+                raise AssertionError("the wizard asked more questions than the script")
+            return lines.pop(0)
+
+        monkeypatch.setattr("builtins.input", _input)
+        monkeypatch.setattr(nuclear, "check_privileges", lambda: (True, True))
+        monkeypatch.setattr(nuclear, "check_child_raw_capability", lambda: (True, ""))
+
+        def _detect(host, port, timeout=2.0):
+            return "tls-h2" if port == 443 else "plain"
+
+        monkeypatch.setattr(nuclear, "detect_target_protocol", _detect)
+        monkeypatch.setattr(nuclear, "probe_udp_port", lambda host, port: True)
+        monkeypatch.setattr(nuclear, "probe_tcp_port", lambda host, port: True)
+
+        class _Aggregator:
+            def __init__(self, **kw):
+                captured.update(kw)
+
+            def run(self):
+                return 0
+
+        monkeypatch.setattr(nuclear, "NuclearAggregator", _Aggregator)
+        assert nuclear.nuclear_wizard() == 0
+        names = {p.name: p for p in captured["profiles"]}
+        # The port the operator typed stands.
+        assert names["http_flood"].port == 8123
+        assert "rapid_reset" not in names
+
+    def test_an_unknown_verdict_asks_everything_as_before(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """A probe that proves nothing changes no question and drops nothing."""
+        captured = _scripted_wizard(
+            monkeypatch, self._with(protocol="unknown"), tmp_path, wizard_protocol="unknown"
+        )
+        names = [p.name for p in captured["profiles"]]
+        assert "rapid_reset" in names
 
 
 class TestWizardPresets:

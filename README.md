@@ -374,6 +374,23 @@ only when HTTP/2 is on; **persona rotation** only when a persona was given;
 HTTP/2 is not offered at all when HTTP/3 was chosen; the **workers** question
 appears only when `lab.yaml` leaves `max_workers` unset.
 
+The TLS-riding questions are also gated on what the target actually speaks.
+Before asking anything about transports, the wizard connects to the target's
+port and probes it: TCP, then a TLS handshake (offering h2), then a plain HTTP
+request. Against a **plaintext** target — the common case for a website on
+port 80, which cannot answer QUIC or TLS however the flags are answered — the
+HTTP/3, HTTP/2 and TLS/verify questions are skipped with the reason printed,
+`http_flood` runs over plain HTTP/1.1, and **rapid_reset is dropped from the
+menu before the selection is parsed** (a `--profiles rapid_reset` preset then
+aborts naming the valid list, rather than silently running a shorter strike).
+If the typed port is plaintext but port 443 answers TLS, the wizard offers to
+switch ports instead. A probe that proves nothing (`unknown`) changes no
+question and drops nothing. The same detection is used by the pass/fail runs
+themselves: if a run's flags claim TLS but the target refuses the handshake,
+the availability probes and the `/stats` reading switch to plain HTTP and say
+so, instead of reporting `0% availability` and an unreadable `/stats` for a
+target that is up.
+
 One input uses a default that isn't prompted:
 
 - **Reflector ports** use the well-known service ports (53 / 123 / 389 / 1900).
@@ -390,8 +407,9 @@ One input uses a default that isn't prompted:
 | Profiles to run | Which profiles the strike runs. Blank = all; comma-separated numbers or names from the menu just printed; duplicates collapse, unknown names re-ask |
 
 **Choosing profiles:** the menu lists what this strike could actually run —
-after the privilege and port filters, so deselecting is never a surprise. You
-can also skip the question with a flag:
+after the privilege filter, the port probes and the target-protocol probe
+(rapid_reset needs a port that completes a TLS handshake and negotiates h2) —
+so deselecting is never a surprise. You can also skip the question with a flag:
 
 ```bash
 python -m adobo --nuclear --profiles dns_amplification,http_flood,slowloris
@@ -413,6 +431,13 @@ icmp_flood: never attempted a packet
 
 The results table reports **"Handed to OS"** rather than "sent", counting packets
 passed to the operating system (not confirmation of delivery).
+
+A profile whose workers all die before the deadline does not idle until the
+clock runs out: when the last worker thread exits — every connection refused,
+every handshake timed out — the profile stops there with `[ERROR]` and a note
+naming the time it stopped, the deadline, and the first worker error. Before
+that change, a dead profile read `[RUNNING]` with zero counters for the entire
+remaining duration, and the only honest-looking numbers were zeroes.
 
 ## Hardened Target
 

@@ -26,6 +26,8 @@ a dangling ``run_start`` in the trail.
 from __future__ import annotations
 
 import asyncio
+import socket
+import ssl
 import threading
 import time
 from dataclasses import dataclass, field
@@ -55,7 +57,11 @@ from .models import (
     utcnow,
 )
 from .monitor import ResourceMonitor, process_for_pid
-from .observation import TargetObserver, refused_connection
+from .observation import (
+    TargetObserver,
+    explain_http_error,
+    refused_connection,
+)
 from .proxies import ProxyListError, shared_pool
 from .safety import SafetyGuard
 from .transports import (
@@ -73,6 +79,12 @@ __all__ = [
     "RunEngine",
     "RunOutcome",
     "RunSnapshot",
+    "TARGET_CLOSED",
+    "TARGET_PLAIN",
+    "TARGET_TLS",
+    "TARGET_TLS_H2",
+    "TARGET_UNKNOWN",
+    "detect_target_protocol",
 ]
 
 DEFAULT_BATCH = 50
@@ -92,6 +104,113 @@ def _read_once(coro: Any) -> Any:
     hot path, so spinning up a loop for it is acceptable.
     """
     return asyncio.run(coro)
+
+
+# Verdicts detect_target_protocol() can return.
+TARGET_PLAIN = "plain"
+"""The port answers plain HTTP and refused a TLS handshake."""
+TARGET_TLS_H2 = "tls-h2"
+"""TLS completes AND the server negotiated HTTP/2 over it."""
+TARGET_TLS = "tls"
+"""TLS completes, but HTTP/2 was not negotiated over it."""
+TARGET_CLOSED = "closed"
+"""TCP connect was refused: no service, not a protocol question."""
+TARGET_UNKNOWN = "unknown"
+"""Nothing conclusive: a timeout, silence, or an unparseable response."""
+
+
+def detect_target_protocol(host: str, port: int, timeout: float = 2.0) -> str:
+    """Ask the target what it actually speaks on this port.
+
+    A TCP connect, then a TLS handshake with HTTP/2 offered over ALPN, then -
+    on a fresh socket, because a refused ClientHello leaves the first one in a
+    state no plain client can safely reuse - a plain HTTP GET. The verdict is
+    what the *target* said, not what the attack profile claims:
+
+    - everything the h3/h2/rapid_reset choices infer ("requires TLS",
+      "auto-enabled on port 443") was written from the operator's answer about
+      their *own* transport, and a profile-level transport decision never
+      reaches back into the questions that transport answer. A plaintext
+      website on port 80 could therefore be handed h2 and h3 questions whose
+      only possible outcome was workers that open nothing and a strike that
+      sends nothing - every worker burning its connect timeout against a port
+      that speaks neither QUIC nor TLS.
+
+    "unknown" keeps today's behaviour: the operator is told nothing
+    conclusive, and their choices stand. Only a definite "plain" mute the
+    TLS-only questions, because a definite answer is the only honest basis
+    for refusing them.
+    """
+    deadline = time.monotonic() + timeout
+
+    try:
+        sock = socket.create_connection((host, port), timeout=timeout)
+    except OSError:
+        return TARGET_CLOSED
+
+    with sock:
+        # The plain probe waits for a response, which competes with the TLS
+        # attempt for the same budget. Reserve time for both.
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return TARGET_UNKNOWN
+        try:
+            sock.settimeout(remaining)
+            # Deliberately an *unverified* context: the verdict is about
+            # protocol capability, not trust. A verified context turns a
+            # self-signed lab target (or any certificate the client would not
+            # accept) into a failed handshake, which the plain-GET fallback
+            # then reads as "unknown" - a TLS server dismissed for having the
+            # wrong paperwork. Measured on a self-signed https://127.0.0.1.
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            context.set_alpn_protocols(["h2"])
+            with context.wrap_socket(sock, server_hostname=host) as tls:
+                if tls.version() is not None:
+                    negotiated = tls.selected_alpn_protocol()
+                    return TARGET_TLS_H2 if negotiated == "h2" else TARGET_TLS
+        except (ssl.SSLError, OSError, ValueError):
+            pass
+
+    # A refused ClientHello may leave the server mid-read; never probe plain
+    # HTTP on a socket the TLS attempt polluted.
+    try:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return TARGET_UNKNOWN
+        sock = socket.create_connection(
+            (host, port), timeout=max(0.25, remaining)
+        )
+    except OSError:
+        return TARGET_UNKNOWN
+    try:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return TARGET_UNKNOWN
+        sock.settimeout(remaining)
+        request = f"GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+        try:
+            sock.sendall(request.encode())
+            received = bytearray()
+            while len(received) < 512:
+                chunk = sock.recv(512)
+                if not chunk:
+                    break
+                received.extend(chunk)
+        except socket.timeout:
+            return TARGET_UNKNOWN
+        except OSError:
+            return TARGET_UNKNOWN
+        head = bytes(received).upper()
+        if head.startswith(b"HTTP/"):
+            return TARGET_PLAIN
+    finally:
+        try:
+            sock.close()
+        except OSError:  # pragma: no cover - already closed by the timeout path
+            pass
+    return TARGET_UNKNOWN
 
 
 # --------------------------------------------------------------------------
@@ -237,6 +356,13 @@ class RunEngine:
         self._worker_errors: list[BaseException] = []
         self._peer_unavailable: str | None = None
         self._setup_error: str | None = None
+        # Worker-exit accounting for the all-dead declaration. A run whose
+        # every worker thread has exited with a fatal transport error while
+        # the deadline is still far away has nothing left that could emit a
+        # packet, and idle-running to the clock used to render as a [RUNNING]
+        # row with zero counters for the remaining duration.
+        self._worker_total = 0
+        self._workers_exited = 0
         # Set when the prober could not run at all, as distinct from running and
         # failing. The two produce different reports: one has no availability
         # figure, the other has a figure that says the target was down.
@@ -287,6 +413,14 @@ class RunEngine:
         if not self.config.dry_run:
             self._apply_safety_gate()
 
+        # The claimed scheme is verified against the target before anything
+        # speaks in its name. h2/h3 (and a config with use_tls) imply the
+        # prober and the /stats reader, and a plaintext target got handed
+        # TLS: every probe refused, "0% availability" for a live site, and a
+        # /stats read that began "ConnectError: " with nothing after it. The
+        # flip is announced so the notes below explain their own scheme.
+        self._verify_probe_scheme()
+
         # The opening /stats reading is the first thing that happens, ahead of
         # `started`, so it is setup rather than part of the run. It has to be
         # taken before the workers start for two reasons: once the flood is
@@ -331,6 +465,7 @@ class RunEngine:
                 # with its own connect timeout would add that timeout to the end
                 # of every run against a dead target. The prober still runs, so
                 # the result is a measurement of the target being down.
+                self._worker_total = self.config.attack.workers
                 workers = self._start_workers()
 
             asyncio.run(self._run_samplers())
@@ -368,6 +503,63 @@ class RunEngine:
                 update={"attack": result.applied}
             )
             self._policy_notes.extend(result.notes)
+
+    def _verify_probe_scheme(self) -> None:
+        """Confirm the target speaks TLS when the probe claims to use it.
+
+        Runs once, before the workers and ahead of the opening /stats reading,
+        so the observer created in place here is the one every subsequent
+        reader uses. Only a definite "the target refused TLS and answered
+        plain HTTP" flips the scheme; a silent target keeps the claimed
+        scheme, because an absent answer is not evidence about either.
+        """
+        if not self._probe_tls:
+            return
+        verdict = detect_target_protocol(
+            self.config.target.host,
+            self.config.target.port,
+            timeout=max(0.5, self.probe_timeout_s),
+        )
+        if verdict != TARGET_PLAIN:
+            return
+        self._probe_tls = False
+        self._observer = TargetObserver(
+            self.config.target.host,
+            self.config.target.port,
+            tls=False,
+            verify=self._probe_verify,
+        )
+        self._policy_notes.append(
+            f"The target refused a TLS handshake on port "
+            f"{self.config.target.port} and answered plain HTTP, so the "
+            f"availability probes and the /stats reading were made over "
+            f"plain HTTP instead of the TLS this run's configuration claims."
+        )
+
+    def _declare_all_workers_ended(self) -> None:
+        """Stop the run when its last worker thread has exited before deadline.
+
+        Workers only ever exit because the deadline arrived or their transport
+        died fatally, so "every worker has finished and the deadline has not"
+        means the run is a shell: the samplers would keep painting a [RUNNING]
+        row with zero counters for the whole remaining duration. The first
+        worker error is carried into the note so the reason is readable from
+        the outcome alone.
+        """
+        elapsed = self.controller.elapsed
+        duration = self.config.attack.duration_seconds
+        reason = (
+            f"all {self._worker_total} worker threads exited at "
+            f"{elapsed:.1f}s of {duration:g}s, before the deadline"
+        )
+        if self._worker_errors:
+            first = self._worker_errors[0]
+            detail = f"{type(first).__name__}: {first}".strip()
+            if len(detail) > 200:
+                detail = detail[:197] + "..."
+            reason = f"{reason}; first worker error: {detail}"
+        self._policy_notes.append(reason)
+        self.controller.request_stop(CancelReason.ERROR, reason)
 
     def _validate_transport(self) -> bool:
         """Open and immediately close one transport to fail fast.
@@ -454,9 +646,17 @@ class RunEngine:
             transport.close()
             with self._transport_lock:
                 self._active_workers -= 1
+                self._workers_exited += 1
+                all_ended = self._workers_exited == self._worker_total
                 self._retired = self._retired + transport.snapshot()
                 if transport in self._worker_transports:
                     self._worker_transports.remove(transport)
+            if (
+                all_ended
+                and not self.config.dry_run
+                and not self.controller.should_stop()
+            ):
+                self._declare_all_workers_ended()
 
     def _pump(self, transport: Transport, index: int) -> None:
         """Pace packets to the configured rate until asked to stop.
@@ -777,7 +977,18 @@ class RunEngine:
         means the prober can never be starved by a short deadline and leave the
         report claiming an unmeasured run scored well.
         """
-        if self.config.transport is TransportKind.H3:
+        if not self._probes_enabled():
+            return
+        # The h3 prober speaks QUIC, and a target that has already been shown
+        # to refuse TLS does not answer there either: its probes would each
+        # pay the full probe timeout against a socket nobody is on, and the
+        # reported 0% (run 64.29.17.3: 0/9) would be about the scheme, not
+        # the target. The plain probe measures a live site the same way.
+        if (
+            self.config.transport is TransportKind.H3
+            and self._probe_tls
+            and not self._probe_unavailable
+        ):
             await self._probe_availability_h3()
             return
         self._probe_protocol = "http/1.1" if not self._probe_tls else "https/1.1"
@@ -853,7 +1064,7 @@ class RunEngine:
                 t=t,
                 ok=False,
                 latency_ms=round((time.monotonic() - started) * 1000, 2),
-                error=f"{type(exc).__name__}: {exc}",
+                error=explain_http_error(exc, url),
             )
         latency = round((time.monotonic() - started) * 1000, 2)
         return ProbeResult(

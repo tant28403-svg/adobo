@@ -14,11 +14,19 @@ from __future__ import annotations
 import socket
 import threading
 import time
+from typing import Any
 
 import pytest
 
 from adobo.cancellation import CancelReason, GracePeriod, RunController
-from adobo.engine import EngineHooks, RunEngine, RunOutcome
+from adobo.engine import (
+    EngineHooks,
+    RunEngine,
+    RunOutcome,
+    TARGET_PLAIN,
+    TARGET_TLS_H2,
+    TARGET_UNKNOWN,
+)
 from adobo.models import (
     AttackProfile,
     ProfileName,
@@ -27,6 +35,7 @@ from adobo.models import (
     TransportKind,
 )
 from adobo.scoring import score_run
+from adobo.transports import TransportCounters
 
 TARGET = Target(host="127.0.0.1", port=8000)
 
@@ -461,7 +470,121 @@ class TestDeadTargetIsMeasuredNotAborted:
         assert "no packets were delivered" in notes.lower()
 
 
+class TestAllWorkersDeadStopsTheRunEarly:
+    """A run whose every worker has died before the deadline is a shell.
+
+    Two h3 errors each costing a connect timeout were what the operator saw -
+    [RUNNING] rows, zero counters, "0/2 profile contributing" - while the
+    engine idled to the clock, because worker deaths never stop a run by
+    design. They still do not (one worker dying leaves the others working),
+    but the *last* one out while the deadline is still far away declares it.
+    """
+
+    def _engine(self, monkeypatch, duration: float = 1.0, workers: int = 2):
+        from adobo.transports import TransportError, TransportCounters
+
+        monkeypatch.setattr("adobo.engine.get_transport", lambda config: _DyingTransport())
+        config = make_config(duration=duration, workers=workers)
+        return make_engine(config), duration
+
+    def test_the_run_stops_with_an_error_well_before_the_deadline(
+        self, monkeypatch
+    ) -> None:
+        engine = self._engine(monkeypatch)[0]
+        started = time.monotonic()
+        outcome = engine.run()
+        elapsed = time.monotonic() - started
+        assert outcome.reason is CancelReason.ERROR
+        assert elapsed < 0.6, f"the run idled past its last live worker: {elapsed:.2f}s"
+        # Nothing was ever going to be sent, and the result says so directly.
+        assert outcome.result.attack.packets_sent == 0
+
+    def test_the_note_carries_the_count_and_the_deadline(self, monkeypatch) -> None:
+        engine = self._engine(monkeypatch)[0]
+        outcome = engine.run()
+        joined = " ".join(outcome.result.notes)
+        assert "all 2 worker threads exited" in joined
+        assert "before the deadline" in joined
+        assert "TransportError" in joined
+
+
+class _DyingTransport:
+    """A transport that opens but on which every send fails identically."""
+
+    connections_opened = 0
+
+    def open(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+    def request_stop(self) -> None:  # pragma: no cover - interface completeness
+        pass
+
+    def snapshot(self) -> TransportCounters:
+        return TransportCounters()
+
+    def send_one(self, _payload: Any) -> None:
+        from adobo.transports import TransportError
+
+        raise TransportError("connect refused")
+
+
+class TestTheProbeSpeaksTheTargetScheme:
+    """Probes and /stats must speak the scheme the target accepts.
+
+    The prober used to inherit the profile's TLS flag verbatim - h2/h3 runs
+    imply it - and so probed a plaintext website over https://host:80: every
+    probe refused, "0% availability" described a live site, and the /stats
+    reading ended 'ConnectError: ' with nothing after the colon. Verification
+    asks the port once, at run start, and only a definite plain answer flips.
+    """
+
+    def _tls_config(self) -> RunConfig:
+        return make_config(duration=0.3, transport=TransportKind.VIRTUAL).model_copy(
+            update={
+                "attack": AttackProfile(
+                    profile=ProfileName.HTTP_FLOOD,
+                    pps=500,
+                    duration_seconds=0.3,
+                    payload_size=64,
+                    use_tls=True,
+                )
+            }
+        )
+
+    def _engine(self, config: RunConfig, detect_to: str, monkeypatch) -> RunEngine:
+        monkeypatch.setattr(
+            "adobo.engine.detect_target_protocol",
+            lambda host, port, timeout=2.0: detect_to,
+        )
+        return make_engine(config)
+
+    def test_a_plain_target_flips_to_plain_and_says_so(self, monkeypatch) -> None:
+        engine = self._engine(self._tls_config(), TARGET_PLAIN, monkeypatch)
+        outcome = engine.run()
+        assert engine._probe_tls is False
+        joined = " ".join(outcome.result.notes)
+        assert "plain HTTP" in joined
+        assert "8000" in joined  # the port it actually probed is named
+
+    def test_a_tls_target_keeps_the_claimed_scheme(self, monkeypatch) -> None:
+        engine = self._engine(self._tls_config(), TARGET_TLS_H2, monkeypatch)
+        outcome = engine.run()
+        assert engine._probe_tls is True
+        joined = " ".join(outcome.result.notes)
+        assert "refused a TLS handshake" not in joined
+
+    def test_a_silent_target_keeps_the_claimed_scheme(self, monkeypatch) -> None:
+        """'unknown' is not 'plain': the flip needs positive evidence."""
+        engine = self._engine(self._tls_config(), TARGET_UNKNOWN, monkeypatch)
+        outcome = engine.run()
+        assert engine._probe_tls is True
+
+
 class TestSleepUntilStopReturnsPromptlyOnCancel:
+
     """_sleep_until_stop must not poll in slices; it must wait on the event.
 
     The old implementation sliced the wait into 50 ms chunks via

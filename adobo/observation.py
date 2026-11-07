@@ -49,6 +49,7 @@ __all__ = [
     "TargetObserver",
     "STATS_PATH",
     "NO_HTTP_SURFACE_MARKERS",
+    "explain_http_error",
     "refused_connection",
 ]
 
@@ -96,6 +97,23 @@ def refused_connection(error: str | None) -> bool:
         return False
     lowered = error.lower()
     return any(marker in lowered for marker in NO_HTTP_SURFACE_MARKERS)
+
+
+def explain_http_error(exc: BaseException, url: str) -> str:
+    """Name the failure AND where it happened, for empty-bellied exceptions.
+
+    ``reason: ConnectError: `` - type name, colon, nothing - is what an
+    operator is shown when the exception's ``str()`` is empty, and a reader
+    cannot tell a scheme mismatch (TLS into a plaintext port, the case that
+    produced it) from a dead target from it. When the detail is empty the
+    connection itself becomes the detail: what was connected to, and over
+    which scheme. The probe failure-reason *matching* still keys off the
+    exception type name, which survives either branch.
+    """
+    detail = str(exc).strip()
+    if detail:
+        return f"{type(exc).__name__}: {detail}"
+    return f"{type(exc).__name__} (no detail from the server) when connecting to {url}"
 
 
 class TargetObservation(Protocol):
@@ -205,7 +223,7 @@ class TargetObserver:
         try:
             payload = await self._fetch(timeout)
         except Exception as exc:  # noqa: BLE001 - any failure means "unobserved"
-            self._last_error = f"{type(exc).__name__}: {exc}"
+            self._last_error = explain_http_error(exc, self._url)
             return None
         try:
             return int(payload["requests"]), int(payload["errors"])
@@ -231,7 +249,7 @@ class TargetObserver:
         try:
             await self._fetch(timeout)
         except Exception as exc:  # noqa: BLE001 - unavailability is the datum
-            self.last_probe_error = f"{type(exc).__name__}: {exc}"
+            self.last_probe_error = explain_http_error(exc, self._url)
             return False
         self.last_probe_error = None
         return True

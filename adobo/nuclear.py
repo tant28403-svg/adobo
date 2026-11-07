@@ -15,7 +15,16 @@ from typing import Any
 
 from .models import ProfileName, RunConfig, Target, TransportKind, AttackProfile, WORKERS_CEILING
 from .cancellation import CancelReason
-from .engine import EngineHooks, RunEngine
+from .engine import (
+    EngineHooks,
+    RunEngine,
+    TARGET_CLOSED,
+    TARGET_PLAIN,
+    TARGET_TLS,
+    TARGET_TLS_H2,
+    TARGET_UNKNOWN,
+    detect_target_protocol,
+)
 from .observation import TargetObserver, refused_connection
 from .safety import PolicyViolation, SafetyGuard
 from .transports import raw_capability
@@ -1467,13 +1476,38 @@ class NuclearAggregator:
         # probe load to a target that is already saturated, and all ten would
         # lose the race to answer.
         #
-        # The reading follows the HTTP child's scheme: a strike that asked for
-        # TLS reads its counters over TLS, or a TLS-only target reports as
-        # unobserved no matter how much it served.
+        # The reading follows the HTTP child's scheme, derived from what the
+        # target says it speaks rather than from the operator's choices: a
+        # strike that asked for TLS against a target that refused the handshake
+        # (port 80 websites DO get chosen this way, and h2/h3 profiles imply
+        # TLS regardless of the target) used to probe-and-read over
+        # https://<plain-port>, which reads as ConnectError and reports the
+        # strike unobserved no matter what the target served. Detection asks
+        # the port directly; only a definite "plain" flips the scheme, and the
+        # flip is announced because it changes what the numbers below mean.
+        stats_port = self._http_port()
+        if self.use_tls or self.use_http2 or self.use_http3:
+            verdict = detect_target_protocol(self.target_ip, stats_port, timeout=3.0)
+        else:
+            # No TLS was asked for anywhere, so the strike speaks plain HTTP
+            # by construction; the reading follows it without a TCP probe.
+            verdict = TARGET_PLAIN
+        if verdict in (TARGET_TLS, TARGET_TLS_H2):
+            tls_stats = True
+        elif verdict == TARGET_PLAIN:
+            tls_stats = False
+            if self.use_tls or self.use_http2 or self.use_http3:
+                print(
+                    f"  [i] {self.target_ip}:{stats_port} does not speak TLS; "
+                    f"reading /stats over plain HTTP."
+                )
+        else:
+            # Unknown: keep the operator's answer rather than second-guessing.
+            tls_stats = bool(self.use_tls or self.use_http2 or self.use_http3)
         self._observer = TargetObserver(
             self.target_ip,
-            self._http_port(),
-            tls=bool(self.use_tls or self.use_http2),
+            stats_port,
+            tls=tls_stats,
             verify=self.tls_verify,
         )
         self._stats_before = _read_stats(self._observer)
@@ -1799,6 +1833,34 @@ def nuclear_wizard(
     print("\n=== Nuclear Strike ===")
     host = _ask("Target IP")
     port = _ask_int("Port (for TCP/UDP profiles)", 80)
+
+    # Ask the target what it speaks on the port the operator named, before the
+    # questions that could select a transport the target cannot serve. The
+    # h2/h3 choices ride TLS (h2 by requirement here, QUIC by definition), so
+    # against a plaintext port every answer other than "no" could only have
+    # produced workers that open nothing - the strike that hands zero packets
+    # to the OS and shows an [ERROR] row per HTTP profile, discovered five
+    # minutes into the clock instead of at this prompt.
+    protocol = detect_target_protocol(host, port)
+    if protocol == TARGET_CLOSED:
+        print(f"  [i] nothing answered TCP on {host}:{port}; TCP profiles are filtered below.")
+    elif protocol == TARGET_PLAIN:
+        print(f"  [!] {host}:{port} speaks plain HTTP: a TLS handshake was refused.")
+        print("      HTTP/2, HTTP/3 and rapid_reset require TLS and cannot run against this port.")
+        if port != 443:
+            alt = detect_target_protocol(host, 443)
+            if alt in (TARGET_TLS, TARGET_TLS_H2):
+                if _ask_yes_no("Switch to port 443, which speaks TLS?", default=True):
+                    port = 443
+                    protocol = alt
+                    print(f"  Target port is now {port}.")
+                else:
+                    print("  Keeping the plain port; HTTP profiles will run over plain HTTP/1.1.")
+    elif protocol == TARGET_UNKNOWN:
+        print(
+            f"  [i] could not determine whether {host}:{port} speaks TLS; "
+            f"the TLS-only options stay offered."
+        )
     
     # Reflector ports are the well-known service ports and are not asked. A
     # different reflector means a different service, and the amplification
@@ -1831,22 +1893,37 @@ def nuclear_wizard(
 
     # HTTP/3 for http_flood. Asked before HTTP/2 because it is exclusive with it:
     # one http_flood profile runs on one transport, and answering yes here means
-    # HTTP/2 is not offered rather than being silently overridden.
-    use_http3 = _ask_yes_no(
-        "Use HTTP/3 (QUIC) for http_flood? (needs the aioquic package and a "
-        "target that speaks h3; reports no received-bytes figure)",
-        default=False,
-    )
-    if use_http3 and not aioquic_available():
-        print("  [!] aioquic is not installed; running HTTP/1.1 instead.")
-        print("      Install it with: pip install aioquic")
+    # HTTP/2 is not offered rather than being silently overridden. Only offered
+    # when the target's port could plausibly answer QUIC: QUIC itself rides TLS,
+    # so a port that refused a TLS handshake would leave every choice here
+    # beyond "no" with nothing but a handshake timeout to show for it - and
+    # exponential discovery at 5s per worker was what the operator saw instead
+    # of an answer to a question that could not have been honored.
+    if protocol in (TARGET_TLS, TARGET_TLS_H2, TARGET_UNKNOWN):
+        use_http3 = _ask_yes_no(
+            "Use HTTP/3 (QUIC) for http_flood? (needs the aioquic package and a "
+            "target that speaks h3; reports no received-bytes figure)",
+            default=False,
+        )
+        if use_http3 and not aioquic_available():
+            print("  [!] aioquic is not installed; running HTTP/1.1 instead.")
+            print("      Install it with: pip install aioquic")
+            use_http3 = False
+    else:
         use_http3 = False
 
-    # HTTP/2 for http_flood (requires TLS)
-    use_http2 = False if use_http3 else _ask_yes_no(
-        "Use HTTP/2 for http_flood? (requires TLS, enables multiplexing)",
-        default=False,
-    )
+    # HTTP/2 for http_flood (requires TLS). h2 is negotiated over that same TLS
+    # handshake, so "plain" is a definite no; "unknown" keeps the question,
+    # because a target that stayed silent to the probe may still answer h2.
+    if not use_http3 and protocol in (TARGET_TLS_H2, TARGET_UNKNOWN):
+        use_http2 = _ask_yes_no(
+            "Use HTTP/2 for http_flood? (requires TLS, enables multiplexing)",
+            default=False,
+        )
+    else:
+        use_http2 = False
+        if not use_http3:
+            print("  HTTP/2 is not offered for this target: the port speaks plain HTTP.")
     h2_concurrency = 100
     if use_http2:
         h2_concurrency = _ask_int_bounded(
@@ -1954,11 +2031,22 @@ def nuclear_wizard(
         default=False,
     )
 
-    # TLS options
-    use_tls = _ask_yes_no(
-        "Use TLS/HTTPS for http_flood? (auto-enabled on port 443)",
-        default=False,
-    )
+    # TLS options. Offered only when the strike can actually speak TLS: a
+    # TLS-capable target, or a probe that stayed silent (rapid_reset may still
+    # work there, and let the operator keep the choice that always existed).
+    # A target that REFUSED the TLS handshake has no TLS path left at all, so
+    # these prompts would have been two questions whose only honest answers
+    # were "no" and the default - rapid_reset is filtered from the menu below
+    # on the same measurement, announced at the same moment.
+    if protocol in (TARGET_TLS, TARGET_TLS_H2, TARGET_UNKNOWN):
+        # "auto-enabled on port 443" made real: on the TLS port the default
+        # matches what the port speaks.
+        use_tls = _ask_yes_no(
+            "Use TLS/HTTPS for http_flood? (auto-enabled on port 443)",
+            default=port == 443,
+        )
+    else:
+        use_tls = False
     tls_verify = True
     # Asked for h3 and h2 as well as for TLS. Both speak TLS unconditionally -
     # QUIC is encrypted by definition and HTTP/2 here always goes through a TLS
@@ -1968,18 +2056,12 @@ def nuclear_wizard(
     # rapid_reset speaks h2 whether or not HTTP/2 was chosen for http_flood, so
     # this is asked whenever the strike will use TLS at all - not unconditionally,
     # because a prompt whose answer never changes is a step to skip.
-    # Asked on every strike, because every strike now speaks TLS: rapid_reset is part
-    # of the profile list unconditionally and rides HTTP/2 over TLS whether or
-    # not HTTP/2 was chosen for http_flood. Gating the question on use_tls or
-    # use_http2 meant the tool decided "verify" for a profile the operator was
-    # never asked about, and a strike against a self-signed target failed at the
-    # handshake with no way to say otherwise from the wizard.
-    #
-    # This is one extra prompt on every nuclear run, which is a change to the
-    # flow. The default is Yes, so pressing Enter keeps the previous behaviour
-    # exactly, and it is asked last among the HTTP questions so it does not
-    # disturb the shape of the ones before it.
-    if True:
+    # No longer asked on EVERY strike: a target that refused its TLS handshake
+    # has no TLS-speaking profile left (rapid_reset is filtered below), so the
+    # verify question there has no choice to guard and is skipped. Asked on
+    # every strike where TLS is possible, keeping the same prompt history as
+    # before for those.
+    if protocol in (TARGET_TLS, TARGET_TLS_H2, TARGET_UNKNOWN):
         tls_verify = _ask_yes_no(
             "Verify TLS certificates? (disable for self-signed certs)",
             default=True,
@@ -2061,6 +2143,29 @@ def nuclear_wizard(
             print(f"      - {name}: {reason}")
         print()
 
+    # rapid_reset rides an h2 connection, and an h2 connection here rides a TLS
+    # handshake that must also negotiate h2. A target the protocol probe saw
+    # refusing TLS - or answering TLS without h2 over ALPN - cannot give it
+    # one, and a profile that cannot run has no place in a menu whose point is
+    # listing what the strike could actually run. Dropped BEFORE the selection
+    # is parsed, so a --profiles preset naming it aborts with the valid list
+    # (the established behaviour for an unrunnable name) instead of silently
+    # shortening the strike.
+    if protocol not in (TARGET_TLS_H2, TARGET_UNKNOWN):
+        had_rapid = any(p.name == "rapid_reset" for p in profiles)
+        if had_rapid:
+            profiles = [p for p in profiles if p.name != "rapid_reset"]
+            reason = (
+                f"the target finished a TLS handshake on port {port} without "
+                f"negotiating HTTP/2"
+                if protocol == TARGET_TLS
+                else f"the target speaks plain HTTP on port {port}"
+            )
+            print(
+                f"\n[!] rapid_reset skipped: {reason}, and rapid_reset needs "
+                f"an h2 connection over TLS."
+            )
+
     # Profile selection. Asked here - after the privilege and port filters -
     # so the menu lists what the strike could actually run, and so the
     # reflector warnings below fire only for profiles that survived the
@@ -2114,28 +2219,32 @@ def nuclear_wizard(
         "ssdp": [p for p in profiles if p.profile == ProfileName.SSDP_AMPLIFICATION],
     }
     
-    for protocol, profiles_list in amp_profiles_by_protocol.items():
+    # `reflector_protocol`, not `protocol`: the wizard's protocol *verdict*
+    # from the target probe is read further down, and this loop rebinding the
+    # same name to a service label was how the two crossed. Local rename, no
+    # behaviour change.
+    for reflector_protocol, profiles_list in amp_profiles_by_protocol.items():
         if not profiles_list:
             continue
-        port = reflector_ports.get(protocol)
-        if not port:
+        reflector_port = reflector_ports.get(reflector_protocol)
+        if not reflector_port:
             continue
         # Only warn when the probe actually established the port is closed. A
         # timeout is not evidence of anything, and calling it "appears closed"
         # when it may equally have been a filtered packet is how this check came
         # to interrupt runs against reflectors that were working fine.
-        if probe_udp_port(host, port):
+        if probe_udp_port(host, reflector_port):
             continue
-        print(f"\n[!] WARNING: {protocol.upper()} reflector port {port} on {host} is closed.")
-        print(f"    {protocol.upper()} amplification requires a valid open reflector on port {port}.")
+        print(f"\n[!] WARNING: {reflector_protocol.upper()} reflector port {reflector_port} on {host} is closed.")
+        print(f"    {reflector_protocol.upper()} amplification requires a valid open reflector on port {reflector_port}.")
         print("    Without a valid reflector, this profile will only send requests at")
         print("    low rate with no amplification.")
         print()
-        proceed = _ask_yes_no(f"Continue {protocol.upper()} amplification anyway?", default=False)
+        proceed = _ask_yes_no(f"Continue {reflector_protocol.upper()} amplification anyway?", default=False)
         if not proceed:
             print("Exiting.")
             return 1
-        print(f"    Continuing. {protocol.upper()} numbers will show queries sent, not traffic delivered.")
+        print(f"    Continuing. {reflector_protocol.upper()} numbers will show queries sent, not traffic delivered.")
 
     if not profiles:
         print("No profiles available to run. Exiting.")
