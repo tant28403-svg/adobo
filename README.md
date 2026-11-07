@@ -332,13 +332,13 @@ A run prints a result block like:
 > applied per profile, not divided across them, so 10 profiles at 500 PPS
 > means 5,000+ PPS combined. Start low and increase gradually.
 
-Runs every applicable profile in parallel:
+Runs the selected profiles in parallel (default: every applicable profile):
 
 ```bash
 python -m adobo --nuclear
 ```
 
-It asks up to 17 questions, some depending on earlier answers:
+It asks up to 18 questions, some depending on earlier answers:
 
 ```
 === Nuclear Strike ===
@@ -364,6 +364,20 @@ One question uses a default that isn't prompted:
 | Workers | Per profile. Default 4, maximum `max_workers` (200) |
 | Payload | Bytes per packet. Ceiling 1,400 |
 | IP spoofing | Adds the spoofed variants. Needs root |
+| Profiles to run | Which profiles the strike runs. Blank = all; otherwise comma-separated numbers or names from the menu just printed. Duplicates collapse, unknown names re-ask |
+
+**Choosing profiles:** the menu lists what this strike could actually run —
+after the privilege and port filters, so deselecting is never a surprise. You
+can also skip the question with a flag:
+
+```bash
+python -m adobo --nuclear --profiles dns_amplification,http_flood,slowloris
+```
+
+A preset name that cannot run in this strike (dropped by privileges or a
+closed port) aborts with the valid list rather than silently running
+everything. The reflector warnings only fire for selected amplification
+profiles.
 
 Any profile that cannot run is reported together with the reason. On Windows, the raw
 socket profiles (scapy and linux_raw) will fail unless Npcap and Administrator

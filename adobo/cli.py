@@ -387,6 +387,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="run the interactive nuclear wizard instead of a single profile",
     )
+    parser.add_argument(
+        "--profiles",
+        default="",
+        help=(
+            "with --nuclear: comma-separated profiles the strike runs (names "
+            "as in the wizard menu, e.g. 'dns_amplification,http_flood'). "
+            "Blank or 'all' runs every applicable profile"
+        ),
+    )
     parser.add_argument("--quiet", action="store_true", help="suppress progress output")
     parser.add_argument(
         "--dry-run",
@@ -902,6 +911,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     if getattr(args, "proxy_default_scheme", "http") in (None, "http")
                     else args.proxy_default_scheme
                 ),
+                # --profiles is forwarded as a preset: the wizard validates it
+                # against the profiles that survive the privilege and port
+                # filters, so a name that cannot run in this strike is a hard
+                # error naming the valid set, not a silently full strike.
+                selected_profiles=getattr(args, "profiles", "") or None,
             )
         except KeyboardInterrupt:
             # Same code as an interrupted run, so a caller can treat "the

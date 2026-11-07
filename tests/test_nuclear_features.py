@@ -257,6 +257,7 @@ def _scripted_wizard(
     answers: list[str],
     tmp_path,
     presets: dict | None = None,
+    expect: int = 0,
 ) -> dict:
     """Run the real wizard on scripted answers and capture what it decided.
 
@@ -269,6 +270,10 @@ def _scripted_wizard(
     it had just collected, so a list typed at the prompt validated as ``None``
     while the same list passed as ``--proxy-file`` worked. Only driving the
     wizard distinguishes those two.
+
+    Both port probes are patched to "reachable" so the profile menu is the full
+    built list in every test - without the TCP patch, the real probe finds
+    nothing listening on 127.0.0.1:8123 and the menu silently shrinks.
     """
     import adobo.nuclear as nuclear
 
@@ -290,6 +295,7 @@ def _scripted_wizard(
     # those profiles outright rather than stopping to ask whether to continue
     # with no reflector. Which profiles exist is not what these tests are about.
     monkeypatch.setattr(nuclear, "probe_udp_port", lambda host, port: True)
+    monkeypatch.setattr(nuclear, "probe_tcp_port", lambda host, port: True)
 
     def _load(path):
         captured["load_proxies_got"] = path
@@ -305,7 +311,7 @@ def _scripted_wizard(
             return 0
 
     monkeypatch.setattr(nuclear, "NuclearAggregator", _Aggregator)
-    assert nuclear.nuclear_wizard(**(presets or {})) == 0
+    assert nuclear.nuclear_wizard(**(presets or {})) == expect
     return captured
 
 
@@ -317,12 +323,13 @@ def _proxy_for(_path):
 
 class TestTheWizardIsDriven:
     #: host, port, pps, duration, http2?, personas, rotation, proxy, keep-alive,
-    #: tls, workers, payload, spoof
+    #: tls, workers, payload, spoof, profiles
     BASE = {
         "host": "127.0.0.1", "port": "8123", "pps": "100", "duration": "2",
         "http3": "n", "http2": "n", "concurrency": "100", "personas": "",
         "rotation": "", "preamble": "", "proxy": "", "keep_alive": "n",
         "tls": "n", "verify": "y", "workers": "4", "payload": "512", "spoof": "n",
+        "profiles": "",
     }
 
     #: Order the wizard asks in. `concurrency` and `preamble` only appear when
@@ -340,10 +347,14 @@ class TestTheWizardIsDriven:
     #: after these scripts were written, and every test in this class failed
     #: with answers fed to the wrong prompt until the order was re-read off the
     #: wizard.
+    #:
+    #: `profiles` is the last question: it is asked after build_profiles, the
+    #: privilege drop and the port filter, because the menu lists what the
+    #: strike could actually run. Blank means every available profile.
     ORDER = [
         "host", "port", "pps", "duration", "http3", "http2", "concurrency",
         "personas", "rotation", "preamble", "proxy", "keep_alive", "tls",
-        "verify", "workers", "payload", "spoof",
+        "verify", "workers", "payload", "spoof", "profiles",
     ]
 
     def _with(self, *, omit: tuple = (), **replacements) -> list[str]:
@@ -509,6 +520,120 @@ class TestTheWizardIsDriven:
         )
         configs = aggregator._build_configs()
         assert all(c.attack.tls_verify is False for c in configs)
+
+    # -- profile selection --------------------------------------------------
+
+    def test_a_blank_selection_runs_every_available_profile(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """Blank keeps the historical strike: every profile that survived the
+        privilege and port filters runs."""
+        blank = _scripted_wizard(monkeypatch, self._with(), tmp_path)
+        everything = _scripted_wizard(
+            monkeypatch, self._with(), tmp_path, presets={"selected_profiles": "all"}
+        )
+        assert blank["profiles"] == everything["profiles"]
+        assert len(blank["profiles"]) >= 1
+
+    def test_a_preset_selection_reaches_the_strike(self, monkeypatch, tmp_path) -> None:
+        captured = _scripted_wizard(
+            monkeypatch, self._with(), tmp_path,
+            presets={"selected_profiles": "udp_flood"},
+        )
+        names = [p.name for p in captured["profiles"]]
+        assert names == ["udp_flood"]
+
+    def test_numbers_select_by_menu_position(self, monkeypatch, tmp_path) -> None:
+        """The menu is numbered; selecting by number must resolve to the same
+        profile the operator read off the screen."""
+        menu = _scripted_wizard(monkeypatch, self._with(), tmp_path)["profiles"]
+        first_name = menu[0].name
+        last_name = menu[-1].name
+
+        by_number = _scripted_wizard(
+            monkeypatch, self._with(), tmp_path, presets={"selected_profiles": "1"}
+        )
+        assert [p.name for p in by_number["profiles"]] == [first_name]
+
+        mixed = _scripted_wizard(
+            monkeypatch, self._with(), tmp_path,
+            presets={"selected_profiles": f"1,{last_name}"},
+        )
+        assert [p.name for p in mixed["profiles"]] == [first_name, last_name]
+
+    def test_an_unknown_preset_aborts_naming_the_valid_set(
+        self, monkeypatch, tmp_path, capsys
+    ) -> None:
+        """A preset that silently ran everything instead of the requested
+        subset is the one failure mode worse than an error here."""
+        captured = _scripted_wizard(
+            monkeypatch, self._with(), tmp_path,
+            presets={"selected_profiles": "nope"}, expect=1,
+        )
+        assert captured == {}, "no aggregator may be built for a refused preset"
+        out = capsys.readouterr().out
+        assert "unknown profile" in out
+        assert "valid for this strike" in out
+
+    def test_an_interactive_typo_re_asks_and_blank_then_runs_all(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """Interactive validation is a re-ask, not an abort: the operator
+        typos, sees the valid names, and pressing Enter still means all."""
+        answers = self._with(profiles="nope") + [""]
+        captured = _scripted_wizard(monkeypatch, answers, tmp_path)
+        everything = _scripted_wizard(
+            monkeypatch, self._with(), tmp_path, presets={"selected_profiles": "all"}
+        )
+        assert captured["profiles"] == everything["profiles"]
+
+    def test_a_selection_only_warns_about_selected_reflectors(
+        self, monkeypatch, tmp_path, capsys
+    ) -> None:
+        """The reflector warnings run after the selection, so deselecting an
+        amplification profile means no 'Continue DNS anyway?' for it.
+
+        The probe here reads as CLOSED for every UDP port: the connectionless
+        amplification profiles survive the filter anyway, and the warning loop
+        would ask about each one that is still selected - so a strike whose
+        selection contains none of them must reach the aggregator with no
+        reflector questions at all.
+        """
+        import adobo.nuclear as nuclear
+
+        captured: dict = {}
+        lines = list(self._with())
+
+        def _input(*_a, **_k):
+            if not lines:
+                raise AssertionError("the wizard asked more questions than the script")
+            return lines.pop(0)
+
+        monkeypatch.setattr("builtins.input", _input)
+        monkeypatch.setattr(nuclear, "check_privileges", lambda: (True, True))
+        monkeypatch.setattr(nuclear, "check_child_raw_capability", lambda: (True, ""))
+        monkeypatch.setattr(nuclear, "probe_udp_port", lambda host, port: False)
+        monkeypatch.setattr(nuclear, "probe_tcp_port", lambda host, port: True)
+
+        def _load(path):
+            return [_proxy_for(path)]
+
+        monkeypatch.setattr(nuclear, "load_proxies", _load)
+
+        class _Aggregator:
+            def __init__(self, **kw):
+                captured.update(kw)
+
+            def run(self):
+                return 0
+
+        monkeypatch.setattr(nuclear, "NuclearAggregator", _Aggregator)
+
+        assert nuclear.nuclear_wizard(selected_profiles="udp_flood") == 0
+        assert [p.name for p in captured["profiles"]] == ["udp_flood"]
+        out = capsys.readouterr().out
+        assert "Continue DNS amplification anyway?" not in out
+        assert "Continue NTP amplification anyway?" not in out
 
 
 # ---------------------------------------------------------------------------

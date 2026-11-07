@@ -1720,6 +1720,51 @@ def _ask_yes_no(prompt: str, default: bool) -> bool:
         print("  Please answer 'y' or 'n'")
 
 
+def _announce_profiles(profiles: list[NuclearProfile]) -> None:
+    """Print the numbered menu of profiles this strike could run.
+
+    The list is whatever survived the privilege and port filters, so the
+    operator selects from what would actually run rather than from a
+    theoretical universe that includes profiles about to be dropped.
+    """
+    print("  profiles available for this strike:")
+    for index, profile in enumerate(profiles, start=1):
+        print(f"    {index:>2}. {profile.name:<22} ({profile.transport.value})")
+
+
+def _parse_profile_selection(
+    raw: str, profiles: list[NuclearProfile]
+) -> tuple[list[NuclearProfile], list[str]]:
+    """Resolve one selection line into profiles: numbers, names, or a mix.
+
+    Case-insensitive; duplicates collapse (``3,http_flood,3`` selects two
+    profiles); the result keeps menu order regardless of how the tokens were
+    typed. Unknown tokens are reported rather than ignored - a typo that
+    silently selected nothing would run the full strike instead of the
+    intended subset, which is the one failure mode worse than an error here.
+
+    Returns ``(selected, unknown_tokens)``.
+    """
+    index_by_key: dict[str, int] = {}
+    for index, profile in enumerate(profiles):
+        index_by_key[str(index + 1)] = index
+        index_by_key[profile.name.lower()] = index
+
+    chosen: set[int] = set()
+    unknown: list[str] = []
+    for token in raw.replace(",", " ").split():
+        key = token.strip().lower()
+        if not key:
+            continue
+        index = index_by_key.get(key)
+        if index is None:
+            unknown.append(token)
+        else:
+            chosen.add(index)
+    selected = [profiles[i] for i in sorted(chosen)]
+    return selected, unknown
+
+
 def nuclear_wizard(
     *,
     fingerprint: str | None = None,
@@ -1733,6 +1778,7 @@ def nuclear_wizard(
     data: str | None = None,
     content_type: str | None = None,
     proxy_default_scheme: str | None = None,
+    selected_profiles: str | None = None,
 ) -> int:
     """Interactive wizard for nuclear mode.
 
@@ -1744,6 +1790,11 @@ def nuclear_wizard(
     shape options follow the same rule, and are announced rather than asked:
     seven more interactive questions for options that already exist as flags
     would grow the wizard without growing what it can do.
+
+    ``selected_profiles`` (the ``--profiles`` flag) is validated hard rather
+    than loosely: an unknown name aborts the strike with the valid list,
+    because a preset that silently ran everything instead of the requested
+    subset is the one failure mode worse than an error here.
     """
     print("\n=== Nuclear Strike ===")
     host = _ask("Target IP")
@@ -1996,6 +2047,51 @@ def nuclear_wizard(
         for name, reason in closed:
             print(f"      - {name}: {reason}")
         print()
+
+    # Profile selection. Asked here - after the privilege and port filters -
+    # so the menu lists what the strike could actually run, and so the
+    # reflector warnings below fire only for profiles that survived the
+    # selection. Blank keeps the historical strike: every available profile
+    # runs.
+    total = len(profiles)
+    preset = (selected_profiles or "").strip()
+    if preset and preset.lower() != "all":
+        chosen, unknown = _parse_profile_selection(preset, profiles)
+        if unknown:
+            print(f"[!] --profiles named unknown profile(s): {', '.join(unknown)}")
+            print(f"    valid for this strike: {', '.join(p.name for p in profiles)}")
+            return 1
+        if not chosen:
+            print("[!] --profiles selected nothing.")
+            return 1
+        profiles = chosen
+        print(
+            f"  profiles: {len(profiles)} of {total} selected "
+            f"(from the command line)"
+        )
+    else:
+        _announce_profiles(profiles)
+        while True:
+            answer = _ask(
+                "Profiles to run (comma-separated numbers or names, blank = all)",
+                default="all",
+            )
+            if answer.strip().lower() in ("", "all"):
+                break
+            chosen, unknown = _parse_profile_selection(answer, profiles)
+            if unknown:
+                print(f"  unknown profile(s): {', '.join(unknown)}")
+                print(
+                    f"  valid: {', '.join(p.name for p in profiles)} "
+                    f"(or their numbers)"
+                )
+                continue
+            if not chosen:
+                print("  nothing selected; name at least one profile, or leave blank for all")
+                continue
+            profiles = chosen
+            print(f"  profiles: {len(profiles)} of {total} selected")
+            break
 
     # Check reflector ports for amplification profiles
     amp_profiles_by_protocol = {

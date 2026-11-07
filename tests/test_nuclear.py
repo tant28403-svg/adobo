@@ -33,6 +33,7 @@ from adobo.nuclear import (
     NuclearAggregator,
     NuclearProfile,
     _drop_privilege_profiles,
+    _parse_profile_selection,
     build_profiles,
     filter_available_profiles,
     probe_udp_port,
@@ -1177,3 +1178,54 @@ class TestRequestShapeReachesTheChild:
     def test_proxy_default_scheme_reaches_the_run_config(self) -> None:
         configs = _aggregator(proxy_default_scheme="socks5")._build_configs()
         assert configs[0].proxy_default_scheme == "socks5"
+
+
+class TestProfileSelection:
+    """The selection parser: numbers, names, or a mix; order preserved from
+    the menu; duplicates collapse; unknown tokens reported, never ignored.
+
+    Reporting rather than ignoring is the load-bearing choice: a typo that
+    silently selected nothing would run the full strike instead of the
+    intended subset, which is the one failure mode worse than an error here.
+    """
+
+    def _menu(self):
+        return [
+            make_profile("udp_flood", 8000, ProfileName.UDP_FLOOD),
+            make_profile("http_flood", 8000, ProfileName.HTTP_FLOOD),
+            make_profile("slowloris", 8000, ProfileName.SLOWLORIS),
+        ]
+
+    def test_names_select_in_menu_order(self) -> None:
+        selected, unknown = _parse_profile_selection(
+            "slowloris,udp_flood", self._menu()
+        )
+        assert [p.name for p in selected] == ["udp_flood", "slowloris"]
+        assert unknown == []
+
+    def test_numbers_select_by_position(self) -> None:
+        selected, unknown = _parse_profile_selection("1,3", self._menu())
+        assert [p.name for p in selected] == ["udp_flood", "slowloris"]
+
+    def test_mixed_tokens_and_duplicates_collapse(self) -> None:
+        selected, unknown = _parse_profile_selection(
+            "3,http_flood,3,udp_flood", self._menu()
+        )
+        assert [p.name for p in selected] == ["udp_flood", "http_flood", "slowloris"]
+        assert unknown == []
+
+    def test_names_are_case_insensitive(self) -> None:
+        selected, _unknown = _parse_profile_selection("UDP_FLOOD", self._menu())
+        assert [p.name for p in selected] == ["udp_flood"]
+
+    def test_unknown_tokens_are_reported(self) -> None:
+        selected, unknown = _parse_profile_selection("1,nope", self._menu())
+        assert [p.name for p in selected] == ["udp_flood"]
+        assert unknown == ["nope"]
+
+    def test_nothing_selected_is_distinguishable_from_all(self) -> None:
+        """A line of only unknowns selects nothing - the caller re-asks or
+        aborts; the parser must not hand back the full list as a fallback."""
+        selected, unknown = _parse_profile_selection("nope,nada", self._menu())
+        assert selected == []
+        assert unknown == ["nope", "nada"]
