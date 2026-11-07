@@ -259,6 +259,7 @@ def _scripted_wizard(
     presets: dict | None = None,
     expect: int = 0,
     wizard_protocol: str = "tls-h2",
+    quic_ok: bool = True,
 ) -> dict:
     """Run the real wizard on scripted answers and capture what it decided.
 
@@ -298,6 +299,12 @@ def _scripted_wizard(
     # "tls-h2" is the verdict that keeps the shipped question flow.
     monkeypatch.setattr(
         nuclear, "detect_target_protocol", lambda host, port, timeout=2.0: wizard_protocol
+    )
+    # The h3 answer now triggers one real QUIC handshake; patched like the
+    # probes so a scripted strike never touches the network. Only consulted
+    # when the script answers yes to h3.
+    monkeypatch.setattr(
+        nuclear, "quic_reachable", lambda host, port, timeout=3.0: quic_ok
     )
     # True means the reflector port reads as closed, which makes the wizard skip
     # those profiles outright rather than stopping to ask whether to continue
@@ -389,7 +396,12 @@ class TestTheWizardIsDriven:
         http2_on = http2_asked and values["http2"] == "y"
         # The TLS dialogue (and the verify question riding it) exists whenever
         # the strike could speak TLS at all; a plaintext target drops the pair.
+        # The "Use TLS" question itself is skipped when h3 is on - QUIC is TLS
+        # by definition - but verify is still asked, because it guards the h3
+        # handshake too.
         tls_dialogue = protocol != "plain"
+        tls_asked = tls_dialogue and not http3_enabled
+        verify_asked = tls_dialogue
         asked = [
             key
             for key in self.ORDER
@@ -398,8 +410,8 @@ class TestTheWizardIsDriven:
             and not (key == "http2" and not http2_asked)
             and not (key in ("concurrency", "preamble") and not http2_on)
             and not (key == "rotation" and not values["personas"])
-            and not (key == "tls" and not tls_dialogue)
-            and not (key == "verify" and not tls_dialogue)
+            and not (key == "tls" and not tls_asked)
+            and not (key == "verify" and not verify_asked)
         ]
         return [str(values[key]) for key in asked]
 
@@ -861,6 +873,142 @@ class TestTheWizardKnowsWhatTheTargetSpeaks(TestTheWizardIsDriven):
         names = [p.name for p in captured["profiles"]]
         assert "rapid_reset" in names
 
+    def test_a_quic_that_never_answers_falls_back_to_http1(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """The h3 'yes' is tested against the target before it can cost a run.
+
+        The QUIC handshake check sits between the h3 question and the next, and
+        a target that stays silent gets the fallback question - answering yes
+        (the default) converts the strike to HTTP/1.1 rather than running 30
+        workers into five-second timeouts apiece.
+        """
+        # Splice in the answers the fallback branch adds. The harness models
+        # the kept-h3 branch, where h2 and the TLS question are never asked;
+        # once h3 falls back, both re-open - the h2 question right after the
+        # fallback prompt, and the TLS question between keep-alive and verify.
+        script = self._with(http3="y")
+        i = script.index("y")  # the http3 answer ("verify" is the only other "y")
+        script[i + 1 : i + 1] = ["", "n"]  # fallback: Enter (default yes); h2: no
+        v = script.index("y", i + 1)  # the verify answer
+        script.insert(v, "n")  # the re-opened TLS question: no
+        captured = _scripted_wizard(
+            monkeypatch, script, tmp_path, quic_ok=False
+        )
+        assert captured["use_http3"] is False
+        assert captured["use_http2"] is False
+        assert captured["use_tls"] is False
+        # The strike still runs: http_flood on the socket transport.
+        from adobo.models import TransportKind
+
+        names = {p.name: p for p in captured["profiles"]}
+        assert names["http_flood"].transport is TransportKind.SOCKET
+
+    def test_a_quic_that_answers_keeps_h3_without_a_fallback_question(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """A target that answers QUIC keeps the h3 choice, no extra prompt."""
+        captured = _scripted_wizard(
+            monkeypatch, self._with(http3="y"), tmp_path, quic_ok=True
+        )
+        assert captured["use_http3"] is True
+
+    def test_the_tls_question_is_skipped_when_h3_is_chosen(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """QUIC is TLS by definition; the 'n' answer could do nothing anyway.
+
+        The script keeps its verify answer (h3 still verifies), but the
+        "Use TLS/HTTPS" slot disappears from the question order.
+        """
+        script = self._with(http3="y")
+        captured = _scripted_wizard(monkeypatch, script, tmp_path)
+        assert captured["use_http3"] is True
+        assert captured["tls_verify"] is True  # verify still asked and answered
+
+
+class TestTheParentProberCountsAnswers:
+    """A 403 is the target answering, not the target being absent.
+
+    The parent prober used to raise on any non-2xx, so a CDN edge that
+    redirected every IP-addressed request (308) or a WAF that answered 403
+    read as "0% availability, none was refused" - the opposite of what the
+    transcript showed. These tests pin the new contract at both layers:
+    alive() returns True for any HTTP response, and the aggregator tallies
+    the statuses it was answered with.
+    """
+
+    @staticmethod
+    def _observer_with(exc: Exception | None) -> Any:
+        from adobo.observation import TargetObserver
+
+        async def _fetch(timeout: float | None = None) -> dict:
+            if exc is not None:
+                raise exc
+            return {"requests": 1, "errors": 0}
+
+        return TargetObserver("127.0.0.1", 1, fetch=_fetch)
+
+    def test_a_403_answer_counts_as_answered(self) -> None:
+        import asyncio
+
+        import httpx
+
+        request = httpx.Request("GET", "https://127.0.0.1:1/stats")
+        response = httpx.Response(403, request=request)
+        observer = self._observer_with(httpx.HTTPStatusError(
+            "Client error '403 Forbidden'", request=request, response=response
+        ))
+        assert asyncio.run(observer.alive(0.5)) is True
+        assert observer.last_probe_error == "HTTP 403"
+
+    def test_a_timeout_is_still_a_failure(self) -> None:
+        import asyncio
+
+        observer = self._observer_with(TimeoutError("no answer"))
+        assert asyncio.run(observer.alive(0.5)) is False
+        assert "TimeoutError" in (observer.last_probe_error or "")
+
+    def test_an_answer_success_clears_the_reason(self) -> None:
+        import asyncio
+
+        observer = self._observer_with(None)
+        assert asyncio.run(observer.alive(0.5)) is True
+        assert observer.last_probe_error is None
+
+    def test_the_aggregator_tallies_answer_statuses(self, monkeypatch) -> None:
+        """ok probes answered with 4xx land in the status tally, not failures."""
+        import adobo.nuclear as nuclear
+        from adobo.models import ProfileName, TransportKind
+
+        profile = nuclear.NuclearProfile(
+            name="http_flood",
+            profile=ProfileName.HTTP_FLOOD,
+            transport=TransportKind.SOCKET,
+            port=80,
+            spoof=False,
+            requires_admin=False,
+        )
+        aggregator = nuclear.NuclearAggregator(
+            profiles=[profile], target_ip="127.0.0.1", pps=1, duration=1.0
+        )
+
+        class _StubObserver:
+            last_probe_error = "HTTP 403"
+
+            async def alive(self, timeout: float | None = None) -> bool:
+                # Async because the prober drives it through asyncio.run;
+                # a sync stub answered True into a TypeError that the
+                # accommodating except swallowed as a failed sample.
+                return True
+
+        aggregator._observer = _StubObserver()
+        monkeypatch.setattr(nuclear, "PARENT_PROBE_ENABLED", True)
+        aggregator._probe_target()
+        assert aggregator._probe_ok == 1
+        assert aggregator._probe_status_counts == {"HTTP 403": 1}
+        assert aggregator._probe_failures == {}
+
 
 class TestWizardPresets:
     """A preset is a value the caller already has. It must survive intact.
@@ -887,6 +1035,20 @@ class TestWizardPresets:
 
         monkeypatch.setattr("adobo.nuclear._ask", lambda *a, **k: "a")
         assert _ask_choice("x", ["a", "b"], default="a", preset="") == "a"
+
+    def test_a_blank_answer_takes_the_yes_no_default(self, monkeypatch) -> None:
+        """Enter on a '[y/N]' prompt must mean the advertised default.
+
+        It did not: _ask(None) treats blank as "keep asking", so every yes/no
+        question re-asked on Enter - and a scripted blank answer silently
+        consumed a second question's slot. The suffix promised a default the
+        code never honoured.
+        """
+        from adobo.nuclear import _ask_yes_no
+
+        monkeypatch.setattr("adobo.nuclear._ask", lambda *a, **k: "")
+        assert _ask_yes_no("x", default=True) is True
+        assert _ask_yes_no("x", default=False) is False
 
     def test_an_invalid_preset_is_refused_rather_than_defaulted(
         self, monkeypatch

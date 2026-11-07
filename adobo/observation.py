@@ -239,16 +239,29 @@ class TargetObserver:
         Never raises: an unreachable target is a failed sample, which is the
         measurement, not an error in the measuring.
 
-        The reason for the most recent failure is left on
-        :attr:`last_probe_error`. A boolean cannot distinguish "the target
-        collapsed" from "there was never an HTTP service here", and a report
-        that has to choose between those two readings is guessing unless it kept
-        the reason. Success clears it, so the attribute always describes the
-        latest sample rather than the latest failure.
+        **Any HTTP response counts as an answer** - including a 3xx redirect or
+        a WAF's 403. The previous version called ``raise_for_status()`` on the
+        fetch, so a 308-to-somewhere or a 403 was counted as a *failure*, and a
+        target that had answered 138 times read as "0%, none was refused" - the
+        opposite of what the transcript showed. A refused connection, a
+        timeout, or silence is what a failed sample means now; a status code,
+        whatever it is, is the service speaking.
+
+        The reason for the most recent sample is left on
+        :attr:`last_probe_error`: ``None`` after a 2xx/3xx answer, ``HTTP 403``
+        (the status that answered) after a 4xx/5xx, or the connection failure
+        text. Callers render that distinction rather than collapsing all three.
         """
         try:
             await self._fetch(timeout)
         except Exception as exc:  # noqa: BLE001 - unavailability is the datum
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            if status is not None:
+                # httpx raises HTTPStatusError with the response attached when
+                # the fetch is configured to reject non-2xx. The status is the
+                # target answering, which is what this method measures.
+                self.last_probe_error = f"HTTP {status}"
+                return True
             self.last_probe_error = explain_http_error(exc, self._url)
             return False
         self.last_probe_error = None

@@ -32,7 +32,7 @@ from .config import config_path, load_lab_config, LAB_CONFIG_NAME
 from .fingerprint import FINGERPRINTS
 from .h2profile import H2_PROFILES
 from .proxies import ProxyListError, load_proxies
-from .transports.http3_transport import aioquic_available
+from .transports.http3_transport import aioquic_available, quic_reachable
 
 H2_PROFILE_KEYS = tuple(H2_PROFILES)
 @dataclass(frozen=True, slots=True)
@@ -773,6 +773,9 @@ class NuclearAggregator:
         # collapse", and those demand opposite conclusions, so the reason for
         # each failure is recorded rather than discarded.
         self._probe_failures: dict[str, int] = {}
+        # The statuses probes were answered WITH (4xx/5xx): a WAF's 403 counts
+        # as answered, and the tally is what says so without calling it uptime.
+        self._probe_status_counts: dict[str, int] = {}
         self._last_probe = 0.0
 
     @staticmethod
@@ -884,6 +887,15 @@ class NuclearAggregator:
         try:
             if asyncio.run(self._observer.alive(PARENT_PROBE_TIMEOUT_S)):
                 self._probe_ok += 1
+                # An answer with a status is tallied by status, so a WAF's 403
+                # shows up as "answered 138 times, all 403" rather than as
+                # either unmeasured downtime or unexplained 100%.
+                status = getattr(self._observer, "last_probe_error", None)
+                if status and status.startswith("HTTP"):
+                    key = status.strip()
+                    self._probe_status_counts[key] = (
+                        self._probe_status_counts.get(key, 0) + 1
+                    )
         except Exception:  # noqa: BLE001 - defensive; alive() already swallows
             pass
         # alive() never raises, so reaching here with a failure means it
@@ -1113,6 +1125,19 @@ class NuclearAggregator:
                 )
             )
             print(f"  Probe failure reasons: {breakdown}")
+
+        if self._probe_status_counts:
+            breakdown = ", ".join(
+                f"{count}x {key}"
+                for key, count in sorted(
+                    self._probe_status_counts.items(), key=lambda kv: -kv[1]
+                )
+            )
+            print(f"  Probe answer statuses: {breakdown}")
+            print(
+                "    (every status above is the target answering; a 403 is "
+                "typically a WAF or a missing Host header, not downtime)"
+            )
 
     def _print_progress(self, elapsed: float, remaining: float) -> None:
         """Print live progress table."""
@@ -1743,7 +1768,13 @@ def _ask_yes_no(prompt: str, default: bool) -> bool:
     """Ask a yes/no question with a default."""
     suffix = " [y/N]" if not default else " [Y/n]"
     while True:
-        raw = _ask(f"{prompt}{suffix}")
+        # The "" default matters: _ask(None) treats a blank answer as "keep
+        # asking", which made Enter on a "[y/N]" question re-ask instead of
+        # taking the default the suffix advertises - and any script (or
+        # operator) that answered blank got silently out of step with the
+        # question count. "" reads through _ask untouched, and the branch
+        # below turns it into the default.
+        raw = _ask(f"{prompt}{suffix}", "")
         if not raw:
             return default
         low = raw.lower()
@@ -1909,6 +1940,16 @@ def nuclear_wizard(
             print("  [!] aioquic is not installed; running HTTP/1.1 instead.")
             print("      Install it with: pip install aioquic")
             use_http3 = False
+        # A yes is only as good as the target's QUIC answer. TCP-TLS spoke
+        # nothing about UDP, and the previous shape of this failure was a
+        # strike whose every worker timed out its handshake against a port
+        # nobody was listening on with UDP. One real handshake, now, converts
+        # the guaranteed-zero run into a working one at the prompt.
+        if use_http3 and not quic_reachable(host, port, timeout=3.0):
+            print("  [!] The target did not answer a QUIC handshake (3s). HTTP/3 will not connect:")
+            print("      many CDN edges disable QUIC, or UDP 443 is blocked on this route.")
+            if _ask_yes_no("Continue with HTTP/1.1 instead?", default=True):
+                use_http3 = False
     else:
         use_http3 = False
 
@@ -2038,7 +2079,11 @@ def nuclear_wizard(
     # these prompts would have been two questions whose only honest answers
     # were "no" and the default - rapid_reset is filtered from the menu below
     # on the same measurement, announced at the same moment.
-    if protocol in (TARGET_TLS, TARGET_TLS_H2, TARGET_UNKNOWN):
+    # The "Use TLS" question is skipped when HTTP/3 was chosen: QUIC is TLS by
+    # definition, so there is no plaintext answer to give and the question's
+    # "n" would have done nothing - it governs the socket/h2 paths only.
+    tls_dialogue = protocol in (TARGET_TLS, TARGET_TLS_H2, TARGET_UNKNOWN)
+    if tls_dialogue and not use_http3:
         # "auto-enabled on port 443" made real: on the TLS port the default
         # matches what the port speaks.
         use_tls = _ask_yes_no(
@@ -2059,9 +2104,9 @@ def nuclear_wizard(
     # No longer asked on EVERY strike: a target that refused its TLS handshake
     # has no TLS-speaking profile left (rapid_reset is filtered below), so the
     # verify question there has no choice to guard and is skipped. Asked on
-    # every strike where TLS is possible, keeping the same prompt history as
-    # before for those.
-    if protocol in (TARGET_TLS, TARGET_TLS_H2, TARGET_UNKNOWN):
+    # every strike where TLS is possible - including the h3 case - keeping the
+    # same prompt history as before for those.
+    if tls_dialogue or use_http3:
         tls_verify = _ask_yes_no(
             "Verify TLS certificates? (disable for self-signed certs)",
             default=True,

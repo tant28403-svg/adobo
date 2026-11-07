@@ -185,6 +185,7 @@ async def h3_probe(
     *,
     timeout: float,
     tls_verify: bool = True,
+    host_header: str = "",
 ) -> H3Probe:
     """One HTTP/3 GET against *host*, for the availability prober.
 
@@ -235,7 +236,7 @@ async def h3_probe(
         stream_id = 0
         h3.send_headers(
             stream_id=stream_id,
-            headers=_probe_headers(host, port, path),
+            headers=_probe_headers(host, port, path, host_header=host_header),
             end_stream=True,
         )
         protocol.transmit()
@@ -261,15 +262,24 @@ async def h3_probe(
         await _close_probe(manager)
 
 
-def _probe_headers(host: str, port: int, path: str) -> list[tuple[bytes, bytes]]:
+def _probe_headers(
+    host: str, port: int, path: str, host_header: str = ""
+) -> list[tuple[bytes, bytes]]:
     """The prober's request headers.
 
     No persona and no accept header: this is the tool checking whether the target
     is alive, not a request meant to look like anything. It uses the same
     self-identifying agent as every other h3 request so a log that shows one
     cannot be mistaken for the other.
+
+    *host_header*, when set, becomes ``:authority``: a CDN edge routes by that
+    header, so a probe addressed to the IP with the site's hostname reaches the
+    site instead of the edge's catch-all (which is what a 308-to-somewhere-else
+    was).
     """
-    authority = host if port == 443 else f"{host}:{port}"
+    authority = host_header or host
+    if authority == host and port != 443:
+        authority = f"{host}:{port}"
     return [
         (b":method", b"GET"),
         (b":authority", authority.encode("ascii", "ignore")),
@@ -304,6 +314,51 @@ def aioquic_available() -> bool:
     except Exception:
         return False
     return True
+
+
+def quic_reachable(host: str, port: int, timeout: float = 3.0) -> bool:
+    """One real QUIC handshake attempt. True only when the server answered.
+
+    TCP-TLS proves nothing about UDP: a CDN edge can complete an h2 handshake
+    all day while silently dropping every QUIC Initial - or the route blocks
+    UDP 443 entirely. The wizard runs this before letting an h3 choice stand,
+    because the alternative was discovering the same fact at five seconds per
+    worker inside the strike, with nothing to show for the whole run.
+
+    The handshake is unverified on purpose (protocol capability, not trust),
+    matching detect_target_protocol's posture. Any exception means "no answer
+    was proven", which for this question is the same as no.
+    """
+    if not aioquic_available():
+        return False
+
+    import ssl
+
+    from aioquic.asyncio import connect
+    from aioquic.h3.connection import H3_ALPN
+    from aioquic.quic.configuration import QuicConfiguration
+
+    async def _attempt() -> bool:
+        config = QuicConfiguration(
+            is_client=True,
+            alpn_protocols=H3_ALPN,
+            verify_mode=ssl.CERT_NONE,
+            server_name=host,
+        )
+        manager = connect(host, port, configuration=config)
+        try:
+            await asyncio.wait_for(manager.__aenter__(), timeout=timeout)
+            return True
+        finally:
+            try:
+                await asyncio.wait_for(manager.__aexit__(None, None, None), timeout=1.0)
+            except Exception:  # noqa: BLE001 - teardown must not mask the verdict
+                pass
+
+    try:
+        return asyncio.run(asyncio.wait_for(_attempt(), timeout=timeout + 2.0))
+    except Exception:  # noqa: BLE001 - silence is the answer this probe gives
+        return False
 
 
 class Http3Transport(Transport):
